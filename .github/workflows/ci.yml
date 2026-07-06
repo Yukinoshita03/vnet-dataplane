@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  userspace:
+    name: Userspace ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVNET_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload userspace artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: userspace-${{ matrix.os }}
+          path: |
+            build/userspace/
+            build/tests/
+          if-no-files-found: error
+
+  kernel-module:
+    name: Kernel module
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential linux-headers-generic
+
+      - name: Build kernel module
+        run: |
+          KDIR="$(find /usr/src -maxdepth 1 -type d -name 'linux-headers-*generic' | sort | tail -n 1)"
+          test -n "$KDIR"
+          make -C kernel KDIR="$KDIR"
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-module
+          path: |
+            kernel/*.ko
+            kernel/*.mod
+            kernel/*.symvers
+          if-no-files-found: error

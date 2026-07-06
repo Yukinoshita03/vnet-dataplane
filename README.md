@@ -1,27 +1,30 @@
 # vnet-dataplane
 
-`vnet-dataplane` is a job-focused systems project: a Linux virtual NIC driver paired with a C++20 userspace dataplane.
+[![CI](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml/badge.svg)](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml)
 
-The target outcome is a repo that demonstrates:
+`vnet-dataplane` 是一个面向求职的系统方向项目：实现一个 Linux 虚拟网卡驱动，并配套一个 C++20 用户态 dataplane。
 
-- Linux networking internals: `net_device`, NAPI, RX/TX queues, packet path
-- Modern C++: packet parsing, queue abstractions, metrics, tests, build hygiene
-- Infra engineering: benchmarks, observability, design docs, repeatable build steps
+这个仓库希望集中展示三类能力：
 
-## Scope
+- Linux 网络内核基础：`net_device`、NAPI、RX/TX queue、包路径
+- 现代 C++ 工程能力：报文解析、队列抽象、指标统计、测试与构建
+- 基础设施研发能力：压测、可观测性、设计文档、可复现构建流程
 
-The project is intentionally split into two parts:
+## 项目范围
+
+当前项目明确分成两部分：
 
 1. `kernel/`
-   A minimal virtual NIC kernel module that registers `vnet0`, handles bring-up/tear-down, tracks TX stats, and forms the base for a future RX/TX ring plus NAPI poll loop.
+   一个最小可运行的虚拟网卡内核模块，负责注册 `vnet0`、处理 up/down 生命周期、维护基础 TX 统计，并为后续的 RX/TX ring 和 NAPI poll 打基础。
 
 2. `userspace/`
-   A C++20 dataplane that will consume packets from the driver side, parse L2/L3/L4 headers, apply filtering or forwarding logic, and expose metrics.
+   一个 C++20 用户态 dataplane，后续负责消费驱动侧数据、解析 L2/L3/L4 报文、执行过滤或转发逻辑，并输出 metrics。
 
-## Repository layout
+## 仓库结构
 
 ```text
 .
+|-- .github/workflows/ci.yml
 |-- CMakeLists.txt
 |-- README.md
 |-- docs/
@@ -41,29 +44,29 @@ The project is intentionally split into two parts:
         `-- packet.cpp
 ```
 
-## Current status
+## 当前状态
 
-- The kernel module is a bootstrap implementation, not yet a full data path.
-- The userspace library already contains a small Ethernet frame parser with a CLI entry point and a test.
-- The next milestone is to add a shared queue design and a packet injection path from the kernel module to userspace.
+- 内核模块目前是 bootstrap 版本，目标是先把设备生命周期和基础统计做稳。
+- 用户态已经有一个可编译的 Ethernet 报文解析库、一个 CLI 程序和一个测试。
+- 下一阶段是补共享 ring 设计，并把内核到用户态的报文传递路径串起来。
 
-## Build
+## 本地构建
 
-Userspace build:
+用户态构建：
 
 ```bash
 cmake -S . -B build
 cmake --build build
-ctest --test-dir build
+ctest --test-dir build --output-on-failure
 ```
 
-Kernel module build on Linux:
+Linux 下编译内核模块：
 
 ```bash
 make -C kernel
 ```
 
-Load and inspect the device on Linux:
+Linux 下加载并查看设备：
 
 ```bash
 sudo insmod kernel/vnetdrv.ko
@@ -72,6 +75,14 @@ sudo ip link set vnet0 up
 sudo rmmod vnetdrv
 ```
 
-## Roadmap
+## CI/CD
 
-The execution plan lives in [docs/roadmap.md](docs/roadmap.md). The architecture notes live in [docs/architecture.md](docs/architecture.md).
+仓库已经配置 GitHub Actions：
+
+- `userspace` 作业：在 `Ubuntu` 和 `Windows` 上构建并测试 C++20 用户态代码
+- `kernel-module` 作业：在 `Ubuntu` 上安装通用内核头文件并编译虚拟网卡模块
+- 构建产物会作为 workflow artifact 保存，方便后续下载和检查
+
+## 路线图
+
+执行计划见 [docs/roadmap.md](docs/roadmap.md)，架构说明见 [docs/architecture.md](docs/architecture.md)。

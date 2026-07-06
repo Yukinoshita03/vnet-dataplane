@@ -16,14 +16,18 @@ static int vnet_poll(struct napi_struct *napi, int budget)
 
 static int vnet_open(struct net_device *dev)
 {
+	struct vnet_priv *priv = netdev_priv(dev);
+
 	netif_start_queue(dev);
-	napi_enable(&netdev_priv(dev)->napi);
+	napi_enable(&priv->napi);
 	return 0;
 }
 
 static int vnet_stop(struct net_device *dev)
 {
-	napi_disable(&netdev_priv(dev)->napi);
+	struct vnet_priv *priv = netdev_priv(dev);
+
+	napi_disable(&priv->napi);
 	netif_stop_queue(dev);
 	return 0;
 }
