@@ -14,9 +14,3 @@ add_executable(vnetctl
 )
 
 target_link_libraries(vnetctl PRIVATE vnet_core)
-
-add_executable(virt_service_classifier
-  src/virt_service_classifier.cpp
-)
-
-target_link_libraries(virt_service_classifier PRIVATE vnet_core)

@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and syntax check
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            g++ \
+            libbpf-dev \
+            libelf-dev \
+            linux-libc-dev \
+            llvm \
+            zlib1g-dev
+
+      - name: BPF syntax check with editor shims
+        run: |
+          clang -fsyntax-only \
+            -I third_party/bpf-headers \
+            -I include \
+            bpf/dns_monitor.c
+
+      - name: Build Linux artifacts
+        run: ./scripts/build_linux.sh
+
+      - name: Verify build outputs
+        run: |
+          test -f build/dns_monitor.bpf.o
+          test -x build/dns_monitor
+          test -x build/virt_service_classifier
+
+      - name: Ensure generated artifacts are ignored
+        run: git diff --exit-code -- . ':!build'

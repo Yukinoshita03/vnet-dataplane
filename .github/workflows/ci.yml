@@ -73,3 +73,45 @@ jobs:
             kernel/*.mod
             kernel/*.symvers
           if-no-files-found: error
+
+  linux-accel:
+    name: Linux accel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang \
+            g++ \
+            iproute2 \
+            libbpf-dev \
+            libelf-dev \
+            linux-libc-dev \
+            llvm \
+            zlib1g-dev
+
+      - name: Build linux_accel
+        run: ./scripts/build_linux.sh
+        working-directory: linux_accel
+
+      - name: Verify linux_accel outputs
+        run: |
+          test -f linux_accel/build/dns_monitor.bpf.o
+          test -x linux_accel/build/dns_monitor
+          test -x linux_accel/build/grpc_monitor
+          test -x linux_accel/build/grpc_fast_cache
+          test -x linux_accel/build/cachectl
+          test -x linux_accel/build/virt_service_classifier
+
+      - name: Upload linux_accel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-accel
+          path: |
+            linux_accel/build/
+          if-no-files-found: error
