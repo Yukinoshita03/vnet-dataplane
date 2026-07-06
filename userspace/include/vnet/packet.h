@@ -47,6 +47,20 @@ struct TcpHeader {
   std::uint16_t urgent_pointer{};
 };
 
+struct ParsedPacket {
+  EthernetFrame ethernet{};
+  std::optional<Ipv4Header> ipv4;
+  std::optional<UdpHeader> udp;
+  std::optional<TcpHeader> tcp;
+};
+
+enum class ServiceKind {
+  kUnknown = 0,
+  kDns,
+  kGrpc,
+  kOther,
+};
+
 std::optional<EthernetFrame>
 ParseEthernetFrame(std::span<const std::byte> bytes);
 std::optional<Ipv4Header>
@@ -55,6 +69,12 @@ std::optional<UdpHeader>
 ParseUdpHeader(std::span<const std::byte> bytes);
 std::optional<TcpHeader>
 ParseTcpHeader(std::span<const std::byte> bytes);
+std::optional<ParsedPacket> ParsePacket(std::span<const std::byte> bytes);
+std::size_t Ipv4HeaderLength(const Ipv4Header &header);
+std::size_t TcpHeaderLength(const TcpHeader &header);
+ServiceKind ClassifyService(const ParsedPacket &packet);
+const char *ServiceKindName(ServiceKind kind);
 std::string FormatMac(const std::array<std::byte, 6> &mac);
+std::string FormatIpv4(const std::array<std::byte, 4> &ip);
 
 } // namespace vnet
