@@ -6,7 +6,7 @@
 #include <optional>
 #include <span>
 #include <sstream>
-#include <typeinfo.h>
+
 namespace vnet {
 
 namespace {
