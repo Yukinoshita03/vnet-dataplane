@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(VNET_BUILD_TESTS "Build vnet-dataplane tests" ON)
 
 add_subdirectory(userspace)
+add_subdirectory(agent)
 
 if(VNET_BUILD_TESTS)
   enable_testing()
