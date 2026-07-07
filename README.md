@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml/badge.svg)](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml)
 
+[中文](#vnet-dataplane) | [English](#english-version)
+
 A Linux eBPF agent for virtualized network path observability and lightweight service acceleration.
 
 `vnet-dataplane` 面向 KVM、OpenStack 和 Kubernetes 节点，用于发现 `veth`、`tap`、`bridge`、`OVS` 等虚拟化网络路径，观测 DNS、gRPC 和 TCP/UDP 流量，并在可控场景下提供 XDP/tc 快路径优化原型。
@@ -154,3 +156,82 @@ sudo rmmod vnetdrv
 - [linux_accel/docs/cloud-native-integration.md](linux_accel/docs/cloud-native-integration.md)：OpenStack / Kubernetes 接入说明
 - [docs/architecture.md](docs/architecture.md)：主仓库架构说明
 - [docs/roadmap.md](docs/roadmap.md)：主仓库路线图
+
+## English Version
+
+`vnet-dataplane` is a Linux eBPF agent for virtualized network path observability and lightweight service acceleration.
+
+It targets KVM, OpenStack, and Kubernetes nodes. The project discovers virtualized network paths such as `veth`, `tap`, `bridge`, and `OVS`, observes DNS, gRPC, and TCP/UDP traffic, and provides controlled XDP/tc fast-path acceleration prototypes for cacheable service traffic.
+
+The goal is to make virtualized network paths observable, verifiable, and reproducible: where packets enter, which interfaces they cross, where latency appears, and whether a narrow acceleration path can be applied safely.
+
+### Features
+
+- Discover virtualized network paths and candidate eBPF attach points
+- Collect DNS, gRPC, TCP, and UDP traffic metrics
+- Report path information, latency, service classification, and eBPF attach status
+- Provide DNS XDP cache and gRPC fast-cache prototypes
+- Reproduce virtualized network experiments with `netns + bridge + veth`
+- Keep a virtual NIC driver and C++ userspace dataplane as lower-level experimental components
+
+### Project Layout
+
+| Module | Status | Description |
+| --- | --- | --- |
+| `linux_accel/` | Main module | Linux eBPF observability and acceleration module with DNS/gRPC monitors, XDP/tc fast paths, benchmarks, and documentation |
+| `userspace/` | Base component | C++20 userspace dataplane prototype with basic packet parsing, a CLI example, and tests |
+| `kernel/` | Experimental component | Minimal virtual NIC driver prototype that registers `vnet0` and maintains basic TX statistics |
+
+### Quick Start
+
+Build the Linux acceleration module on a Linux host:
+
+```bash
+cd linux_accel
+./scripts/build_linux.sh
+```
+
+Run the virtualized path benchmark:
+
+```bash
+cd linux_accel
+REQUESTS=1000 ./bench/virt_path_bench.sh
+```
+
+Probe OpenStack / OVS attach points:
+
+```bash
+cd linux_accel
+./bench/openstack_path_probe.sh
+./bench/openstack_tc_attach_smoke.sh
+```
+
+Build the C++ userspace components:
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Build the virtual NIC driver:
+
+```bash
+make -C kernel
+```
+
+### Roadmap
+
+Near-term goals:
+
+1. Provide a unified `vnet-agent` CLI for probe, monitor, bench, and diagnose workflows
+2. Add JSON and Prometheus metrics output
+3. Improve the read-only observability mode and keep packet modification disabled by default
+4. Mark DNS XDP cache and gRPC fast-cache as optional acceleration capabilities
+5. Add systemd service and Kubernetes DaemonSet deployment examples
+
+Long-term goals:
+
+- Provide stable virtualized network path observability for Linux nodes
+- Offer safe and reversible lightweight fast paths for cacheable DNS/gRPC traffic
+- Connect the virtual NIC, userspace dataplane, and eBPF acceleration module into a complete dataplane lab
