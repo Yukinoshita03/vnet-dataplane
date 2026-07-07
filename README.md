@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml/badge.svg)](https://github.com/Yukinoshita03/vnet-dataplane/actions/workflows/ci.yml)
 
-[中文](#vnet-dataplane) | [English](#english-version)
+**Language:** [中文](#中文) | [English](#english)
 
-A Linux eBPF agent for virtualized network path observability and lightweight service acceleration.
+## 中文
 
 `vnet-dataplane` 面向 KVM、OpenStack 和 Kubernetes 节点，用于发现 `veth`、`tap`、`bridge`、`OVS` 等虚拟化网络路径，观测 DNS、gRPC 和 TCP/UDP 流量，并在可控场景下提供 XDP/tc 快路径优化原型。
 
@@ -157,7 +157,7 @@ sudo rmmod vnetdrv
 - [docs/architecture.md](docs/architecture.md)：主仓库架构说明
 - [docs/roadmap.md](docs/roadmap.md)：主仓库路线图
 
-## English Version
+## English
 
 `vnet-dataplane` is a Linux eBPF agent for virtualized network path observability and lightweight service acceleration.
 
