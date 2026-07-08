@@ -3,10 +3,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
+#include <initializer_list>
 #include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #if !defined(_WIN32)
 #include <sys/wait.h>
@@ -16,6 +19,20 @@
 namespace {
 
 constexpr std::string_view kProgramName = "vnet-agent";
+constexpr int kLabelWidth = 28;
+constexpr int kStateWidth = 12;
+
+enum class CheckState {
+  kOk,
+  kMissing,
+  kSkipped,
+  kLinuxOnly,
+};
+
+struct CheckResult {
+  CheckState state;
+  std::string detail;
+};
 
 bool IsWindowsPlatform() {
 #if defined(_WIN32)
@@ -45,10 +62,6 @@ std::filesystem::path RepoRoot() {
   return SourceDir().parent_path();
 }
 
-bool IsUnixLikePlatform() {
-  return !IsWindowsPlatform();
-}
-
 std::string PlatformLabel() {
 #if defined(_WIN32)
   return "Windows";
@@ -66,8 +79,8 @@ void PrintUsage(std::ostream& os) {
      << "  vnet-agent probe\n"
      << "  vnet-agent bench virt-path\n\n"
      << "Commands:\n"
-     << "  status         Check local environment and build prerequisites.\n"
-     << "  probe          Run the OpenStack path probe script.\n"
+     << "  status          Check local environment and build prerequisites.\n"
+     << "  probe           Run the OpenStack path probe script.\n"
      << "  bench virt-path Run the virtualization path benchmark script.\n";
 }
 
@@ -80,9 +93,11 @@ std::filesystem::path LinuxAccelBuildDir() {
 }
 
 std::optional<std::string> RunCommandCapture(const std::string& command);
+bool CommandExists(std::string_view command);
 
 std::string TrimCopy(std::string value) {
-  while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' ' || value.back() == '\t')) {
+  while (!value.empty() && (value.back() == '\n' || value.back() == '\r' ||
+                            value.back() == ' ' || value.back() == '\t')) {
     value.pop_back();
   }
   std::size_t begin = 0;
@@ -92,16 +107,123 @@ std::string TrimCopy(std::string value) {
   return value.substr(begin);
 }
 
-std::string KernelDescription() {
+std::string_view CheckStateLabel(CheckState state) {
+  switch (state) {
+    case CheckState::kOk:
+      return "OK";
+    case CheckState::kMissing:
+      return "MISSING";
+    case CheckState::kSkipped:
+      return "SKIPPED";
+    case CheckState::kLinuxOnly:
+      return "LINUX_ONLY";
+  }
+  return "MISSING";
+}
+
+CheckResult MakeOk(std::string detail) {
+  return {CheckState::kOk, std::move(detail)};
+}
+
+CheckResult MakeMissing(std::string detail) {
+  return {CheckState::kMissing, std::move(detail)};
+}
+
+CheckResult MakeSkipped(std::string detail) {
+  return {CheckState::kSkipped, std::move(detail)};
+}
+
+CheckResult MakeLinuxOnly(std::string detail) {
+  return {CheckState::kLinuxOnly, std::move(detail)};
+}
+
+CheckResult CheckPlatformInfo(std::string detail) {
+  return MakeOk(std::move(detail));
+}
+
+CheckResult CheckKernel() {
 #if defined(_WIN32)
-  return "Windows";
+  return MakeOk("Windows");
 #else
   const std::optional<std::string> output = RunCommandCapture("uname -sr");
   if (output.has_value() && !output->empty()) {
-    return TrimCopy(*output);
+    return MakeOk(TrimCopy(*output));
   }
-  return "Linux";
+  return MakeOk("Linux");
 #endif
+}
+
+CheckResult CheckRootStatus() {
+#if defined(_WIN32)
+  return MakeSkipped("n/a on Windows");
+#else
+  if (geteuid() == 0) {
+    return MakeOk("yes");
+  }
+  return MakeMissing("not running as root");
+#endif
+}
+
+CheckResult CheckCommand(std::string_view command, bool linux_only = false) {
+  if (linux_only && !IsLinuxPlatform()) {
+    return MakeLinuxOnly("not available on Windows");
+  }
+  if (CommandExists(command)) {
+    return MakeOk("found");
+  }
+  return MakeMissing("not found");
+}
+
+CheckResult CheckPath(const std::filesystem::path& path) {
+  std::error_code ec;
+  if (std::filesystem::exists(path, ec)) {
+    return MakeOk("found");
+  }
+  return MakeMissing("not found");
+}
+
+void PrintCheckLine(std::string_view label, const CheckResult& result) {
+  std::cout << "  " << std::left << std::setw(kLabelWidth) << label << "  "
+            << std::left << std::setw(kStateWidth) << CheckStateLabel(result.state)
+            << result.detail << '\n';
+}
+
+void PrintGroup(std::string_view title,
+                std::initializer_list<std::pair<std::string_view, CheckResult>> entries) {
+  std::cout << title << ":\n";
+  for (const auto& [label, result] : entries) {
+    PrintCheckLine(label, result);
+  }
+  std::cout << '\n';
+}
+
+CheckResult ProbeCapability() {
+  if (!IsLinuxPlatform()) {
+    return MakeLinuxOnly("not available on Windows");
+  }
+  const CheckResult script = CheckPath(RepoRoot() / "linux_accel" / "bench" / "openstack_path_probe.sh");
+  if (script.state == CheckState::kOk) {
+    return MakeOk("ready");
+  }
+  return MakeMissing("script missing");
+}
+
+CheckResult LinuxAccelBuildCapability() {
+  const CheckResult build_dir = CheckPath(LinuxAccelBuildDir());
+  const CheckResult dns_monitor = CheckPath(LinuxAccelBuildDir() / "dns_monitor");
+  const CheckResult grpc_monitor = CheckPath(LinuxAccelBuildDir() / "grpc_monitor");
+  const CheckResult grpc_fast_cache = CheckPath(LinuxAccelBuildDir() / "grpc_fast_cache");
+  const CheckResult cachectl = CheckPath(LinuxAccelBuildDir() / "cachectl");
+  const CheckResult virt_classifier = CheckPath(LinuxAccelBuildDir() / "virt_service_classifier");
+  const bool ready = build_dir.state == CheckState::kOk && dns_monitor.state == CheckState::kOk &&
+                     grpc_monitor.state == CheckState::kOk &&
+                     grpc_fast_cache.state == CheckState::kOk &&
+                     cachectl.state == CheckState::kOk &&
+                     virt_classifier.state == CheckState::kOk;
+  if (ready) {
+    return MakeOk("ready");
+  }
+  return MakeMissing("missing build artifacts");
 }
 
 std::optional<std::string> RunCommandCapture(const std::string& command) {
@@ -130,82 +252,78 @@ std::optional<std::string> RunCommandCapture(const std::string& command) {
   return output;
 }
 
-bool CommandExists(const std::string& command) {
-  const std::string shell =
+bool CommandExists(std::string_view command) {
 #if defined(_WIN32)
-      "where " + command;
+  return std::system(("where " + std::string(command) + " >nul 2>nul").c_str()) == 0;
 #else
-      "command -v " + command;
+  return std::system(("command -v " + std::string(command) + " >/dev/null 2>&1").c_str()) == 0;
 #endif
-  const std::optional<std::string> output = RunCommandCapture(shell);
-  return output.has_value() && !output->empty();
-}
-
-bool PathExists(const std::filesystem::path& path) {
-  std::error_code ec;
-  return std::filesystem::exists(path, ec);
-}
-
-void PrintCheckLine(const std::string& label, bool ok, const std::string& detail) {
-  std::cout << (ok ? "[OK]   " : "[WARN] ") << label;
-  if (!detail.empty()) {
-    std::cout << " - " << detail;
-  }
-  std::cout << '\n';
 }
 
 int RunStatus() {
-  std::cout << kProgramName << " status\n";
-  std::cout << "OS: " << PlatformLabel() << '\n';
-  std::cout << "Kernel: " << KernelDescription() << '\n';
-  std::cout << "Repo root: " << RepoRoot().string() << '\n';
+  const CheckResult os = CheckPlatformInfo(PlatformLabel());
+  const CheckResult kernel = CheckKernel();
+  const CheckResult root = CheckRootStatus();
 
-  bool all_ok = true;
+  const CheckResult cmake = CheckCommand("cmake");
+  const CheckResult clang = CheckCommand("clang");
+  const CheckResult tc = CheckCommand("tc", true);
+  const CheckResult bpftool = CheckCommand("bpftool", true);
+  const CheckResult ovs_vsctl = CheckCommand("ovs-vsctl");
 
-  const bool has_tc = CommandExists("tc");
-  const bool has_clang = CommandExists("clang");
-  const bool has_bpftool = CommandExists("bpftool");
-  const bool has_ovs_vsctl = CommandExists("ovs-vsctl");
-  const bool has_cmake = CommandExists("cmake");
+  const CheckResult linux_accel_build = CheckPath(LinuxAccelBuildDir());
+  const CheckResult dns_monitor = CheckPath(LinuxAccelBuildDir() / "dns_monitor");
+  const CheckResult grpc_monitor = CheckPath(LinuxAccelBuildDir() / "grpc_monitor");
+  const CheckResult grpc_fast_cache = CheckPath(LinuxAccelBuildDir() / "grpc_fast_cache");
+  const CheckResult cachectl = CheckPath(LinuxAccelBuildDir() / "cachectl");
+  const CheckResult virt_classifier = CheckPath(LinuxAccelBuildDir() / "virt_service_classifier");
 
-  PrintCheckLine("tc", has_tc, has_tc ? "found" : "missing");
-  PrintCheckLine("clang", has_clang, has_clang ? "found" : "missing");
-  PrintCheckLine("bpftool", has_bpftool, has_bpftool ? "found" : "missing");
-  PrintCheckLine("ovs-vsctl", has_ovs_vsctl, has_ovs_vsctl ? "found" : "missing");
-  PrintCheckLine("cmake", has_cmake, has_cmake ? "found" : "missing");
+  const CheckResult openstack_path_probe =
+      CheckPath(RepoRoot() / "linux_accel" / "bench" / "openstack_path_probe.sh");
+  const CheckResult virt_path_bench = CheckPath(RepoRoot() / "linux_accel" / "bench" / "virt_path_bench.sh");
 
-  bool has_root_access = true;
-#if defined(_WIN32)
-  PrintCheckLine("root", true, "n/a on Windows");
-#else
-  has_root_access = (geteuid() == 0);
-  PrintCheckLine("root", has_root_access, has_root_access ? "yes" : "no");
-#endif
+  std::cout << kProgramName << " status\n\n";
 
-  const bool has_build_dir = PathExists(LinuxAccelBuildDir());
-  const bool has_dns_monitor = PathExists(LinuxAccelBuildDir() / "dns_monitor");
-  const bool has_grpc_monitor = PathExists(LinuxAccelBuildDir() / "grpc_monitor");
-  const bool has_grpc_fast_cache = PathExists(LinuxAccelBuildDir() / "grpc_fast_cache");
-  const bool has_cachectl = PathExists(LinuxAccelBuildDir() / "cachectl");
-  const bool has_virt_classifier = PathExists(LinuxAccelBuildDir() / "virt_service_classifier");
+  PrintGroup("System", {
+                            {"OS", os},
+                            {"Kernel", kernel},
+                            {"Root", root},
+                        });
 
-  PrintCheckLine("linux_accel/build", has_build_dir, has_build_dir ? "present" : "missing");
-  PrintCheckLine("dns_monitor", has_dns_monitor, has_dns_monitor ? "present" : "missing");
-  PrintCheckLine("grpc_monitor", has_grpc_monitor, has_grpc_monitor ? "present" : "missing");
-  PrintCheckLine("grpc_fast_cache", has_grpc_fast_cache, has_grpc_fast_cache ? "present" : "missing");
-  PrintCheckLine("cachectl", has_cachectl, has_cachectl ? "present" : "missing");
-  PrintCheckLine("virt_service_classifier", has_virt_classifier, has_virt_classifier ? "present" : "missing");
+  PrintGroup("Toolchain", {
+                              {"cmake", cmake},
+                              {"clang", clang},
+                              {"tc", tc},
+                              {"bpftool", bpftool},
+                              {"ovs-vsctl", ovs_vsctl},
+                          });
 
-  all_ok = has_tc && has_clang && has_bpftool && has_ovs_vsctl && has_cmake &&
-           has_root_access && has_build_dir && has_dns_monitor && has_grpc_monitor &&
-           has_grpc_fast_cache && has_cachectl && has_virt_classifier;
+  PrintGroup("Linux accel artifacts", {
+                                          {"linux_accel/build", linux_accel_build},
+                                          {"dns_monitor", dns_monitor},
+                                          {"grpc_monitor", grpc_monitor},
+                                          {"grpc_fast_cache", grpc_fast_cache},
+                                          {"cachectl", cachectl},
+                                          {"virt_service_classifier", virt_classifier},
+                                      });
 
-  std::cout << "Status: " << (all_ok ? "ready" : "not ready") << '\n';
+  PrintGroup("Scripts", {
+                           {"openstack_path_probe.sh", openstack_path_probe},
+                           {"virt_path_bench.sh", virt_path_bench},
+                       });
+
+  PrintGroup("Summary", {
+                             {"status command", MakeOk("ready")},
+                             {"read-only CLI", MakeOk("ready")},
+                             {"linux probe", ProbeCapability()},
+                             {"linux_accel build", LinuxAccelBuildCapability()},
+                         });
+
   return 0;
 }
 
 int RunLinuxScript(const std::filesystem::path& script_path) {
-  if (!PathExists(script_path)) {
+  if (!std::filesystem::exists(script_path)) {
     std::cerr << "error: script not found: " << script_path.string() << '\n';
     return 1;
   }
