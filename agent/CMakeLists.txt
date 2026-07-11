@@ -1,5 +1,8 @@
 add_executable(vnet-agent
+  src/command_runner.cpp
+  src/commands.cpp
   src/main.cpp
+  src/status.cpp
 )
 
 target_compile_features(vnet-agent PRIVATE cxx_std_20)
@@ -11,7 +14,7 @@ target_compile_definitions(vnet-agent
 
 target_include_directories(vnet-agent
   PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
 if(VNET_BUILD_TESTS)
