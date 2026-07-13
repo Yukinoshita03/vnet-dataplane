@@ -68,7 +68,9 @@ stop_backends() {
     run_sudo ip netns exec "${srv_ns}" pkill -TERM -f "${backend_py}" >/dev/null 2>&1 || true
   fi
   for pid in "${backend_pids[@]:-}"; do
-    stop_pid "${pid}"
+    if [[ -n "${pid}" ]]; then
+      wait "${pid}" >/dev/null 2>&1 || true
+    fi
   done
   backend_pids=()
 }
@@ -116,6 +118,10 @@ answer = (b"\xc0\x0c\x00\x01\x00\x01" + ttl.to_bytes(4, "big") +
 count = 0
 running = True
 
+def flush_count():
+    with open(count_file, "w", encoding="ascii") as output:
+        output.write(str(count))
+
 def stop(_signum, _frame):
     global running
     running = False
@@ -133,8 +139,6 @@ while running:
     except socket.timeout:
         continue
     count += 1
-    with open(count_file, "w", encoding="ascii") as output:
-        output.write(str(count))
     if len(data) >= 12 and data[12:] == qname and response_mode == "nxdomain":
         response = data[:2] + b"\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:]
     elif len(data) >= 12 and data[12:] == qname:
@@ -142,6 +146,9 @@ while running:
     else:
         response = data[:2] + b"\x81\x83\x00\x01\x00\x00\x00\x00\x00\x00" + data[12:]
     s.sendto(response, peer)
+
+s.close()
+flush_count()
 PY
   cat > "${client_py}" <<'PY'
 import socket
@@ -328,14 +335,13 @@ record_scenario() {
 
 run_suite() {
   local baseline_count
-  local warm_count
   local final_count
 
   start_backend baseline "${srv_ip}" "${answer_ip}" 60
   run_client baseline "${srv_ip}" "${answer_ip}" "${requests}"
+  stop_backends
   baseline_count="$(backend_count baseline)"
   record_scenario "baseline" "${out_dir}/${run_id}-baseline.client.log" "${baseline_count}"
-  stop_backends
 
   start_server_monitor server-only "${answer_ip}" 60
   run_client server-only "${srv_ip}" "${answer_ip}" "${requests}"
@@ -347,19 +353,16 @@ run_suite() {
   start_backend client-only "${srv_ip}" "${answer_ip}" 60
   start_client_monitor client-only --trusted-dns "${srv_ip}"
   run_client client-warm "${srv_ip}" "${answer_ip}" 1
-  sleep 0.2
-  warm_count="$(backend_count client-only)"
   run_client client-only "${srv_ip}" "${answer_ip}" "${requests}"
-  sleep 1
-  final_count="$(backend_count client-only)"
   stop_monitors
+  stop_backends
+  final_count="$(backend_count client-only)"
   record_scenario "client-only" "${out_dir}/${run_id}-client-only.client.log" "${final_count}" \
     "${out_dir}/${run_id}-client-only.client-monitor.log"
-  if [[ "${warm_count}" != 1 || "${final_count}" != "${warm_count}" ]]; then
+  if [[ "${final_count}" != 1 ]]; then
     echo "client-only backend counter did not remain at one" >&2
     exit 1
   fi
-  stop_backends
 
   start_server_monitor both "${answer_ip}" 60
   start_client_monitor both --trusted-dns "${srv_ip}"
@@ -376,16 +379,15 @@ run_suite() {
   run_client ttl-hit "${srv_ip}" "${answer_ip}" 1
   sleep 2
   run_client ttl-expired "${srv_ip}" "${answer_ip}" 1
-  sleep 1
-  final_count="$(backend_count ttl)"
   stop_monitors
+  stop_backends
+  final_count="$(backend_count ttl)"
   record_scenario "ttl-expiry" "${out_dir}/${run_id}-ttl-expired.client.log" "${final_count}" \
     "${out_dir}/${run_id}-ttl.client-monitor.log"
   if [[ "${final_count}" != 2 ]]; then
     echo "TTL expiry did not trigger a backend request" >&2
     exit 1
   fi
-  stop_backends
 
   start_backend isolate-primary "${srv_ip}" "${answer_ip}" 60
   start_backend isolate-alt "${alt_srv_ip}" "${alt_answer_ip}" 60
@@ -394,8 +396,8 @@ run_suite() {
   run_client isolation-alt-warm "${alt_srv_ip}" "${alt_answer_ip}" 1
   run_client isolation-primary "${srv_ip}" "${answer_ip}" 4
   run_client isolation-alt "${alt_srv_ip}" "${alt_answer_ip}" 4
-  sleep 1
   stop_monitors
+  stop_backends
   if [[ "$(backend_count isolate-primary)" != 1 || "$(backend_count isolate-alt)" != 1 ]]; then
     echo "resolver isolation cache entries were not kept separately" >&2
     exit 1
@@ -403,37 +405,34 @@ run_suite() {
   record_scenario "resolver-isolation" "${out_dir}/${run_id}-isolation-primary.client.log" \
     "primary=$(backend_count isolate-primary),alt=$(backend_count isolate-alt)" \
     "${out_dir}/${run_id}-isolation.client-monitor.log"
-  stop_backends
 
   start_backend untrusted "${untrusted_srv_ip}" "${untrusted_answer_ip}" 60
   start_client_monitor untrusted --trusted-dns "${srv_ip}"
   run_client untrusted-first "${untrusted_srv_ip}" "${untrusted_answer_ip}" 1
   run_client untrusted-second "${untrusted_srv_ip}" "${untrusted_answer_ip}" 1
-  sleep 1
-  final_count="$(backend_count untrusted)"
   stop_monitors
+  stop_backends
+  final_count="$(backend_count untrusted)"
   record_scenario "untrusted-resolver" "${out_dir}/${run_id}-untrusted-second.client.log" "${final_count}" \
     "${out_dir}/${run_id}-untrusted.client-monitor.log"
   if [[ "${final_count}" != 2 ]]; then
     echo "untrusted DNS response was incorrectly cached" >&2
     exit 1
   fi
-  stop_backends
 
   start_backend nxdomain "${srv_ip}" "${answer_ip}" 60 nxdomain
   start_client_monitor nxdomain --trusted-dns "${srv_ip}"
   run_client nxdomain-first "${srv_ip}" NXDOMAIN 1
   run_client nxdomain-second "${srv_ip}" NXDOMAIN 1
-  sleep 1
-  final_count="$(backend_count nxdomain)"
   stop_monitors
+  stop_backends
+  final_count="$(backend_count nxdomain)"
   record_scenario "nxdomain-rejected" "${out_dir}/${run_id}-nxdomain-second.client.log" "${final_count}" \
     "${out_dir}/${run_id}-nxdomain.client-monitor.log"
   if [[ "${final_count}" != 2 ]]; then
     echo "NXDOMAIN response was incorrectly cached" >&2
     exit 1
   fi
-  stop_backends
 }
 
 need_cmd ip
