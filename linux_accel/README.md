@@ -33,6 +33,7 @@
 | --- | --- | --- |
 | DNS tc 监控 | 已完成 | 监控 IPv4 UDP DNS 请求/响应事件与延迟 |
 | DNS XDP 加速 | 已完成 | 对命中缓存的 DNS `A/IN` 查询直接 `XDP_TX` 回包 |
+| DNS 客户端自学习缓存 | 已实现，VM 已验证 | host-side veth XDP 命中回包，tc egress 从可信 DNS 响应学习 |
 | 多条 DNS 缓存 | 已完成 | 支持 `--cache-file` 批量加载域名、IP、TTL |
 | gRPC tc 监控 | 已完成 | 监控 TCP `50051` 端口请求包、响应包和传输层 RTT |
 | gRPC 快缓存 | 已完成原型 | 面向 h2c unary 健康检查类请求做快速响应 |

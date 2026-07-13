@@ -36,19 +36,23 @@ bool encode_dns_qname(const std::string &domain, dns_cache_key *key)
 
         if (label_len == 0 || label_len > 63)
             return false;
-        if (out + 1 + label_len >= DNS_CACHE_QNAME_MAX)
+        if (out + 1 + label_len >= DNS_XDP_QNAME_SCAN_MAX)
             return false;
 
         key->qname[out++] = static_cast<__u8>(label_len);
-        for (size_t i = 0; i < label_len; ++i)
-            key->qname[out++] = static_cast<__u8>(name[label_start + i]);
+        for (size_t i = 0; i < label_len; ++i) {
+            char character = name[label_start + i];
+            if (character >= 'A' && character <= 'Z')
+                character += 'a' - 'A';
+            key->qname[out++] = static_cast<__u8>(character);
+        }
 
         if (dot == std::string::npos)
             break;
         label_start = dot + 1;
     }
 
-    if (out >= DNS_CACHE_QNAME_MAX)
+    if (out >= DNS_XDP_QNAME_SCAN_MAX)
         return false;
     key->qname[out] = 0;
     key->qtype = 1;

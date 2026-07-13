@@ -33,6 +33,9 @@
 | D-05 | DNS TTL 过期 | 短 TTL 缓存项过期后再次查询 | 缓存项过期或被视为失效，`cache_expired` 增加 | 缓存元数据和指标已支持 | 已完成 |
 | D-06 | DNS XDP benchmark | `DURATION=5 LATENCY_COUNT=10000 LATENCY_WARMUP=500 ./bench/dns_xdp_cache_bench.sh` | userspace 和 XDP 两组均完成，丢包接近 0；`cache_hit > 0`、`cache_tx > 0` | `artifacts/dns-xdp-cache-bench/20260630-164919`：userspace `74702.04 qps`，XDP `533691.56 qps`，QPS `7.14x`；p99 `793.97 us` 降至 `4.35 us`，提升 `182.52x`；`cache_hit=10500 cache_tx=10500 ringbuf_drop=0` | 已完成 |
 | D-07 | tc 与 XDP 对比 | `./bench/dns_tc_vs_xdp_bench.sh` | 输出 no-hook userspace、tc monitor、generic XDP cache-hit 三组 QPS/p99 | 脚本生成 `artifacts/dns-tc-vs-xdp-bench/<timestamp>/summary.md` | 已完成 |
+| D-08 | DNS client-only 自学习 | `./bench/dns_dual_end_cache_bench.sh` | 第一次请求到 backend，后续请求命中 client XDP cache，backend count 不再增长 | `cache_learned > 0`、`cache_hit > 0`、`cache_tx > 0` | 已验证 |
+| D-09 | DNS 双端协同 | 同 D-08 | client miss 后 server XDP hit，返回响应被 client tc egress 学习，后续 client hit | backend count 为 0，server/client metrics 均有命中 | 已验证 |
+| D-10 | DNS client 安全回退 | 同 D-08 | TTL expiry、resolver isolation、不可信 resolver 不产生错误 cache entry | `cache_expired`、`learn_rejected` 与 backend count 符合预期 | 已验证 |
 
 ## gRPC 监控与快缓存
 

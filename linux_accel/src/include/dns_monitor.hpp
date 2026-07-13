@@ -52,13 +52,17 @@ struct FlowKeyEqual {
 struct Options {
     // Command-line config. hook=tc stays the default baseline.
     std::string ifname;
-    std::string bpf_object = "build/dns_monitor.bpf.o";
+    std::string bpf_object;
     std::string hook = "tc";
+    std::string role = "server";
     std::string xdp_mode = "native";
     std::string cache_domain;
     std::string cache_ip;
     std::string cache_file;
+    std::vector<std::string> trusted_dns;
     int cache_ttl = 60;
+    int max_learn_ttl = 300;
+    int learn_window_ms = 2000;
     int timeout_ms = 2000;
     bool verbose_events = false;
     double qps_spike_factor = 3.0;
@@ -92,6 +96,9 @@ struct ReaderState {
     uint64_t last_cache_misses = 0;
     uint64_t last_cache_expired = 0;
     uint64_t last_cache_tx = 0;
+    uint64_t last_cache_learned = 0;
+    uint64_t last_cache_learn_rejected = 0;
+    uint64_t last_cache_pending_expired = 0;
     int dropped_events_fd = -1;
     int cache_stats_fd = -1;
 };

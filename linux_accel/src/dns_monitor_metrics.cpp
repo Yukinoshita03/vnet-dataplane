@@ -21,6 +21,10 @@ const char *direction_name_local(__u32 direction)
         return "egress";
     case DNS_DIR_XDP_INGRESS:
         return "xdp-ingress";
+    case DNS_DIR_CLIENT_XDP_INGRESS:
+        return "client-xdp-ingress";
+    case DNS_DIR_CLIENT_TC_EGRESS:
+        return "client-tc-egress";
     default:
         return "unknown";
     }
@@ -282,12 +286,24 @@ void print_metrics(ReaderState *state)
         state->cache_stats_fd, DNS_CACHE_STAT_EXPIRED);
     uint64_t cache_tx = read_percpu_counter_total(
         state->cache_stats_fd, DNS_CACHE_STAT_TX);
+    uint64_t cache_learned = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_LEARNED);
+    uint64_t cache_learn_rejected = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_LEARN_REJECTED);
+    uint64_t cache_pending_expired = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_PENDING_EXPIRED);
 
     uint64_t cache_hit_delta = counter_delta(cache_hits, &state->last_cache_hits);
     uint64_t cache_miss_delta = counter_delta(cache_misses, &state->last_cache_misses);
     uint64_t cache_expired_delta =
         counter_delta(cache_expired, &state->last_cache_expired);
     uint64_t cache_tx_delta = counter_delta(cache_tx, &state->last_cache_tx);
+    uint64_t cache_learned_delta =
+        counter_delta(cache_learned, &state->last_cache_learned);
+    uint64_t cache_learn_rejected_delta = counter_delta(
+        cache_learn_rejected, &state->last_cache_learn_rejected);
+    uint64_t cache_pending_expired_delta = counter_delta(
+        cache_pending_expired, &state->last_cache_pending_expired);
 
     double avg_ms = average_ms(state->current.latency_samples_ns);
     double p95_ms = percentile_ms(state->current.latency_samples_ns, 95.0);
@@ -298,6 +314,7 @@ void print_metrics(ReaderState *state)
                                       p95_ms);
 
     std::cout << "dns_metrics dev=" << state->options->ifname
+              << " role=" << state->options->role
               << " qps=" << state->current.query_count
               << " rps=" << state->current.response_count
               << " pending=" << state->pending.size()
@@ -319,10 +336,13 @@ void print_metrics(ReaderState *state)
 
     std::cout << " ringbuf_drop=" << state->current.ringbuf_drop_delta
               << " cache_hit=" << cache_hit_delta
-              << " cache_miss=" << cache_miss_delta
-              << " cache_expired=" << cache_expired_delta
-              << " cache_tx=" << cache_tx_delta
-              << " alerts=" << alerts << "\n";
+               << " cache_miss=" << cache_miss_delta
+               << " cache_expired=" << cache_expired_delta
+               << " cache_tx=" << cache_tx_delta
+               << " cache_learned=" << cache_learned_delta
+               << " learn_rejected=" << cache_learn_rejected_delta
+               << " pending_expired=" << cache_pending_expired_delta
+               << " alerts=" << alerts << "\n";
 
     state->history.push_back(
         {state->current.query_count + state->current.response_count, p95_ms});

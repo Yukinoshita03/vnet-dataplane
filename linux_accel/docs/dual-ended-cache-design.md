@@ -148,3 +148,9 @@ DNS 证明了内核 XDP 加速路径。gRPC 证明了第二类服务的监控路
 2. 增强 HTTP/2 frame 处理，并补充 TLS 部署说明。
 3. 增加客户端侧缓存实验，复用当前服务端侧策略模型。
 4. 在 OpenStack `br-int` 路径生成真实 VM-to-VM workload 流量。
+
+## DNS 客户端侧自学习实现
+
+客户端侧实现已落在独立的 `dns_client_cache.bpf.o`：host-side client veth ingress 的 XDP 程序查找 `resolver IPv4 + normalized QNAME + QTYPE + QCLASS`，命中后使用 `XDP_TX` 将查询改写为响应。未命中时记录 pending query 并 `XDP_PASS`。
+
+同一 client veth 的 tc egress 程序只从可信 DNS resolver 返回、且能够匹配 pending 五元组、DNS ID 和问题字段的 `A/IN` 直接响应中学习。TTL 被限制在运行时配置上限，后续回包使用剩余 TTL。异常、EDNS、AAA/CNAME/负响应和不可信 resolver 一律 fail-open。详细运行方式见 `docs/dns-client-cache.md`。

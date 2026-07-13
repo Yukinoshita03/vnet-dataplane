@@ -33,8 +33,11 @@ void print_usage(const char *program)
     std::cerr << "Usage: " << program
               << " --dev <ifname> [--bpf-object <path>]"
               << " [--hook tc|xdp] [--xdp-mode native|generic]"
+              << " [--role server|client]"
               << " [--cache-domain <name> --cache-ip <ipv4> [--cache-ttl <sec>]]"
               << " [--cache-file <path>]"
+              << " [--trusted-dns <ipv4>] [--max-learn-ttl <sec>]"
+              << " [--learn-window-ms <ms>]"
               << " [--timeout-ms <ms>] [--verbose-events]"
               << " [--qps-spike-factor <n>] [--latency-spike-factor <n>]\n";
 }
@@ -51,10 +54,10 @@ bool parse_options(int argc, char **argv, Options *options)
             options->hook = argv[++i];
             if (options->hook != "tc" && options->hook != "xdp")
                 return false;
-            if (options->hook == "xdp" &&
-                options->bpf_object == "build/dns_monitor.bpf.o") {
-                options->bpf_object = "build/dns_xdp_monitor.bpf.o";
-            }
+        } else if (arg == "--role" && i + 1 < argc) {
+            options->role = argv[++i];
+            if (options->role != "server" && options->role != "client")
+                return false;
         } else if (arg == "--xdp-mode" && i + 1 < argc) {
             options->xdp_mode = argv[++i];
             if (options->xdp_mode != "native" && options->xdp_mode != "generic")
@@ -65,8 +68,16 @@ bool parse_options(int argc, char **argv, Options *options)
             options->cache_ip = argv[++i];
         } else if (arg == "--cache-file" && i + 1 < argc) {
             options->cache_file = argv[++i];
+        } else if (arg == "--trusted-dns" && i + 1 < argc) {
+            options->trusted_dns.emplace_back(argv[++i]);
         } else if (arg == "--cache-ttl" && i + 1 < argc) {
             if (!parse_int(argv[++i], &options->cache_ttl))
+                return false;
+        } else if (arg == "--max-learn-ttl" && i + 1 < argc) {
+            if (!parse_int(argv[++i], &options->max_learn_ttl))
+                return false;
+        } else if (arg == "--learn-window-ms" && i + 1 < argc) {
+            if (!parse_int(argv[++i], &options->learn_window_ms))
                 return false;
         } else if (arg == "--timeout-ms" && i + 1 < argc) {
             if (!parse_int(argv[++i], &options->timeout_ms))
@@ -97,6 +108,32 @@ bool parse_options(int argc, char **argv, Options *options)
         options->hook != "xdp") {
         std::cerr << "DNS cache injection is only supported with --hook xdp\n";
         return false;
+    }
+    if (options->role == "client" && options->hook != "xdp") {
+        std::cerr << "--role client requires --hook xdp\n";
+        return false;
+    }
+    if (options->role == "client" && options->trusted_dns.empty()) {
+        std::cerr << "--role client requires at least one --trusted-dns\n";
+        return false;
+    }
+    if (options->role == "client" &&
+        (!options->cache_domain.empty() || !options->cache_file.empty())) {
+        std::cerr << "client cache learns responses and does not accept static cache entries\n";
+        return false;
+    }
+    if (options->role != "client" && !options->trusted_dns.empty()) {
+        std::cerr << "--trusted-dns is only supported with --role client\n";
+        return false;
+    }
+
+    if (options->bpf_object.empty()) {
+        if (options->hook == "tc")
+            options->bpf_object = "build/dns_monitor.bpf.o";
+        else if (options->role == "client")
+            options->bpf_object = "build/dns_client_cache.bpf.o";
+        else
+            options->bpf_object = "build/dns_xdp_monitor.bpf.o";
     }
     return true;
 }

@@ -28,6 +28,11 @@ clang -target bpf -O2 -g \
 
 clang -target bpf -O2 -g \
   "${BPF_INCLUDES[@]}" \
+  -c "${ROOT_DIR}/bpf/dns_client_cache.c" \
+  -o "${BUILD_DIR}/dns_client_cache.bpf.o"
+
+clang -target bpf -O2 -g \
+  "${BPF_INCLUDES[@]}" \
   -c "${ROOT_DIR}/bpf/grpc_monitor.c" \
   -o "${BUILD_DIR}/grpc_monitor.bpf.o"
 
@@ -75,6 +80,7 @@ c++ -std=c++17 -O2 -g \
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_xdp_monitor.bpf.o"
+echo "Built ${BUILD_DIR}/dns_client_cache.bpf.o"
 echo "Built ${BUILD_DIR}/grpc_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_monitor"
 echo "Built ${BUILD_DIR}/grpc_monitor"

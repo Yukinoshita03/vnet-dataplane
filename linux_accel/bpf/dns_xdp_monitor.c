@@ -8,46 +8,12 @@
 #include <bpf/bpf_helpers.h>
 
 #include "dns_event.h"
+#include "dns_xdp_cache_helpers.h"
 
-#define DNS_PORT 53
-#define DNS_FLAG_RESPONSE 0x8000
-#define DNS_RCODE_MASK 0x000f
-#define DNS_QTYPE_A 1
-#define DNS_QCLASS_IN 1
-#define DNS_RESPONSE_NOERROR 0x8180
-#define DNS_A_ANSWER_LEN 16
-#define DNS_CACHE_ANSWER_OFFSET_MAX 511
-#define DNS_XDP_QNAME_SCAN_MAX 64
-#define DNS_FIXED_ANSWER_WRITER(offset)                                      \
-    if (answer_offset == offset) {                                           \
-        answer = data + offset;                                              \
-        if ((void *)(answer + DNS_A_ANSWER_LEN) > data_end)                  \
-            return -1;                                                       \
-        goto write_answer;                                                   \
-    }
-#define ETH_ALEN 6
 #define IP_FRAGMENT_MASK 0x3fff
 #define RINGBUF_SIZE (1 << 24)
 #define DNS_QUERY_START_MAX_ENTRIES 65536
 #define DNS_CACHE_MAX_ENTRIES 1024
-
-struct dns_hdr {
-    __be16 id;
-    __be16 flags;
-    __be16 qdcount;
-    __be16 ancount;
-    __be16 nscount;
-    __be16 arcount;
-};
-
-struct dns_a_answer {
-    __be16 name;
-    __be16 type;
-    __be16 class;
-    __be32 ttl;
-    __be16 rdlength;
-    __be32 addr;
-} __attribute__((packed));
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -121,184 +87,6 @@ static __always_inline void build_dns_flow_key(struct dns_flow_key *key,
     }
 }
 
-static __always_inline __u16 ipv4_header_checksum(struct iphdr *ip)
-{
-    __u8 *p = (__u8 *)ip;
-    __u32 sum = 0;
-
-    sum += ((__u16)p[0] << 8) | p[1];
-    sum += ((__u16)p[2] << 8) | p[3];
-    sum += ((__u16)p[4] << 8) | p[5];
-    sum += ((__u16)p[6] << 8) | p[7];
-    sum += ((__u16)p[8] << 8) | p[9];
-    sum += ((__u16)p[10] << 8) | p[11];
-    sum += ((__u16)p[12] << 8) | p[13];
-    sum += ((__u16)p[14] << 8) | p[15];
-    sum += ((__u16)p[16] << 8) | p[17];
-    sum += ((__u16)p[18] << 8) | p[19];
-
-    sum = (sum & 0xffff) + (sum >> 16);
-    sum = (sum & 0xffff) + (sum >> 16);
-    return bpf_htons((__u16)(~sum));
-}
-
-static __always_inline void swap_eth_addrs(struct ethhdr *eth)
-{
-    __u8 tmp;
-
-    tmp = eth->h_source[0];
-    eth->h_source[0] = eth->h_dest[0];
-    eth->h_dest[0] = tmp;
-    tmp = eth->h_source[1];
-    eth->h_source[1] = eth->h_dest[1];
-    eth->h_dest[1] = tmp;
-    tmp = eth->h_source[2];
-    eth->h_source[2] = eth->h_dest[2];
-    eth->h_dest[2] = tmp;
-    tmp = eth->h_source[3];
-    eth->h_source[3] = eth->h_dest[3];
-    eth->h_dest[3] = tmp;
-    tmp = eth->h_source[4];
-    eth->h_source[4] = eth->h_dest[4];
-    eth->h_dest[4] = tmp;
-    tmp = eth->h_source[5];
-    eth->h_source[5] = eth->h_dest[5];
-    eth->h_dest[5] = tmp;
-}
-
-static __always_inline int write_dns_a_answer(void *data, void *data_end,
-                                              __u32 answer_offset,
-                                              __u32 answer_ttl,
-                                              __u32 answer_ipv4)
-{
-    __u8 *answer;
-
-    DNS_FIXED_ANSWER_WRITER(60)
-    DNS_FIXED_ANSWER_WRITER(61)
-    DNS_FIXED_ANSWER_WRITER(62)
-    DNS_FIXED_ANSWER_WRITER(63)
-    DNS_FIXED_ANSWER_WRITER(64)
-    DNS_FIXED_ANSWER_WRITER(65)
-    DNS_FIXED_ANSWER_WRITER(66)
-    DNS_FIXED_ANSWER_WRITER(67)
-    DNS_FIXED_ANSWER_WRITER(68)
-    DNS_FIXED_ANSWER_WRITER(69)
-    DNS_FIXED_ANSWER_WRITER(70)
-    DNS_FIXED_ANSWER_WRITER(71)
-    DNS_FIXED_ANSWER_WRITER(72)
-    DNS_FIXED_ANSWER_WRITER(73)
-    DNS_FIXED_ANSWER_WRITER(74)
-    DNS_FIXED_ANSWER_WRITER(75)
-    DNS_FIXED_ANSWER_WRITER(76)
-    DNS_FIXED_ANSWER_WRITER(77)
-    DNS_FIXED_ANSWER_WRITER(78)
-    DNS_FIXED_ANSWER_WRITER(79)
-    DNS_FIXED_ANSWER_WRITER(80)
-    DNS_FIXED_ANSWER_WRITER(81)
-    DNS_FIXED_ANSWER_WRITER(82)
-    DNS_FIXED_ANSWER_WRITER(83)
-    DNS_FIXED_ANSWER_WRITER(84)
-    DNS_FIXED_ANSWER_WRITER(85)
-    DNS_FIXED_ANSWER_WRITER(86)
-    DNS_FIXED_ANSWER_WRITER(87)
-    DNS_FIXED_ANSWER_WRITER(88)
-    DNS_FIXED_ANSWER_WRITER(89)
-    DNS_FIXED_ANSWER_WRITER(90)
-    DNS_FIXED_ANSWER_WRITER(91)
-    DNS_FIXED_ANSWER_WRITER(92)
-    DNS_FIXED_ANSWER_WRITER(93)
-    DNS_FIXED_ANSWER_WRITER(94)
-    DNS_FIXED_ANSWER_WRITER(95)
-    DNS_FIXED_ANSWER_WRITER(96)
-    DNS_FIXED_ANSWER_WRITER(97)
-    DNS_FIXED_ANSWER_WRITER(98)
-    DNS_FIXED_ANSWER_WRITER(99)
-    DNS_FIXED_ANSWER_WRITER(100)
-    DNS_FIXED_ANSWER_WRITER(101)
-    DNS_FIXED_ANSWER_WRITER(102)
-    DNS_FIXED_ANSWER_WRITER(103)
-    DNS_FIXED_ANSWER_WRITER(104)
-    DNS_FIXED_ANSWER_WRITER(105)
-    DNS_FIXED_ANSWER_WRITER(106)
-    DNS_FIXED_ANSWER_WRITER(107)
-    DNS_FIXED_ANSWER_WRITER(108)
-    DNS_FIXED_ANSWER_WRITER(109)
-    DNS_FIXED_ANSWER_WRITER(110)
-    DNS_FIXED_ANSWER_WRITER(111)
-    DNS_FIXED_ANSWER_WRITER(112)
-    DNS_FIXED_ANSWER_WRITER(113)
-    DNS_FIXED_ANSWER_WRITER(114)
-    DNS_FIXED_ANSWER_WRITER(115)
-    DNS_FIXED_ANSWER_WRITER(116)
-    DNS_FIXED_ANSWER_WRITER(117)
-    DNS_FIXED_ANSWER_WRITER(118)
-    DNS_FIXED_ANSWER_WRITER(119)
-    DNS_FIXED_ANSWER_WRITER(120)
-    DNS_FIXED_ANSWER_WRITER(121)
-    DNS_FIXED_ANSWER_WRITER(122)
-    return -1;
-
-write_answer:
-    answer[0] = 0xc0;
-    answer[1] = 0x0c;
-    answer[2] = 0x00;
-    answer[3] = DNS_QTYPE_A;
-    answer[4] = 0x00;
-    answer[5] = DNS_QCLASS_IN;
-    answer[6] = (__u8)(answer_ttl >> 24);
-    answer[7] = (__u8)(answer_ttl >> 16);
-    answer[8] = (__u8)(answer_ttl >> 8);
-    answer[9] = (__u8)answer_ttl;
-    answer[10] = 0x00;
-    answer[11] = 0x04;
-    answer[12] = (__u8)answer_ipv4;
-    answer[13] = (__u8)(answer_ipv4 >> 8);
-    answer[14] = (__u8)(answer_ipv4 >> 16);
-    answer[15] = (__u8)(answer_ipv4 >> 24);
-    return 0;
-}
-
-static __always_inline int parse_dns_question(void *data, void *data_end,
-                                              const struct dns_hdr *dns,
-                                              struct dns_cache_key *key,
-                                              __u32 *question_end_offset)
-{
-    int done = 0;
-    __u32 qname_len = 0;
-    __u8 *field;
-    __u8 *question = (__u8 *)(dns + 1);
-
-    __builtin_memset(key, 0, sizeof(*key));
-
-    for (int i = 0; i < DNS_XDP_QNAME_SCAN_MAX; i++) {
-        __u8 value;
-
-        if ((void *)(question + i + 1) > data_end)
-            return -1;
-
-        value = question[i];
-        key->qname[i] = value;
-
-        if (value == 0) {
-            done = 1;
-            qname_len = i + 1;
-            break;
-        }
-    }
-
-    if (!done)
-        return -1;
-
-    field = question + qname_len;
-    if ((void *)(field + 4) > data_end)
-        return -1;
-
-    key->qtype = ((__u16)field[0] << 8) | field[1];
-    key->qclass = ((__u16)field[2] << 8) | field[3];
-    *question_end_offset = (__u32)((long)field + 4 - (long)data);
-    return 0;
-}
-
 static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
                                                   void *data,
                                                   void *data_end,
@@ -321,6 +109,7 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     __u32 answer_offset;
     __u32 answer_ipv4;
     __u32 answer_ttl;
+    __u64 remaining_ns;
 
     if (is_response)
         return XDP_PASS;
@@ -332,7 +121,9 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     if (ip_header_len != sizeof(*ip))
         return XDP_PASS;
 
-    if (parse_dns_question(data, data_end, dns, &cache_key,
+    __builtin_memset(&cache_key, 0, sizeof(cache_key));
+    if (dns_parse_question(data, data_end, dns, cache_key.qname,
+                           &cache_key.qtype, &cache_key.qclass,
                            &question_end_offset) < 0)
         return XDP_PASS;
     if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
@@ -353,6 +144,12 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     increment_cache_stat(DNS_CACHE_STAT_HIT);
     answer_ipv4 = cache_value->answer_ipv4;
     answer_ttl = cache_value->ttl;
+    if (cache_value->expires_ns) {
+        remaining_ns = cache_value->expires_ns - now;
+        answer_ttl = (__u32)(remaining_ns / 1000000000ull);
+        if (!answer_ttl)
+            answer_ttl = 1;
+    }
 
     old_ip_len = bpf_ntohs(ip->tot_len);
     old_udp_len = bpf_ntohs(udp->len);
@@ -384,18 +181,18 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     if ((void *)(dns + 1) > data_end)
         return XDP_ABORTED;
 
-    if (write_dns_a_answer(data, data_end, answer_offset, answer_ttl,
+    if (dns_write_a_answer(data, data_end, answer_offset, answer_ttl,
                            answer_ipv4) < 0)
         return XDP_ABORTED;
 
-    swap_eth_addrs(eth);
+    dns_swap_eth_addrs(eth);
 
     __be32 tmp_ip = ip->saddr;
     ip->saddr = ip->daddr;
     ip->daddr = tmp_ip;
     ip->tot_len = bpf_htons(new_ip_len);
     ip->check = 0;
-    ip->check = ipv4_header_checksum(ip);
+    ip->check = dns_ipv4_header_checksum(ip);
 
     __be16 tmp_port = udp->source;
     udp->source = udp->dest;
