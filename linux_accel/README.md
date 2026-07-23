@@ -117,6 +117,41 @@ avg=410.80 us p50=320.58 us p95=769.29 us p99=2090.22 us
 ringbuf_drop=0
 ```
 
+### 2026-07-23 OpenStack DNS 端到端 A/B
+
+这组数据来自 Shuka1 OpenStack 项目的真实 OVN 租户网络和 tap 接口。服务端是
+CirrOS 中的合成 UDP DNS responder，客户端使用持久 UDP benchmark 连续发送 500
+次 `A/IN example.test` 查询；两组请求均为 500/500 成功。
+
+| 路径 | 总耗时 | 平均延迟 | 成功率 |
+| --- | ---: | ---: | ---: |
+| 原始路径，不挂载 DNS 加速 | 4.3695 s | 8.739 ms | 500/500 |
+| XDP DNS cache | 0.2907 s | 0.581 ms | 500/500 |
+| 加速效果 | 15.03x | 延迟下降 93.35% | - |
+
+XDP 侧观察到首次 `miss + learn`，随后命中 `cache_hit/cache_tx`，没有过期、拒绝
+或 ringbuf 丢包。使用 `nslookup` 做进程级测试时只快约 12.8%，主要是每次启动
+进程的固定开销稀释了网络路径收益。该结果证明了 OpenStack OVN/tap 路径上的
+DNS 快路径，但 DNS responder 是合成服务，不代表生产权威 DNS。
+
+### 2026-07-23 gRPC fast-cache A/B
+
+这组数据使用仓库自带的 `grpc_fast_cache_bench.sh`，拓扑为 `netns + veth`，协议
+为 h2c unary `/grpc.health.v1.Health/Check`，每组 500 次请求并带 50 次 warmup。
+它验证的是用户态 gRPC 响应缓存，不是 XDP 直接回包。
+
+| 路径 | QPS | 平均延迟 | p99 延迟 | 成功率 |
+| --- | ---: | ---: | ---: | ---: |
+| 直连后端 | 849.98 | 1.063 ms | 1.703 ms | 500/500 |
+| cache hit SERVING | 2614.69 | 0.344 ms | 0.584 ms | 500/500 |
+| 加速效果 | 3.08x | 下降 67.6% | 下降 65.7% | - |
+
+缓存统计为 `cache_hit=1094`、`fallback=0`、`tx_error=0`，其中包含 warmup 请求。
+对照的 response-cache miss 为 769.34 QPS、p99 1.951 ms，policy miss fallback 为
+703.29 QPS、p99 3.035 ms。因此 gRPC 加速依赖幂等方法和重复请求 payload；未命中
+时会承担代理和解析开销。由于本次 OpenStack 控制面 MySQL/InnoDB 损坏并持续返回
+HTTP 500，这组 gRPC 数据不宣称为 OpenStack VM-to-VM 端到端结果。
+
 ### 虚拟化与云场景映射
 
 - `netns + bridge + veth`：可复现的虚拟化路径基线。
