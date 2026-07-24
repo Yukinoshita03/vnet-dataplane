@@ -4,9 +4,12 @@
 
 #include <bpf/bpf.h>
 #include <errno.h>
+#include <linux/bpf.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -18,6 +21,8 @@ struct Options {
     std::string policy_file;
     std::string map_path;
     std::string grpc_map_path;
+    std::string grpc_response_map_path;
+    bool replace = false;
     bool validate_only = false;
 };
 
@@ -27,6 +32,8 @@ void print_usage(const char *program)
               << " --dns-cache-file <path> [--dns-map <pinned-map-path>]"
               << " | --policy-file <path> [--dns-map <pinned-map-path>]"
               << " [--grpc-map <pinned-map-path>]"
+              << " [--grpc-response-map <pinned-map-path>]"
+              << " [--replace]"
               << " [--validate-only]\n";
 }
 
@@ -42,6 +49,10 @@ bool parse_options(int argc, char **argv, Options *options)
             options->map_path = argv[++i];
         } else if (arg == "--grpc-map" && i + 1 < argc) {
             options->grpc_map_path = argv[++i];
+        } else if (arg == "--grpc-response-map" && i + 1 < argc) {
+            options->grpc_response_map_path = argv[++i];
+        } else if (arg == "--replace") {
+            options->replace = true;
         } else if (arg == "--validate-only") {
             options->validate_only = true;
         } else if (arg == "-h" || arg == "--help") {
@@ -56,12 +67,17 @@ bool parse_options(int argc, char **argv, Options *options)
         std::cerr << "Use exactly one of --dns-cache-file or --policy-file\n";
         return false;
     }
-    if (!options->validate_only && options->map_path.empty() && options->grpc_map_path.empty()) {
-        std::cerr << "at least one of --dns-map or --grpc-map is required unless --validate-only is set\n";
+    if (!options->validate_only && options->map_path.empty() &&
+        options->grpc_map_path.empty() &&
+        options->grpc_response_map_path.empty()) {
+        std::cerr << "at least one of --dns-map, --grpc-map, or "
+                  << "--grpc-response-map is required unless --validate-only is set\n";
         return false;
     }
-    if (!options->cache_file.empty() && !options->grpc_map_path.empty()) {
-        std::cerr << "--grpc-map requires --policy-file\n";
+    if (!options->cache_file.empty() &&
+        (!options->grpc_map_path.empty() ||
+         !options->grpc_response_map_path.empty())) {
+        std::cerr << "gRPC maps require --policy-file\n";
         return false;
     }
     return true;
@@ -89,6 +105,88 @@ bool install_grpc_policy_entries(int map_fd,
                   << " ttl=" << entry.ttl << "\n";
     }
     return true;
+}
+
+__u32 grpc_response_status(const std::string &status)
+{
+    if (status == "SERVING" || status == "serving")
+        return GRPC_RESPONSE_SERVING;
+    if (status == "NOT_SERVING" || status == "not_serving")
+        return GRPC_RESPONSE_NOT_SERVING;
+    return 0;
+}
+
+bool install_grpc_response_entries(
+    int map_fd, const std::vector<GrpcResponseCacheEntry> &entries,
+    std::string *error)
+{
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+    for (const GrpcResponseCacheEntry &entry : entries) {
+        const __u32 status = grpc_response_status(entry.status);
+        if (!status) {
+            if (error)
+                *error = "invalid gRPC response status: " + entry.status;
+            return false;
+        }
+
+        grpc_response_cache_key key = {};
+        key.method_hash = entry.method_hash;
+        key.payload_hash = entry.payload_hash;
+        grpc_response_cache_value value = {};
+        value.status = status;
+        value.expires_ns = static_cast<__u64>(now) +
+                           static_cast<__u64>(entry.ttl) * 1000000000ull;
+        if (bpf_map_update_elem(map_fd, &key, &value, BPF_ANY) != 0) {
+            if (error) {
+                *error = std::string("failed to update grpc_response_cache: ") +
+                         strerror(errno);
+            }
+            return false;
+        }
+        std::cout << "Installed gRPC response entry " << entry.method
+                  << " payload=" << entry.payload
+                  << " status=" << entry.status
+                  << " ttl=" << entry.ttl << "\n";
+    }
+    return true;
+}
+
+bool clear_map(int map_fd, const char *map_name, std::string *error)
+{
+    struct bpf_map_info info = {};
+    __u32 info_len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(map_fd, &info, &info_len) != 0 ||
+        info.key_size == 0 || info.key_size > 4096) {
+        if (error)
+            *error = std::string("failed to inspect ") + map_name + ": " +
+                     strerror(errno);
+        return false;
+    }
+    std::vector<unsigned char> current(info.key_size);
+    std::vector<unsigned char> next(info.key_size);
+    bool have_current = false;
+    for (;;) {
+        void *previous = have_current ? current.data() : nullptr;
+        if (bpf_map_get_next_key(map_fd, previous, next.data()) != 0) {
+            if (errno == ENOENT)
+                return true;
+            if (error)
+                *error = std::string("failed to enumerate ") + map_name +
+                         ": " + strerror(errno);
+            return false;
+        }
+        if (bpf_map_delete_elem(map_fd, next.data()) != 0) {
+            if (error)
+                *error = std::string("failed to clear ") + map_name + ": " +
+                         strerror(errno);
+            return false;
+        }
+        current.swap(next);
+        std::fill(next.begin(), next.end(), 0);
+        have_current = true;
+    }
 }
 } // namespace
 
@@ -130,8 +228,9 @@ int main(int argc, char **argv)
         return 0;
     }
 
-        int cache_fd = -1;
+    int cache_fd = -1;
     int grpc_fd = -1;
+    int grpc_response_fd = -1;
 
     if (!options.map_path.empty()) {
         cache_fd = bpf_obj_get(options.map_path.c_str());
@@ -141,6 +240,11 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        if (options.replace && !clear_map(cache_fd, "dns_cache", &error)) {
+            std::cerr << error << "\n";
+            close(cache_fd);
+            return 1;
+        }
         for (const DnsCacheEntry &entry : entries) {
             if (!install_dns_cache_entry(cache_fd, entry, &error)) {
                 std::cerr << error << "\n";
@@ -162,6 +266,12 @@ int main(int argc, char **argv)
                       << options.grpc_map_path << ": " << strerror(errno) << "\n";
             return 1;
         }
+        if (options.replace &&
+            !clear_map(grpc_fd, "grpc_policy_map", &error)) {
+            std::cerr << error << "\n";
+            close(grpc_fd);
+            return 1;
+        }
         if (!install_grpc_policy_entries(grpc_fd, policy.grpc_entries, &error)) {
             std::cerr << error << "\n";
             close(grpc_fd);
@@ -172,7 +282,33 @@ int main(int argc, char **argv)
                   << policy.grpc_entries.size() << "\n";
     }
 
-    if (options.map_path.empty() && options.grpc_map_path.empty()) {
+    if (!options.grpc_response_map_path.empty()) {
+        grpc_response_fd = bpf_obj_get(options.grpc_response_map_path.c_str());
+        if (grpc_response_fd < 0) {
+            std::cerr << "Failed to open pinned gRPC response map "
+                      << options.grpc_response_map_path << ": "
+                      << strerror(errno) << "\n";
+            return 1;
+        }
+        if (options.replace &&
+            !clear_map(grpc_response_fd, "grpc_response_cache", &error)) {
+            std::cerr << error << "\n";
+            close(grpc_response_fd);
+            return 1;
+        }
+        if (!install_grpc_response_entries(grpc_response_fd,
+                                           policy.grpc_cache_entries, &error)) {
+            std::cerr << error << "\n";
+            close(grpc_response_fd);
+            return 1;
+        }
+        close(grpc_response_fd);
+        std::cout << "Installed gRPC response entries="
+                  << policy.grpc_cache_entries.size() << "\n";
+    }
+
+    if (options.map_path.empty() && options.grpc_map_path.empty() &&
+        options.grpc_response_map_path.empty()) {
         std::cout << "No maps selected\n";
     }
     return 0;

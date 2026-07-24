@@ -11,7 +11,7 @@
 | 支持两种以上网络服务 | 已完成 | DNS 与 gRPC |
 | 虚拟化数据包路径优化实验 | 已完成 | `netns + bridge + veth` benchmark |
 | OpenStack/Kubernetes 挂载点证据 | 已完成 | OpenStack tc smoke、Kubernetes 路径探测、workload evidence 脚本 |
-| 双端缓存设计与动态策略 | 已完成 | 设计文档与统一 DNS/gRPC 策略文件 |
+| 双端缓存设计与动态策略 | 进行中 | 设计文档、统一策略文件、pinned response map 与 `cachectl --replace`；待 Linux/OpenStack 实测 |
 | 可复现 benchmark 与 demo | 已完成 | `bench/` 脚本与 demo runbook |
 
 ## 需求明细
@@ -22,6 +22,7 @@
 | 加速 DNS | XDP DNS 缓存命中路径直接 `XDP_TX` 回包 | `bpf/dns_xdp_monitor.c`、`src/dns_monitor.cpp`、`src/dns_cache_config.cpp` | `bench/dns_xdp_cache_bench.sh`：QPS `7.14x`，p99 `182.52x`，`cache_hit=10500 cache_tx=10500 ringbuf_drop=0` |
 | 对比 tc 与 XDP | 同一拓扑对比 no-hook userspace、tc monitor、generic XDP cache-hit 路径 | `bench/dns_tc_vs_xdp_bench.sh`、`docs/tc-dns-event-mvp.md` | 生成 `artifacts/dns-tc-vs-xdp-bench/<timestamp>/summary.md`，包含 QPS 和 p99 对比 |
 | 加速 gRPC | h2c unary fast-cache/proxy 接入 `grpc_policy_map`，用 `method_hash + payload_hash` 做响应缓存 key | `src/grpc_fast_cache.cpp`、`bpf/grpc_monitor.c`、`src/cache_policy.cpp` | `bench/grpc_fast_cache_bench.sh`：QPS `3.69x`，p99 `3.33x`，`fallback_error=0 tx_error=0` |
+| OpenStack VM-to-VM gRPC E2E | 临时 backend/cache/client VM，cache VM 通过 pinned policy/response map 提供命中和动态更新 | `bench/openstack_grpc_e2e.sh`、`bench/openstack_grpc_harness.c`、`docs/openstack-grpc-e2e.md` | 脚本已完成；当前等待 Shuka1 SSH 恢复后执行并记录 QPS、cache-only、`SERVING→NOT_SERVING` |
 | 支持至少两种服务 | DNS 和 gRPC 都具备监控与加速路径 | `bpf/dns_*`、`src/dns_*`、`bpf/grpc_monitor.c`、`src/grpc_*` | DNS XDP benchmark 与 gRPC fast-cache benchmark |
 | 动态缓存策略配置 | 统一策略文件支持 `dns`、`grpc`、`grpc-cache`；`cachectl` 校验并加载 DNS/gRPC BPF map | `src/cachectl.cpp`、`src/cache_policy.cpp`、`src/include/cache_policy.hpp` | `cachectl --policy-file --validate-only` 输出 `dns_entries`、`grpc_entries`、`grpc_cache_entries` |
 | 双端缓存架构 | 文档说明客户端/服务端角色、hook 选择、策略模型和 hit/miss 指标 | `docs/dual-ended-cache-design.md` | 作为最终报告和 demo 的设计证据 |
@@ -59,6 +60,39 @@
 | Xpress DNS 基线 | 同 VM 对比中，本项目相对 patch 后 Xpress DNS：QPS `1.07x`，p99 `1.74x` |
 
 ## 已知边界
+
+## Latest OpenStack E2E status (2026-07-24)
+
+The OpenStack VM-to-VM gRPC harness now completes baseline, cache hit,
+backend-stop cache-only, and runtime `SERVING -> NOT_SERVING` checks. On the
+available CirrOS image the guest kernel has no writable bpffs, so the measured
+run is `guest-userspace-fallback`, not guest eBPF acceleration. At
+`BACKEND_DELAY_US=5000`, it measured `2.26x` QPS, average latency reduction
+`55.8%`, and p99 reduction `43.7%`; at `300us` it measured `0.98x`, showing
+that OpenStack network/proxy overhead dominates when backend work is small.
+The remaining contest evidence is a Linux guest image with writable bpffs and
+the same E2E run in `guest-ebpf` mode.
+
+## Guest-eBPF E2E closure (2026-07-24)
+
+The remaining guest-side requirement is now closed. With the Ubuntu 24.04
+cloud image, three temporary OpenStack VMs completed a real private-network
+`client -> cache -> backend` gRPC path while the cache VM used pinned BPF
+policy and response maps:
+
+| check | observed result |
+| --- | --- |
+| direct baseline | `79.88 qps`, `avg=11054.12 us`, `p99=12367 us` |
+| pinned-map cache hit | `184.49 qps`, `avg=4701.18 us`, `p99=5875 us` |
+| speedup | `2.31x qps`, average `-57.5%`, p99 `-52.5%` |
+| backend stop | `cache-only count=100 failed=0 serving=100` |
+| dynamic policy update | `NOT_SERVING=20/20` |
+| cache process evidence | `cache_hit=49`, `response_cache_miss=0`, `fallback_error=0` |
+
+The pinned response-map dump contained the expected method/payload key and the
+host monitor loaded with `ringbuf_drop=0`. This closes the OpenStack guest-eBPF
+acceleration evidence for the gRPC service. The formal artifact is
+`/home/xuexia/vnet-dataplane-verify/linux_accel/artifacts/openstack-grpc-e2e-guest-ebpf-formal`.
 
 - DNS 加速当前覆盖 IPv4 UDP DNS、单问题、`A/IN`、未压缩 QNAME、缓存命中请求。
 - gRPC 加速当前覆盖 h2c unary demo 流量，不覆盖 TLS、流式 RPC 或任意 protobuf 响应序列化。

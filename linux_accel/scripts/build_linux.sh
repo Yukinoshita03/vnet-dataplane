@@ -57,6 +57,7 @@ c++ -std=c++17 -O2 -g \
   -I"${ROOT_DIR}/src/include" \
   -I"${ROOT_DIR}/include" \
   "${ROOT_DIR}/src/grpc_fast_cache.cpp" \
+  "${ROOT_DIR}/src/grpc_cache_protocol.cpp" \
   "${ROOT_DIR}/src/cache_policy.cpp" \
   "${ROOT_DIR}/src/dns_cache_config.cpp" \
   -o "${BUILD_DIR}/grpc_fast_cache" \

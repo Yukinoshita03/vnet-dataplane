@@ -27,6 +27,22 @@ struct grpc_policy_value {
     __u8 _pad[3];
 };
 
+struct grpc_response_cache_key {
+    __u64 method_hash;
+    __u64 payload_hash;
+};
+
+enum grpc_response_status {
+    GRPC_RESPONSE_SERVING = 1,
+    GRPC_RESPONSE_NOT_SERVING = 2,
+};
+
+struct grpc_response_cache_value {
+    __u32 status;
+    __u32 _pad;
+    __u64 expires_ns;
+};
+
 struct grpc_flow_key {
     __u32 client_ip;
     __u32 server_ip;

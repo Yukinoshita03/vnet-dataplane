@@ -14,6 +14,7 @@
 #define IP_FRAGMENT_MASK 0x3fff
 #define RINGBUF_SIZE (1 << 24)
 #define GRPC_FLOW_MAX_ENTRIES 65536
+#define GRPC_RESPONSE_CACHE_MAX_ENTRIES 4096
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -46,6 +47,13 @@ struct {
     __type(key, struct grpc_policy_key);
     __type(value, struct grpc_policy_value);
 } grpc_policy_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, GRPC_RESPONSE_CACHE_MAX_ENTRIES);
+    __type(key, struct grpc_response_cache_key);
+    __type(value, struct grpc_response_cache_value);
+} grpc_resp_cache SEC(".maps");
 
 static __always_inline int read_packet(void *dst, const struct __sk_buff *skb,
                                        __u32 offset, __u32 len)

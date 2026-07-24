@@ -17,6 +17,7 @@ warmup="${WARMUP:-50}"
 duration="${DURATION:-10}"
 sudo_pass="${SUDO_PASS:-}"
 pin_dir="${PIN_DIR:-/sys/fs/bpf/ebpf-network-service-cache}"
+response_map="${pin_dir}/grpc_response_cache"
 method="/grpc.health.v1.Health/Check"
 fallback_method="/demo.Cache/Get"
 serving_payload="demo"
@@ -272,24 +273,26 @@ grpc ${method} 60 idempotent
 grpc-cache ${method} ${serving_payload} SERVING 60
 grpc-cache ${method} ${not_serving_payload} NOT_SERVING 60
 POLICY
-run_sudo "${repo_dir}/build/cachectl" --policy-file "${out_dir}/cache-policy.txt" --grpc-map "${pin_dir}/grpc_policy_map" > "${out_dir}/cachectl.log"
+run_sudo "${repo_dir}/build/cachectl" --policy-file "${out_dir}/cache-policy.txt" \
+  --grpc-map "${pin_dir}/grpc_policy_map" --grpc-response-map "${response_map}" \
+  > "${out_dir}/cachectl.log"
 
 if [[ -n "${sudo_pass}" ]]; then
-  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${cache_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-fast-cache.log" 2>&1 &
+  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --grpc-response-map '${response_map}' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${cache_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-fast-cache.log" 2>&1 &
 else
-  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${cache_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-fast-cache.log" 2>&1 &
+  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --grpc-response-map "${response_map}" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${cache_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-fast-cache.log" 2>&1 &
 fi
 cache_pid=$!
 if [[ -n "${sudo_pass}" ]]; then
-  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${fallback_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-fallback.log" 2>&1 &
+  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --grpc-response-map '${response_map}' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${fallback_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-fallback.log" 2>&1 &
 else
-  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${fallback_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-fallback.log" 2>&1 &
+  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --grpc-response-map "${response_map}" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${fallback_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-fallback.log" 2>&1 &
 fi
 fallback_pid=$!
 if [[ -n "${sudo_pass}" ]]; then
-  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${response_miss_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-response-miss.log" 2>&1 &
+  nohup sh -c "printf '%s\n' '${sudo_pass}' | sudo -S timeout '$((duration + 20))s' '${repo_dir}/build/grpc_fast_cache' --grpc-map '${pin_dir}/grpc_policy_map' --grpc-response-map '${response_map}' --cache-file '${out_dir}/cache-policy.txt' --listen '${srv_ip}:${response_miss_port}' --backend '${srv_ip}:${backend_port}' --method '${method}' --verbose" > "${out_dir}/grpc-response-miss.log" 2>&1 &
 else
-  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${response_miss_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-response-miss.log" 2>&1 &
+  nohup sudo timeout "$((duration + 20))s" "${repo_dir}/build/grpc_fast_cache" --grpc-map "${pin_dir}/grpc_policy_map" --grpc-response-map "${response_map}" --cache-file "${out_dir}/cache-policy.txt" --listen "${srv_ip}:${response_miss_port}" --backend "${srv_ip}:${backend_port}" --method "${method}" --verbose > "${out_dir}/grpc-response-miss.log" 2>&1 &
 fi
 response_miss_pid=$!
 sleep 1

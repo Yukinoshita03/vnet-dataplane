@@ -366,29 +366,38 @@ bool ensure_dir(const std::string &path)
     return false;
 }
 
-bool pin_grpc_policy_map(bpf_object *obj, const std::string &pin_dir)
+bool pin_map(bpf_object *obj, const std::string &pin_dir,
+             const char *object_name, const char *pin_name)
 {
     if (pin_dir.empty())
         return true;
     if (!ensure_dir(pin_dir))
         return false;
 
-    bpf_map *policy_map = bpf_object__find_map_by_name(obj, "grpc_policy_map");
-    if (!policy_map) {
-        std::cerr << "Failed to find grpc_policy_map\n";
+    bpf_map *map = bpf_object__find_map_by_name(obj, object_name);
+    if (!map) {
+        std::cerr << "Failed to find " << object_name << "\n";
         return false;
     }
 
-    std::string pin_path = pin_dir + "/grpc_policy_map";
+    std::string pin_path = pin_dir + "/" + pin_name;
     unlink(pin_path.c_str());
-    int err = bpf_map__pin(policy_map, pin_path.c_str());
+    int err = bpf_map__pin(map, pin_path.c_str());
     if (err) {
-        std::cerr << "Failed to pin grpc_policy_map at " << pin_path
+        std::cerr << "Failed to pin " << object_name << " at " << pin_path
                   << ": " << strerror(-err) << "\n";
         return false;
     }
-    std::cout << "Pinned grpc_policy_map at " << pin_path << "\n";
+    std::cout << "Pinned " << object_name << " at " << pin_path << "\n";
     return true;
+}
+
+bool pin_grpc_maps(bpf_object *obj, const std::string &pin_dir)
+{
+    // Keep the ELF/kernel map name within BPF_OBJ_NAME_LEN while preserving
+    // the longer, stable pinned path used by cachectl and benchmark scripts.
+    return pin_map(obj, pin_dir, "grpc_policy_map", "grpc_policy_map") &&
+           pin_map(obj, pin_dir, "grpc_resp_cache", "grpc_response_cache");
 }
 
 } // namespace
@@ -441,7 +450,7 @@ int main(int argc, char **argv)
         bpf_object__close(obj);
         return 1;
     }
-    if (!pin_grpc_policy_map(obj, options.pin_dir)) {
+    if (!pin_grpc_maps(obj, options.pin_dir)) {
         bpf_object__close(obj);
         return 1;
     }

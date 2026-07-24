@@ -207,9 +207,11 @@ static __always_inline int try_client_cache_response(
         return XDP_PASS;
     }
 
-    old_ip_len = bpf_ntohs(ip->tot_len);
-    old_udp_len = bpf_ntohs(udp->len);
-    logical_packet_end_offset = (__u32)((long)ip - (long)data) + old_ip_len;
+
+
+
+
+
     if (question_end_offset != logical_packet_end_offset)
         return XDP_PASS;
 

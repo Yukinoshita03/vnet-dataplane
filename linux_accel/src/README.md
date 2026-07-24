@@ -13,3 +13,19 @@
 - `packet_parser.cpp`：用户态 L2-L4 协议解析模块，负责 Ethernet / IPv4 / TCP / UDP 头解析。
 - `virt_service_classifier.cpp`：面向 `veth / tap / bridge` 虚拟化路径的原始帧服务分类工具，可识别 DNS / gRPC / other。
 - `cache policy manager`：双端缓存策略控制面逻辑。
+
+## gRPC fast-cache module layout
+
+The gRPC cache is intentionally split by responsibility:
+
+- `grpc_fast_cache.cpp`: process lifecycle, option validation, listener,
+  backend fallback, map-backed cache lookup, statistics, and the main loop.
+- `grpc_cache_types.hpp`: shared cache key, request, option, status, and
+  statistics types.
+- `grpc_cache_protocol.hpp` / `grpc_cache_protocol.cpp`: h2c preface and
+  frame parsing, the small HPACK subset used by the demo, payload hashing, and
+  gRPC Health Check response encoding.
+
+`scripts/build_linux.sh` and the OpenStack E2E harness compile the protocol
+module explicitly. This keeps protocol changes independent from cache policy
+and runtime lifecycle changes.

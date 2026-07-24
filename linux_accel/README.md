@@ -245,6 +245,18 @@ OpenStack / OVS：
 ./bench/openstack_tc_attach_smoke.sh
 ```
 
+OpenStack VM-to-VM gRPC 端到端场景：
+
+```bash
+REQUESTS=500 WARMUP=50 BACKEND_DELAY_US=300 \
+  bash ./bench/openstack_grpc_e2e.sh
+```
+
+该脚本创建临时 backend/cache/client VM，使用 `cachectl` 写入 pinned
+policy/response map，验证 cache-only 返回，并检查运行时将同一响应从
+`SERVING` 更新为 `NOT_SERVING`。完整边界和输出文件见
+`docs/openstack-grpc-e2e.md`。
+
 Kubernetes：
 
 ```bash
@@ -273,7 +285,9 @@ grpc-cache /grpc.health.v1.Health/Check health-check SERVING 60
 sudo ./build/cachectl \
   --policy-file cache-policy.txt \
   --dns-map /sys/fs/bpf/dns_cache \
-  --grpc-map /sys/fs/bpf/ebpf-network-service-cache/grpc_policy_map
+  --grpc-map /sys/fs/bpf/ebpf-network-service-cache/grpc_policy_map \
+  --grpc-response-map /sys/fs/bpf/ebpf-network-service-cache/grpc_response_cache \
+  --replace
 ```
 
 ## 仓库结构
@@ -314,13 +328,14 @@ sudo ./build/cachectl \
 - DNS 加速当前聚焦 IPv4 UDP、单问题、`A/IN`、未压缩 QNAME、缓存命中请求。
 - gRPC 快缓存当前聚焦 h2c unary demo，不覆盖 TLS、流式 RPC 和完整 HTTP/2 状态机。
 - `virt_service_classifier` 当前只做 L2-L4 解析与基于端口的服务识别，还没有继续上卷到 HTTP/2、DNS payload 语义级解析。
-- OpenStack / Kubernetes 方向当前证明了可挂载性和路径可见性，完整业务级端到端压测还需要继续补。
+- OpenStack / Kubernetes 方向已有挂载性和路径可见性证据；OpenStack VM-to-VM
+  gRPC 脚本已准备好，但本轮仍需在 Shuka1 恢复后完成 Linux 编译和实测。
 
 ## 下一步
 
 我认为这个仓库后面最值得继续做的，不是再堆新点子，而是把下面三件事做深：
 
-1. 把 gRPC response cache 下沉成运行时可更新的 pinned map。
+1. 在 Shuka1 上编译并实测已接入的运行时可更新 gRPC response pinned map。
 2. 把用户态协议解析模块继续扩展到 HTTP/2 frame 和更细粒度的服务识别。
 3. 在真实 OpenStack/KVM 或 Kubernetes 业务流量上做一轮带指标留痕的完整实验。
 
@@ -332,3 +347,42 @@ sudo ./build/cachectl \
 - hyDNS: Acceleration of DNS Through Kernel Space Resolution
 - Xpress DNS
 - BMC: Accelerating Memcached using Safe In-kernel Caching and Pre-stack Processing
+
+## OpenStack VM-to-VM gRPC evidence (2026-07-24)
+
+The repaired Shuka1 DevStack lab completed a real three-VM path:
+`client -> cache:50052 -> backend:50051`. The only available guest image was
+CirrOS and its kernel had no writable bpffs, so these runs are explicitly
+`guest-userspace-fallback`; they are VM-to-VM network evidence, not guest eBPF
+acceleration evidence.
+
+| backend delay | direct QPS | cache QPS | QPS ratio | direct p99 | cache p99 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 300 us | 133.60 | 131.46 | 0.98x | 8.888 ms | 21.976 ms |
+| 5000 us | 77.65 | 175.68 | 2.26x | 16.034 ms | 9.030 ms |
+
+Both runs had zero failed requests. The 5000 us run verified cache-only
+`100/100` after backend stop and runtime `NOT_SERVING 20/20`; host-side
+`grpc_monitor` reported `ringbuf_drop=0`. See
+`docs/openstack-grpc-e2e.md` for the full evidence boundary and artifact paths.
+
+The guest-eBPF closure run used an Ubuntu 24.04 image with writable bpffs on
+the cache VM (`GUEST_BPF=1`, `CACHE_TTL_SEC=600`, backend delay 5000 us):
+
+| path | QPS | avg latency | p99 latency |
+| --- | ---: | ---: | ---: |
+| direct backend | 79.88 | 11.054 ms | 12.367 ms |
+| pinned-map cache hit | 184.49 | 4.701 ms | 5.875 ms |
+
+This is `2.31x` QPS, `57.5%` lower average latency, and `52.5%` lower p99.
+The same run passed `cache-only=100/100` after backend stop and a runtime
+`SERVING -> NOT_SERVING` update of `20/20`. Artifact:
+`artifacts/openstack-grpc-e2e-guest-ebpf-formal` on the Shuka1 controller.
+
+## Code modularization
+
+The gRPC fast-cache implementation is now split into shared types, an h2c/gRPC
+protocol module, and the runtime/cache-policy orchestrator. See
+`src/grpc_cache_types.hpp`, `src/grpc_cache_protocol.hpp`,
+`src/grpc_cache_protocol.cpp`, and `src/grpc_fast_cache.cpp`. The Linux build
+script and OpenStack E2E harness compile all modules explicitly.

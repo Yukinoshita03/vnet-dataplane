@@ -48,6 +48,7 @@
 | G-05 | gRPC NOT_SERVING 缓存命中 | 同 G-04 | 不同 payload 命中 NOT_SERVING 缓存响应，`not_serving_cache_hit > 0` | `2209.13 qps`，p99 `3932.00 us`，`not_serving_cache_hit=1042` | 已完成 |
 | G-06 | gRPC 响应缓存未命中回退 | 同 G-04，使用未缓存 payload | 请求回到后端，`response_cache_miss` 和 `fallback` 增加，`fallback_error=0` | `751.12 qps`，p99 `8203.98 us`，`response_cache_miss=1041 fallback=1041 fallback_error=0` | 已完成 |
 | G-07 | gRPC 策略未命中回退 | 同 G-04，使用未列入白名单的方法 | 请求回到后端，`policy_miss` 和 `fallback` 增加，`fallback_error=0` | `778.52 qps`，p99 `4844.19 us`，`policy_miss=1042 fallback=1042 fallback_error=0` | 已完成 |
+| G-08 | gRPC pinned response map 动态更新 | `cachectl --policy-file <policy> --grpc-response-map <path> --replace`；OpenStack 场景由 `bench/openstack_grpc_e2e.sh` 执行 | 同一 key 从 `SERVING` 更新为 `NOT_SERVING`，后端停止后 client 仍成功且状态切换 | 脚本和 harness 已完成；等待 Shuka1 恢复后的 Linux/OpenStack 实测日志 | 待验证 |
 
 ## 虚拟化与云原生证据
 
@@ -75,6 +76,36 @@
 | R-02 | 报告一致性扫描 | `rg -n "<old benchmark values>" README.md docs` | 不残留旧的核心性能结论 | 最新文档统一使用 DNS `7.14x/182.52x` 与 gRPC `3.69x/3.33x` | 已完成 |
 
 ## 已知缺口
+
+## Latest OpenStack gRPC E2E closure (2026-07-24)
+
+The Ubuntu guest run completed the previously pending G-08/OpenStack proof in
+`guest-ebpf` mode. It used real pinned policy/response maps in the cache VM and
+passed the baseline, cache-hit, backend-stop, and runtime update probes:
+
+| evidence | result |
+| --- | --- |
+| baseline vs cache | `79.88 -> 184.49 qps` (`2.31x`) |
+| latency | average `11054.12 -> 4701.18 us`; p99 `12367 -> 5875 us` |
+| cache-only | `100/100` successful after backend stop |
+| dynamic update | `NOT_SERVING=20/20` |
+| map/process logs | `cache_hit=49`, `response_cache_miss=0`, `fallback_error=0` |
+
+Artifact: `artifacts/openstack-grpc-e2e-guest-ebpf-formal` on the Shuka1
+controller. The floating-IP path started the host monitor with
+`ringbuf_drop=0`, but its tap did not decode transport events in this run;
+local and prior OpenStack monitor tests remain the monitor evidence.
+
+## Latest OpenStack gRPC E2E evidence (2026-07-24)
+
+`bench/openstack_grpc_e2e.sh` completed real three-VM OpenStack traffic with
+zero failed requests, cache-only success after backend stop, and
+`NOT_SERVING=20/20` after the runtime update. The current CirrOS guest uses
+`guest-userspace-fallback` because `/sys/fs/bpf` is not mounted/writable.
+Results were `0.98x` QPS at `300us` backend delay and `2.26x` QPS with `55.8%`
+average / `43.7%` p99 reduction at `5000us`. This is VM-to-VM path evidence,
+not a guest eBPF acceleration claim; repeat with a Linux image and
+`GUEST_BPF=1` to close that requirement.
 
 | 缺口 | 影响 | 后续工作 |
 | --- | --- | --- |
