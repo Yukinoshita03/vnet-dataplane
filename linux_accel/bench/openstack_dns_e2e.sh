@@ -149,7 +149,9 @@ trap cleanup EXIT
 for command in openstack ssh base64 awk grep ip python3 gcc c++ timeout; do need "$command"; done
 [[ -f "$openrc" ]] || { echo "missing openrc: $openrc" >&2; exit 1; }
 # shellcheck disable=SC1090
+set +u
 source "$openrc" "$openrc_user" "$openrc_project"
+set -u
 openstack_cmd token issue -f value -c id >/dev/null
 [[ "$guest_bpf" == 0 || "$guest_bpf" == 1 ]] || {
     echo "GUEST_BPF must be 0 or 1" >&2
