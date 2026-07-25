@@ -101,12 +101,12 @@ copy_guest() {
     local source_file=$2
     local target_file=$3
     if [[ -n "$netns" ]]; then
-        sudo_cmd ip netns exec "$netns" scp "${guest_opts[@]}" "$source_file" \
-            "$guest_user@$ip:$target_file"
-        ssh_guest "$ip" "chmod +x '$target_file'"
+        base64 "$source_file" | tr -d '\n' | sudo_cmd ip netns exec "$netns" \
+            ssh "${guest_opts[@]}" "$guest_user@$ip" \
+            "base64 -d > '$target_file' && chmod +x '$target_file'"
     else
-        scp "${guest_opts[@]}" "$source_file" "$guest_user@$ip:$target_file"
-        ssh_guest "$ip" "chmod +x '$target_file'"
+        base64 "$source_file" | tr -d '\n' | ssh "${guest_opts[@]}" \
+            "$guest_user@$ip" "base64 -d > '$target_file' && chmod +x '$target_file'"
     fi
 }
 
@@ -166,7 +166,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in openstack ssh scp base64 awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
+for command in openstack ssh base64 awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
 [[ -f "$openrc" ]] || { echo "missing openrc: $openrc" >&2; exit 1; }
 # shellcheck disable=SC1090
 set +u
