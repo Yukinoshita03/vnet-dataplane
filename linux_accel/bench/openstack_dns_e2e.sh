@@ -12,6 +12,8 @@ network=${NETWORK:-private}
 image=${IMAGE:-ubuntu-24.04-noble-cloud}
 flavor=${FLAVOR:-m1.small}
 floating_network=${FLOATING_NETWORK:-public}
+use_floating_ip=${USE_FLOATING_IP:-1}
+floating_cidr=${FLOATING_CIDR:-172.24.4.0/24}
 netns=${NETNS:-auto}
 key_name=${KEY_NAME:-}
 guest_key=${GUEST_KEY:-}
@@ -182,16 +184,27 @@ printf 'netns=%s\n' "${netns:-none}" > "$out_dir/environment.md"
 }
 
 security_group_id=$(openstack_cmd security group create "$prefix-sg" -f value -c id)
-openstack_cmd security group rule create --protocol tcp --dst-port 22 "$security_group_id" >/dev/null
-openstack_cmd security group rule create --protocol udp --dst-port 53 "$security_group_id" >/dev/null
-openstack_cmd security group rule create --protocol icmp "$security_group_id" >/dev/null
+private_cidr=${PRIVATE_CIDR:-0.0.0.0/0}
+ssh_cidr=$private_cidr
+[[ "$use_floating_ip" == 1 ]] && ssh_cidr=$floating_cidr
+openstack_cmd security group rule create --protocol tcp --dst-port 22 \
+    --remote-ip "$ssh_cidr" "$security_group_id" >/dev/null
+openstack_cmd security group rule create --protocol udp --dst-port 53 \
+    --remote-ip "$private_cidr" "$security_group_id" >/dev/null
+openstack_cmd security group rule create --protocol icmp \
+    --remote-ip "$private_cidr" "$security_group_id" >/dev/null
 
 client_id=$(create_server "$prefix-client")
 backend_id=$(create_server "$prefix-backend")
 client_ip=$(server_fixed_ip "$client_id")
 backend_ip=$(server_fixed_ip "$backend_id")
-client_ssh_ip=$client_ip
-backend_ssh_ip=$backend_ip
+if [[ "$use_floating_ip" == 1 ]]; then
+    client_ssh_ip=$(allocate_floating_ip "$client_id")
+    backend_ssh_ip=$(allocate_floating_ip "$backend_id")
+else
+    client_ssh_ip=$client_ip
+    backend_ssh_ip=$backend_ip
+fi
 [[ -n "$client_ip" && -n "$backend_ip" ]] || { echo "failed to discover fixed IPs" >&2; exit 1; }
 printf 'client=%s client_ssh=%s backend=%s backend_ssh=%s\n' \
     "$client_ip" "$client_ssh_ip" "$backend_ip" "$backend_ssh_ip" | tee "$out_dir/topology.txt"
