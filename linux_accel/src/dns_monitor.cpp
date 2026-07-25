@@ -283,8 +283,10 @@ int main(int argc, char **argv)
         }
     } else if (options.role == "client") {
         if (!ensure_tc_hook(&attachments, ifindex) ||
-            !attach_tc_filter(&attachments, egress_prog, BPF_TC_EGRESS, 100,
-                              100, &attachments.tc_egress_attached)) {
+            !attach_tc_filter(&attachments, egress_prog, BPF_TC_INGRESS, 100,
+                              100, &attachments.tc_ingress_attached) ||
+            !attach_tc_filter(&attachments, egress_prog, BPF_TC_EGRESS, 101,
+                              101, &attachments.tc_egress_attached)) {
             cleanup_attachments(&attachments, ifindex, xdp_mode);
             bpf_object__close(obj);
             return 1;

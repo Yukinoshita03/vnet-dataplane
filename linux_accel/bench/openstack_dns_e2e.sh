@@ -52,9 +52,13 @@ backend_id=
 client_id=
 backend_ssh_ip=
 client_ssh_ip=
+client_port_id=
+client_tap_if=
+client_cache_mode=guest-ebpf
 security_group_id=
 floating_ip_ids=()
 monitor_pids=()
+client_host_monitor_pid=
 mkdir -p "$out_dir"
 exec > >(tee "$out_dir/run.log") 2>&1
 
@@ -67,8 +71,16 @@ sudo_cmd() {
         sudo "$@"
     fi
 }
+host_root_cmd() {
+    if [[ -n "$sudo_password" ]]; then
+        printf '%s\n' "$sudo_password" | sudo -S -p '' bash -c "$1"
+    else
+        sudo bash -c "$1"
+    fi
+}
 guest_opts=(-i "$guest_key" -o BatchMode=yes -o ConnectTimeout=8
-    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+    -o ControlMaster=auto -o ControlPersist=300 -o ControlPath="/tmp/codex-dns-%C")
 
 ssh_guest() {
     local ip=$1
@@ -101,12 +113,12 @@ copy_guest() {
     local source_file=$2
     local target_file=$3
     if [[ -n "$netns" ]]; then
-        base64 "$source_file" | tr -d '\n' | sudo_cmd ip netns exec "$netns" \
+        gzip -1c "$source_file" | base64 | tr -d '\n' | sudo_cmd ip netns exec "$netns" \
             ssh "${guest_opts[@]}" "$guest_user@$ip" \
-            "base64 -d > '$target_file' && chmod +x '$target_file'"
+            "base64 -d | gzip -d > '$target_file' && chmod +x '$target_file'"
     else
-        base64 "$source_file" | tr -d '\n' | ssh "${guest_opts[@]}" \
-            "$guest_user@$ip" "base64 -d > '$target_file' && chmod +x '$target_file'"
+        gzip -1c "$source_file" | base64 | tr -d '\n' | ssh "${guest_opts[@]}" \
+            "$guest_user@$ip" "base64 -d | gzip -d > '$target_file' && chmod +x '$target_file'"
     fi
 }
 
@@ -133,12 +145,21 @@ create_server() {
 }
 
 backend_count() {
-    guest_cmd "$backend_ssh_ip" "test -s /tmp/dns-backend-count && tr -d '[:space:]' < /tmp/dns-backend-count || printf 0"
+    guest_cmd "$backend_ssh_ip" "test -s /tmp/dns-backend-count && tail -n 1 /tmp/dns-backend-count | tr -d '[:space:]' || printf 0"
 }
 
 stop_guest_processes() {
-    guest_root_cmd "$backend_ssh_ip" 'for f in /tmp/dns-backend.pid /tmp/dns-server-monitor.pid; do if [ -s "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi; done; rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count; true' || true
-    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then kill "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; rm -f /tmp/dns-client-monitor.pid; true' || true
+    if [[ -n "$client_host_monitor_pid" ]]; then
+        sudo_cmd kill -TERM "$client_host_monitor_pid" >/dev/null 2>&1 || true
+        sleep 1
+        sudo_cmd kill -KILL "$client_host_monitor_pid" >/dev/null 2>&1 || true
+        client_host_monitor_pid=
+    fi
+    if [[ -n "$client_tap_if" ]]; then
+        host_root_cmd "tc qdisc del dev '$client_tap_if' clsact 2>/dev/null || true" || true
+    fi
+    guest_root_cmd "$backend_ssh_ip" 'for f in /tmp/dns-backend.pid /tmp/dns-server-monitor.pid; do if [ -s "$f" ]; then kill -TERM "$(cat "$f")" 2>/dev/null || true; fi; done; fuser -k -TERM 53/udp 2>/dev/null || true; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; fuser -k -KILL 53/udp 2>/dev/null || true; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count; true' || true
+    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then kill -TERM "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-client-monitor.pid; true' || true
 }
 
 cleanup() {
@@ -166,7 +187,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in openstack ssh base64 awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
+for command in openstack ssh base64 gzip awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
 [[ -f "$openrc" ]] || { echo "missing openrc: $openrc" >&2; exit 1; }
 # shellcheck disable=SC1090
 set +u
@@ -212,6 +233,11 @@ openstack_cmd server show "$client_id" > "$out_dir/client-server.txt"
 openstack_cmd server show "$backend_id" > "$out_dir/backend-server.txt"
 openstack_cmd port list --server "$client_id" > "$out_dir/client-ports.txt"
 openstack_cmd port list --server "$backend_id" > "$out_dir/backend-ports.txt"
+client_port_id=$(openstack_cmd port list --server "$client_id" -f value -c ID | head -n 1)
+client_tap_if="tap$(printf '%s' "$client_port_id" | cut -c1-11)"
+if ip link show "$client_tap_if" >/dev/null 2>&1 && [[ -f "$accel_dir/build/dns_client_cache.bpf.o" ]]; then
+    client_cache_mode=host-ebpf
+fi
 
 for endpoint in "$client_ssh_ip" "$backend_ssh_ip"; do
     ready=0
@@ -222,11 +248,15 @@ for endpoint in "$client_ssh_ip" "$backend_ssh_ip"; do
     [[ "$ready" == 1 ]] || { echo "SSH timeout: $endpoint" >&2; exit 1; }
 done
 
+for endpoint in "$client_ssh_ip" "$backend_ssh_ip"; do
+    guest_root_cmd "$endpoint" 'host=$(hostname); grep -q "[[:space:]]$host\([[:space:]]\|$\)" /etc/hosts || printf "127.0.1.1 %s\n" "$host" >> /etc/hosts'
+done
 guest_root_cmd "$client_ssh_ip" 'sudo -n true; ip route show default; uname -a; mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
 guest_root_cmd "$backend_ssh_ip" 'sudo -n true; ip route show default; uname -a; mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
 client_dev=$(guest_cmd "$client_ssh_ip" "ip route show default | awk 'NR==1{print \$5}'")
 backend_dev=$(guest_cmd "$backend_ssh_ip" "ip route show default | awk 'NR==1{print \$5}'")
-printf 'client_dev=%s backend_dev=%s guest_bpf=%s\n' "$client_dev" "$backend_dev" "$guest_bpf" >> "$out_dir/topology.txt"
+printf 'client_dev=%s backend_dev=%s client_tap=%s client_cache_mode=%s guest_bpf=%s\n' \
+    "$client_dev" "$backend_dev" "$client_tap_if" "$client_cache_mode" "$guest_bpf" >> "$out_dir/topology.txt"
 guest_cmd "$client_ssh_ip" "ip -br link; ip -br addr" > "$out_dir/client-interface-map.txt"
 guest_cmd "$backend_ssh_ip" "ip -br link; ip -br addr" > "$out_dir/backend-interface-map.txt"
 
@@ -261,6 +291,7 @@ start_backend() {
     guest_root_cmd "$backend_ssh_ip" \
         "rm -f /tmp/dns-backend-count /tmp/dns-backend.pid; nohup /tmp/openstack_dns_harness server 0.0.0.0 53 '$domain' '$answer_ip' '$ttl' /tmp/dns-backend-count '$mode_arg' >/tmp/dns-backend.log 2>&1 </dev/null & echo \$! >/tmp/dns-backend.pid"
     sleep 1
+    guest_root_cmd "$backend_ssh_ip" 'test -s /tmp/dns-backend.pid && kill -0 "$(cat /tmp/dns-backend.pid)"'
 }
 
 start_monitor() {
@@ -270,17 +301,24 @@ start_monitor() {
     if [[ "$side" == server ]]; then
         if [[ "$scenario" == server-only || "$scenario" == both ]]; then
             guest_root_cmd "$backend_ssh_ip" \
-                "nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook xdp --role server --xdp-mode generic --bpf-object /tmp/dns_xdp_monitor.bpf.o --cache-domain '$domain' --cache-ip '$answer_ip' --cache-ttl '$backend_ttl' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
+                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook xdp --role server --xdp-mode generic --bpf-object /tmp/dns_xdp_monitor.bpf.o --cache-domain '$domain' --cache-ip '$answer_ip' --cache-ttl '$backend_ttl' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
         elif [[ "$scenario" == monitor-only ]]; then
             guest_root_cmd "$backend_ssh_ip" \
-                "nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook tc --bpf-object /tmp/dns_monitor.bpf.o --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
+                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook tc --bpf-object /tmp/dns_monitor.bpf.o --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
         fi
     else
         if [[ "$scenario" == client-only || "$scenario" == both || "$scenario" == ttl || "$scenario" == untrusted || "$scenario" == nxdomain ]]; then
             local trusted=$backend_ip
             [[ "$scenario" == untrusted ]] && trusted=10.254.254.254
+            if [[ "$client_cache_mode" == host-ebpf ]]; then
+                local host_log="$out_dir/${scenario}.client-host.log"
+                local host_cmd="setsid timeout 90 '$dns_monitor' --dev '$client_tap_if' --hook xdp --role client --xdp-mode generic --bpf-object '$accel_dir/build/dns_client_cache.bpf.o' --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$host_log' 2>&1 </dev/null & echo \\$!"
+                client_host_monitor_pid=$(host_root_cmd "$host_cmd" | tail -n 1)
+                sleep 2
+                return
+            fi
             guest_root_cmd "$client_ssh_ip" \
-                "nohup timeout 90 /tmp/dns_monitor --dev '$client_dev' --hook xdp --role client --xdp-mode generic --bpf-object /tmp/dns_client_cache.bpf.o --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-client-monitor.pid"
+                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$client_dev' --hook xdp --role client --xdp-mode generic --bpf-object /tmp/dns_client_cache.bpf.o --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-client-monitor.pid"
         fi
     fi
     sleep 2
@@ -288,12 +326,16 @@ start_monitor() {
 
 monitor_line() {
     local log=$1
-    guest_cmd "$2" "grep 'dns_metrics' '$log' | tail -n 1" 2>/dev/null || true
+    if [[ "$2" == host ]]; then
+        grep 'dns_metrics' "$log" | tail -n 1 2>/dev/null || true
+    else
+        guest_cmd "$2" "grep 'dns_metrics' '$log' | tail -n 1" 2>/dev/null || true
+    fi
 }
 
 run_client() {
     guest_cmd "$client_ssh_ip" \
-        "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' '$requests' '$warmup'"
+        "timeout 120 /tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' '$requests' '$warmup'"
 }
 
 record_scenario() {
@@ -302,11 +344,12 @@ record_scenario() {
     local backend=$3
     local client_log=$4
     local server_log=$5
+    local client_target=${6:-$client_ssh_ip}
     {
         printf '### %s\n\n' "$name"
         printf 'client: `%s`\n\n' "$result"
         printf 'backend_requests: `%s`\n\n' "$backend"
-        printf 'client_metrics: `%s`\n\n' "$(monitor_line "$client_log" "$client_ssh_ip")"
+        printf 'client_metrics: `%s`\n\n' "$(monitor_line "$client_log" "$client_target")"
         printf 'server_metrics: `%s`\n\n' "$(monitor_line "$server_log" "$backend_ssh_ip")"
     } >> "$out_dir/summary.md"
 }
@@ -327,10 +370,23 @@ run_scenario() {
     sleep 1
     local count
     count=$(backend_count)
-    guest_cmd "$client_ssh_ip" "cat /tmp/dns-client-monitor.log /tmp/dns-client-$name.log 2>/dev/null || true" > "$out_dir/${name}.client-monitor.log" || true
+    local client_metrics_log=/tmp/dns-client-$name.log
+    local client_metrics_target=$client_ssh_ip
+    if [[ "$client_cache_mode" == host-ebpf ]]; then
+        client_metrics_log="$out_dir/${name}.client-host.log"
+        client_metrics_target=host
+        cp "$client_metrics_log" "$out_dir/${name}.client-monitor.log" 2>/dev/null || true
+    else
+        guest_cmd "$client_ssh_ip" "cat /tmp/dns-client-monitor.log /tmp/dns-client-$name.log 2>/dev/null || true" > "$out_dir/${name}.client-monitor.log" || true
+    fi
     guest_cmd "$backend_ssh_ip" "cat /tmp/dns-server-$name.log 2>/dev/null || true" > "$out_dir/${name}.server-monitor.log" || true
     printf '%s\n' "$count" > "$out_dir/${name}.backend-count"
-    record_scenario "$name" "$result" "$count" "/tmp/dns-client-$name.log" "/tmp/dns-server-$name.log"
+    case "$name" in
+        baseline|monitor-only) [[ "$count" == "$((requests + warmup))" ]] || { echo "$name backend count contaminated: $count" >&2; return 1; } ;;
+        server-only|both) [[ "$count" == 0 ]] || { echo "$name backend count expected 0, got $count" >&2; return 1; } ;;
+        client-only) [[ "$count" == 1 ]] || { echo "client-only backend count expected 1, got $count" >&2; return 1; } ;;
+    esac
+    record_scenario "$name" "$result" "$count" "$client_metrics_log" "/tmp/dns-server-$name.log" "$client_metrics_target"
     stop_guest_processes
 }
 
@@ -342,7 +398,7 @@ run_safety_checks() {
     sleep 2
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 0" > "$out_dir/ttl-expired.log" || true
     printf 'ttl_backend_requests=%s\n' "$(backend_count)" | tee "$out_dir/ttl-summary.txt"
-    [[ "$(backend_count)" == 2 ]] || { echo "TTL expiry check failed" >&2; return 1; }
+    [[ "$(backend_count)" == 3 ]] || { echo "TTL expiry check failed" >&2; return 1; }
     stop_guest_processes
 
     start_backend 60
@@ -363,7 +419,8 @@ run_safety_checks() {
 printf '# OpenStack DNS Dual-End Cache E2E\n\n' > "$out_dir/summary.md"
 printf 'mode=guest-ebpf\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
     "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
-printf 'backend_interface=%s\nclient_interface=%s\n' "$backend_dev" "$client_dev" >> "$out_dir/environment.md"
+printf 'backend_interface=%s\nclient_interface=%s\nclient_tap=%s\nclient_cache_mode=%s\n' \
+    "$backend_dev" "$client_dev" "$client_tap_if" "$client_cache_mode" >> "$out_dir/environment.md"
 
 for run_id in $(seq 1 "$repeat"); do
     printf '## Run %s\n\n' "$run_id" >> "$out_dir/summary.md"
