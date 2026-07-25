@@ -137,8 +137,8 @@ backend_count() {
 }
 
 stop_guest_processes() {
-    guest_root_cmd "$backend_ssh_ip" 'if [ -f /tmp/dns-backend.pid ]; then kill "$(cat /tmp/dns-backend.pid)" 2>/dev/null || true; fi; rm -f /tmp/dns-backend.pid /tmp/dns-backend-count; pkill -TERM -f "/tmp/dns_monitor" 2>/dev/null || true; true' || true
-    guest_root_cmd "$client_ssh_ip" 'if [ -f /tmp/dns-client-monitor.pid ]; then kill "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; rm -f /tmp/dns-client-monitor.pid; pkill -TERM -f "/tmp/dns_monitor" 2>/dev/null || true; true' || true
+    guest_root_cmd "$backend_ssh_ip" 'for f in /tmp/dns-backend.pid /tmp/dns-server-monitor.pid; do if [ -s "$f" ]; then kill "$(cat "$f")" 2>/dev/null || true; fi; done; rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count; true' || true
+    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then kill "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; rm -f /tmp/dns-client-monitor.pid; true' || true
 }
 
 cleanup() {
