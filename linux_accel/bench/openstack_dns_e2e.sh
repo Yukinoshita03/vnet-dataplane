@@ -222,8 +222,8 @@ for endpoint in "$client_ssh_ip" "$backend_ssh_ip"; do
     [[ "$ready" == 1 ]] || { echo "SSH timeout: $endpoint" >&2; exit 1; }
 done
 
-guest_root_cmd "$client_ssh_ip" 'sudo -n true && ip route show default && uname -a && mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
-guest_root_cmd "$backend_ssh_ip" 'sudo -n true && ip route show default && uname -a && mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+guest_root_cmd "$client_ssh_ip" 'sudo -n true; ip route show default; uname -a; mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
+guest_root_cmd "$backend_ssh_ip" 'sudo -n true; ip route show default; uname -a; mkdir -p /sys/fs/bpf; mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
 client_dev=$(guest_cmd "$client_ssh_ip" "ip route show default | awk 'NR==1{print \$5}'")
 backend_dev=$(guest_cmd "$backend_ssh_ip" "ip route show default | awk 'NR==1{print \$5}'")
 printf 'client_dev=%s backend_dev=%s guest_bpf=%s\n' "$client_dev" "$backend_dev" "$guest_bpf" >> "$out_dir/topology.txt"
@@ -249,8 +249,8 @@ copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_xdp_monitor.bpf.o" /tmp/dns_x
 copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_monitor.bpf.o" /tmp/dns_monitor.bpf.o
 
 if [[ "$guest_bpf" == 1 ]]; then
-    guest_root_cmd "$client_ssh_ip" 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
-    guest_root_cmd "$backend_ssh_ip" 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'
+    guest_root_cmd "$client_ssh_ip" 'mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
+    guest_root_cmd "$backend_ssh_ip" 'mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
 fi
 
 start_backend() {
