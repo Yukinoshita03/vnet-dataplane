@@ -12,6 +12,7 @@ network=${NETWORK:-private}
 image=${IMAGE:-ubuntu-24.04-noble-cloud}
 flavor=${FLAVOR:-m1.small}
 floating_network=${FLOATING_NETWORK:-public}
+netns=${NETNS:-auto}
 key_name=${KEY_NAME:-}
 guest_key=${GUEST_KEY:-}
 guest_user=${GUEST_USER:-ubuntu}
@@ -57,13 +58,24 @@ exec > >(tee "$out_dir/run.log") 2>&1
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1" >&2; exit 1; }; }
 openstack_cmd() { openstack "$@"; }
+sudo_cmd() {
+    if [[ -n "$sudo_password" ]]; then
+        printf '%s\n' "$sudo_password" | sudo -S -p '' "$@"
+    else
+        sudo "$@"
+    fi
+}
 guest_opts=(-i "$guest_key" -o BatchMode=yes -o ConnectTimeout=8
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
 ssh_guest() {
     local ip=$1
     shift
-    ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
+    if [[ -n "$netns" ]]; then
+        sudo_cmd ip netns exec "$netns" ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
+    else
+        ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
+    fi
 }
 
 guest_cmd() {
@@ -86,8 +98,14 @@ copy_guest() {
     local ip=$1
     local source_file=$2
     local target_file=$3
-    base64 "$source_file" | tr -d '\n' | ssh_guest "$ip" \
-        "base64 -d > '$target_file' && chmod +x '$target_file'"
+    if [[ -n "$netns" ]]; then
+        sudo_cmd ip netns exec "$netns" scp "${guest_opts[@]}" "$source_file" \
+            "$guest_user@$ip:$target_file"
+        ssh_guest "$ip" "chmod +x '$target_file'"
+    else
+        scp "${guest_opts[@]}" "$source_file" "$guest_user@$ip:$target_file"
+        ssh_guest "$ip" "chmod +x '$target_file'"
+    fi
 }
 
 server_fixed_ip() {
@@ -146,13 +164,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in openstack ssh base64 awk grep ip python3 gcc c++ timeout; do need "$command"; done
+for command in openstack ssh scp base64 awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
 [[ -f "$openrc" ]] || { echo "missing openrc: $openrc" >&2; exit 1; }
 # shellcheck disable=SC1090
 set +u
 source "$openrc" "$openrc_user" "$openrc_project"
 set -u
 openstack_cmd token issue -f value -c id >/dev/null
+if [[ "$netns" == auto ]]; then
+    netns=$(sudo_cmd ip netns list | awk '/^ovnmeta-/{print $1; exit}')
+fi
+[[ "$netns" == none ]] && netns=
+printf 'netns=%s\n' "${netns:-none}" > "$out_dir/environment.md"
 [[ "$guest_bpf" == 0 || "$guest_bpf" == 1 ]] || {
     echo "GUEST_BPF must be 0 or 1" >&2
     exit 1
@@ -167,8 +190,8 @@ client_id=$(create_server "$prefix-client")
 backend_id=$(create_server "$prefix-backend")
 client_ip=$(server_fixed_ip "$client_id")
 backend_ip=$(server_fixed_ip "$backend_id")
-client_ssh_ip=$(allocate_floating_ip "$client_id")
-backend_ssh_ip=$(allocate_floating_ip "$backend_id")
+client_ssh_ip=$client_ip
+backend_ssh_ip=$backend_ip
 [[ -n "$client_ip" && -n "$backend_ip" ]] || { echo "failed to discover fixed IPs" >&2; exit 1; }
 printf 'client=%s client_ssh=%s backend=%s backend_ssh=%s\n' \
     "$client_ip" "$client_ssh_ip" "$backend_ip" "$backend_ssh_ip" | tee "$out_dir/topology.txt"
@@ -325,8 +348,8 @@ run_safety_checks() {
 }
 
 printf '# OpenStack DNS Dual-End Cache E2E\n\n' > "$out_dir/summary.md"
-printf 'mode=guest-ebpf\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
-    "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
+printf 'mode=guest-ebpf\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
+    "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
 printf 'backend_interface=%s\nclient_interface=%s\n' "$backend_dev" "$client_dev" >> "$out_dir/environment.md"
 
 for run_id in $(seq 1 "$repeat"); do
