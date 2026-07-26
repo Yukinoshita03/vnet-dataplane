@@ -11,12 +11,14 @@ openrc_project=${OPENRC_PROJECT:-admin}
 network=${NETWORK:-private}
 image=${IMAGE:-ubuntu-24.04-noble-cloud}
 flavor=${FLAVOR:-m1.small}
+availability_zone=${AVAILABILITY_ZONE:-}
 floating_network=${FLOATING_NETWORK:-public}
 use_floating_ip=${USE_FLOATING_IP:-1}
 floating_cidr=${FLOATING_CIDR:-172.24.4.0/24}
 netns=${NETNS:-auto}
 key_name=${KEY_NAME:-}
 guest_key=${GUEST_KEY:-}
+temporary_key_name=
 guest_user=${GUEST_USER:-ubuntu}
 requests=${REQUESTS:-1000}
 warmup=${WARMUP:-100}
@@ -25,9 +27,13 @@ domain=${DOMAIN:-example.test}
 answer_ip=${ANSWER_IP:-10.0.0.123}
 backend_ttl=${BACKEND_TTL_SEC:-60}
 guest_bpf=${GUEST_BPF:-1}
-ssh_wait_attempts=${SSH_WAIT_ATTEMPTS:-120}
+ssh_wait_attempts=${SSH_WAIT_ATTEMPTS:-450}
+ssh_ready_timeout=${SSH_READY_TIMEOUT_SEC:-$((ssh_wait_attempts * 2))}
+ssh_probe_timeout=${SSH_PROBE_TIMEOUT_SEC:-8}
+ssh_command_timeout=${SSH_COMMAND_TIMEOUT_SEC:-45}
 keep_resources=${KEEP_RESOURCES:-0}
 sudo_password=${SUDO_PASS:-}
+sudo_askpass=
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     cat <<'EOF'
@@ -60,6 +66,11 @@ floating_ip_ids=()
 monitor_pids=()
 client_host_monitor_pid=
 mkdir -p "$out_dir"
+if [[ -n "$sudo_password" ]]; then
+    sudo_askpass="$out_dir/.sudo-askpass"
+    printf '%s\n' '#!/bin/sh' 'printf "%s\\n" "$SUDO_PASS"' > "$sudo_askpass"
+    chmod 700 "$sudo_askpass"
+fi
 exec > >(tee "$out_dir/run.log") 2>&1
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1" >&2; exit 1; }; }
@@ -67,6 +78,13 @@ openstack_cmd() { openstack "$@"; }
 sudo_cmd() {
     if [[ -n "$sudo_password" ]]; then
         printf '%s\n' "$sudo_password" | sudo -S -p '' "$@"
+    else
+        sudo "$@"
+    fi
+}
+sudo_stream_cmd() {
+    if [[ -n "$sudo_password" ]]; then
+        SUDO_ASKPASS="$sudo_askpass" SUDO_PASS="$sudo_password" sudo -A "$@"
     else
         sudo "$@"
     fi
@@ -80,16 +98,24 @@ host_root_cmd() {
 }
 guest_opts=(-i "$guest_key" -o BatchMode=yes -o ConnectTimeout=8
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
-    -o ControlMaster=auto -o ControlPersist=300 -o ControlPath="/tmp/codex-dns-%C")
+    -o ServerAliveInterval=5 -o ServerAliveCountMax=3
+    -o ControlMaster=no)
 
-ssh_guest() {
+ssh_guest_with_timeout() {
+    local timeout_seconds=$1
+    shift
     local ip=$1
     shift
     if [[ -n "$netns" ]]; then
-        sudo_cmd ip netns exec "$netns" ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
+        sudo_cmd timeout "$timeout_seconds" ip netns exec "$netns" \
+            ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
     else
-        ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
+        timeout "$timeout_seconds" ssh "${guest_opts[@]}" "$guest_user@$ip" "$@"
     fi
+}
+
+ssh_guest() {
+    ssh_guest_with_timeout "$ssh_command_timeout" "$@"
 }
 
 guest_cmd() {
@@ -113,7 +139,7 @@ copy_guest() {
     local source_file=$2
     local target_file=$3
     if [[ -n "$netns" ]]; then
-        gzip -1c "$source_file" | base64 | tr -d '\n' | sudo_cmd ip netns exec "$netns" \
+        gzip -1c "$source_file" | base64 | tr -d '\n' | sudo_stream_cmd ip netns exec "$netns" \
             ssh "${guest_opts[@]}" "$guest_user@$ip" \
             "base64 -d | gzip -d > '$target_file' && chmod +x '$target_file'"
     else
@@ -138,10 +164,14 @@ allocate_floating_ip() {
 }
 
 create_server() {
-    openstack_cmd server create --wait \
-        --image "$image" --flavor "$flavor" --network "$network" \
-        --security-group "$security_group_id" --key-name "$key_name" \
-        "$1" -f value -c id
+    local args=(server create --wait
+        --image "$image" --flavor "$flavor" --network "$network"
+        --security-group "$security_group_id" --key-name "$key_name")
+    if [[ -n "$availability_zone" ]]; then
+        args+=(--availability-zone "$availability_zone")
+    fi
+    args+=("$1" -f value -c id)
+    openstack_cmd "${args[@]}"
 }
 
 backend_count() {
@@ -175,6 +205,7 @@ cleanup() {
             [[ -n "$id" ]] && openstack_cmd floating ip delete "$id" >/dev/null 2>&1 || true
         done
         [[ -n "$security_group_id" ]] && openstack_cmd security group delete "$security_group_id" >/dev/null 2>&1 || true
+        [[ -n "$temporary_key_name" ]] && openstack_cmd keypair delete "$temporary_key_name" >/dev/null 2>&1 || true
     else
         echo "KEEP_RESOURCES=1; temporary servers and network resources preserved"
     fi
@@ -183,19 +214,30 @@ cleanup() {
         openstack_cmd server list --name "$prefix" -f value -c ID -c Name -c Status || true
     fi
     printf 'cleanup_status=%s\n' "$status" > "$out_dir/cleanup-status.txt"
+    [[ -n "$sudo_askpass" ]] && rm -f "$sudo_askpass"
     exit "$status"
 }
 trap cleanup EXIT
 
-for command in openstack ssh base64 gzip awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
+for command in openstack ssh ssh-keygen base64 gzip awk grep ip python3 gcc c++ timeout sudo; do need "$command"; done
 [[ -f "$openrc" ]] || { echo "missing openrc: $openrc" >&2; exit 1; }
 # shellcheck disable=SC1090
 set +u
 source "$openrc" "$openrc_user" "$openrc_project"
 set -u
 openstack_cmd token issue -f value -c id >/dev/null
+if [[ -z "$key_name" ]]; then
+    key_name="$prefix-key"
+    temporary_key_name=$key_name
+    key_public_file="$out_dir/guest-key.pub"
+    ssh-keygen -y -f "$guest_key" > "$key_public_file"
+    openstack_cmd keypair create --public-key "$key_public_file" "$key_name" >/dev/null
+fi
 if [[ "$netns" == auto ]]; then
-    netns=$(sudo_cmd ip netns list | awk '/^ovnmeta-/{print $1; exit}')
+    # Listing namespaces is unprivileged on the DevStack host.  Keeping this
+    # outside sudo avoids an inherited SUDO_PASS/pipe interaction selecting no
+    # namespace and then trying to reach floating IPs from the wrong context.
+    netns=$(ip netns list | awk '/^ovnmeta-/{print $1; exit}')
 fi
 [[ "$netns" == none ]] && netns=
 printf 'netns=%s\n' "${netns:-none}" > "$out_dir/environment.md"
@@ -241,8 +283,13 @@ fi
 
 for endpoint in "$client_ssh_ip" "$backend_ssh_ip"; do
     ready=0
-    for _ in $(seq 1 "$ssh_wait_attempts"); do
-        if ssh_guest "$endpoint" true >/dev/null 2>&1; then ready=1; break; fi
+    ready_deadline=$((SECONDS + ssh_ready_timeout))
+    while (( SECONDS < ready_deadline )); do
+        if ssh_guest_with_timeout "$ssh_probe_timeout" "$endpoint" \
+            true >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
         sleep 2
     done
     [[ "$ready" == 1 ]] || { echo "SSH timeout: $endpoint" >&2; exit 1; }
@@ -312,7 +359,7 @@ start_monitor() {
             [[ "$scenario" == untrusted ]] && trusted=10.254.254.254
             if [[ "$client_cache_mode" == host-ebpf ]]; then
                 local host_log="$out_dir/${scenario}.client-host.log"
-                local host_cmd="setsid timeout 90 '$dns_monitor' --dev '$client_tap_if' --hook xdp --role client --xdp-mode generic --bpf-object '$accel_dir/build/dns_client_cache.bpf.o' --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$host_log' 2>&1 </dev/null & echo \\$!"
+                local host_cmd="setsid timeout 90 '$dns_monitor' --dev '$client_tap_if' --hook xdp --role client --xdp-mode generic --bpf-object '$accel_dir/build/dns_client_cache.bpf.o' --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$host_log' 2>&1 </dev/null & echo \$!"
                 client_host_monitor_pid=$(host_root_cmd "$host_cmd" | tail -n 1)
                 sleep 2
                 return
@@ -326,10 +373,13 @@ start_monitor() {
 
 monitor_line() {
     local log=$1
+    local active_metrics='qps=[1-9]|rps=[1-9]|cache_hit=[1-9]|cache_learned=[1-9]|cache_tx=[1-9]'
     if [[ "$2" == host ]]; then
-        grep 'dns_metrics' "$log" | tail -n 1 2>/dev/null || true
+        [[ -f "$log" ]] || return 0
+        grep 'dns_metrics' "$log" 2>/dev/null | grep -E "$active_metrics" | tail -n 1 ||
+            grep 'dns_metrics' "$log" 2>/dev/null | tail -n 1 || true
     else
-        guest_cmd "$2" "grep 'dns_metrics' '$log' | tail -n 1" 2>/dev/null || true
+        guest_cmd "$2" "grep 'dns_metrics' '$log' | grep -E '$active_metrics' | tail -n 1 || grep 'dns_metrics' '$log' | tail -n 1" 2>/dev/null || true
     fi
 }
 
@@ -370,6 +420,15 @@ run_scenario() {
     sleep 1
     local count
     count=$(backend_count)
+    printf '%s\n' "$count" > "$out_dir/${name}.backend-count"
+    case "$name" in
+        baseline|monitor-only) [[ "$count" == "$((requests + warmup))" ]] || { echo "$name backend count contaminated: $count" >&2; return 1; } ;;
+        server-only|both) [[ "$count" == 0 ]] || { echo "$name backend count expected 0, got $count" >&2; return 1; } ;;
+        client-only) [[ "$count" == 1 ]] || { echo "client-only backend count expected 1, got $count" >&2; return 1; } ;;
+    esac
+    # dns_monitor emits its final aggregate when SIGTERM is handled.  Stop it
+    # before copying the logs so the artifacts contain cache learn/hit/tx data.
+    stop_guest_processes
     local client_metrics_log=/tmp/dns-client-$name.log
     local client_metrics_target=$client_ssh_ip
     if [[ "$client_cache_mode" == host-ebpf ]]; then
@@ -380,14 +439,7 @@ run_scenario() {
         guest_cmd "$client_ssh_ip" "cat /tmp/dns-client-monitor.log /tmp/dns-client-$name.log 2>/dev/null || true" > "$out_dir/${name}.client-monitor.log" || true
     fi
     guest_cmd "$backend_ssh_ip" "cat /tmp/dns-server-$name.log 2>/dev/null || true" > "$out_dir/${name}.server-monitor.log" || true
-    printf '%s\n' "$count" > "$out_dir/${name}.backend-count"
-    case "$name" in
-        baseline|monitor-only) [[ "$count" == "$((requests + warmup))" ]] || { echo "$name backend count contaminated: $count" >&2; return 1; } ;;
-        server-only|both) [[ "$count" == 0 ]] || { echo "$name backend count expected 0, got $count" >&2; return 1; } ;;
-        client-only) [[ "$count" == 1 ]] || { echo "client-only backend count expected 1, got $count" >&2; return 1; } ;;
-    esac
     record_scenario "$name" "$result" "$count" "$client_metrics_log" "/tmp/dns-server-$name.log" "$client_metrics_target"
-    stop_guest_processes
 }
 
 run_safety_checks() {
@@ -397,22 +449,28 @@ run_safety_checks() {
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 1" > "$out_dir/ttl-hit.log" || true
     sleep 2
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 0" > "$out_dir/ttl-expired.log" || true
-    printf 'ttl_backend_requests=%s\n' "$(backend_count)" | tee "$out_dir/ttl-summary.txt"
-    [[ "$(backend_count)" == 3 ]] || { echo "TTL expiry check failed" >&2; return 1; }
+    local count
+    count=$(backend_count) || { echo "TTL backend count read failed" >&2; return 1; }
+    printf 'ttl_backend_requests=%s\n' "$count" | tee "$out_dir/ttl-summary.txt"
+    # The warmup request seeds the cache, the measured request hits it, and the
+    # post-expiry request goes back to the backend: exactly two backend hits.
+    [[ "$count" == 2 ]] || { echo "TTL expiry check failed: $count" >&2; return 1; }
     stop_guest_processes
 
     start_backend 60
     start_monitor client untrusted
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/untrusted.log" || true
-    printf 'untrusted_backend_requests=%s\n' "$(backend_count)" | tee "$out_dir/untrusted-summary.txt"
-    [[ "$(backend_count)" == 2 ]] || { echo "untrusted resolver check failed" >&2; return 1; }
+    count=$(backend_count) || { echo "untrusted backend count read failed" >&2; return 1; }
+    printf 'untrusted_backend_requests=%s\n' "$count" | tee "$out_dir/untrusted-summary.txt"
+    [[ "$count" == 2 ]] || { echo "untrusted resolver check failed: $count" >&2; return 1; }
     stop_guest_processes
 
     start_backend 60 nxdomain
     start_monitor client nxdomain
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/nxdomain.log" || true
-    printf 'nxdomain_backend_requests=%s\n' "$(backend_count)" | tee "$out_dir/nxdomain-summary.txt"
-    [[ "$(backend_count)" == 2 ]] || { echo "NXDOMAIN check failed" >&2; return 1; }
+    count=$(backend_count) || { echo "NXDOMAIN backend count read failed" >&2; return 1; }
+    printf 'nxdomain_backend_requests=%s\n' "$count" | tee "$out_dir/nxdomain-summary.txt"
+    [[ "$count" == 2 ]] || { echo "NXDOMAIN check failed: $count" >&2; return 1; }
     stop_guest_processes
 }
 

@@ -2,9 +2,9 @@
 
 ## 结论
 
-OpenStack 私有网络中的 DNS 服务端 XDP 缓存已经完成可复现验证；在当前测试环境中，服务端缓存相对 baseline 的平均 QPS 约为 **1.99 倍**。客户端缓存必须挂在 OpenStack 计算节点的 guest tap 出口/入口路径，直接挂在 guest `ens3` 的 XDP ingress 无法观察本机发出的请求。改用 host tap 后，客户端学习和命中事件已出现，短 smoke 测试的客户端缓存 QPS 约为 **3.92 倍**。
+OpenStack 私有网络中的 DNS 双端缓存已经完成 host-tap 五轮正式验证。客户端缓存必须挂在计算节点对应的 guest tap 出口/入口路径；直接挂在 guest `ens3` 的 XDP ingress 无法观察本机发出的请求。
 
-严格的五轮 host-tap 正式结果尚未闭环，因此本文不把短 smoke 结果冒充正式五轮结果。
+最新正式数据使用中位数：baseline `2275.04 QPS`，server-only `2785.15 QPS`（`1.22x`），client-only `8346.38 QPS`（`3.67x`），both `8887.80 QPS`（`3.91x`）。全部 25 个主场景为 `1000/1000` 成功，TTL、未信任 resolver 与 NXDOMAIN 回退均通过，且 `cleanup_status=0`。
 
 ## 环境
 
@@ -13,6 +13,20 @@ OpenStack 私有网络中的 DNS 服务端 XDP 缓存已经完成可复现验证
 - DNS：UDP/IPv4，固定域名和 A 记录，`1000` 次请求，`100` 次 warmup，五轮
 - 服务端：guest 网卡 `ens3` 上 generic XDP
 - 客户端：host 计算节点对应 `tap<port-id>` 上的 eBPF client cache；旧 guest-`ens3` 模式仅保留作对照
+
+## 五轮 host-tap 正式数据（2026-07-26）
+
+该批结果来自 Shuka1 DevStack 的 OVN 私有网络；两台临时 Ubuntu 24.04 KVM 来宾固定在 `nova:master`，客户端 hook 位于 host-side `tap<port-id>`，服务端 hook 位于 backend VM `ens3` 的 generic XDP。每轮 `1000` 请求、`100` warmup。
+
+| 场景 | QPS min | QPS median | QPS max | 相对 baseline median | backend 请求 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline | 2215.48 | 2275.04 | 2374.79 | 1.00x | 1100 |
+| monitor-only | 1615.18 | 1906.57 | 2173.76 | 0.84x | 1100 |
+| server-only | 2642.65 | 2785.15 | 3136.49 | 1.22x | 0 |
+| client-only | 7937.00 | 8346.38 | 9350.94 | 3.67x | 1 |
+| both | 8776.74 | 8887.80 | 9406.44 | 3.91x | 0 |
+
+每轮 client-only 均观察到 `cache_learned=1 cache_hit=1099 cache_tx=1099`；both 同时观察到客户端上述学习/命中事件和服务端 `cache_hit=1 cache_tx=1`。正式 artifact 保存在实验机：`/tmp/vnet-dataplane-dns-e2e-20260726-1545/artifacts/dns-host-tap-formal-r1`。
 
 ## 五轮 guest-only 正式数据
 

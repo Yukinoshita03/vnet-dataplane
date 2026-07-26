@@ -58,6 +58,7 @@
 | V-02 | OpenStack 路径探测 | `./bench/openstack_path_probe.sh` | 只读列出 OVS/libvirt/OpenStack 可挂载接口 | DevStack 探测发现 12 个候选接口，包括 `br-ex`、`br-int`、`ens33`、`ovs-system`、`virbr0`、veth 链路 | 已完成 |
 | V-03 | OpenStack tc 挂载 smoke | `./bench/openstack_tc_attach_smoke.sh` | DNS 和 gRPC tc monitor 能在 `br-int` 挂载并卸载 | `openstack-tc-attach-smoke/20260627-160408`：`dns_tc=attached grpc_tc=attached` | 已完成 |
 | V-04 | OpenStack workload 证据 | `./bench/openstack_workload_evidence.sh` | summary 记录 OpenStack/OVS 状态、monitor 日志，并标注真实租户流量或 fallback | `openstack-workload-evidence/20260630-162110`：DNS `count=30 failed=0`，monitor `qps=33 rps=33`；gRPC `count=30 failed=0`，monitor `reqps=28 resps=29 p99=0.311ms` | 已完成 |
+| V-05 | OpenStack DNS 双端缓存 E2E | `REPEAT=5 REQUESTS=1000 WARMUP=100 GUEST_BPF=1 ./bench/openstack_dns_e2e.sh` | 五场景成功、回源计数断言、TTL/未信任 resolver/NXDOMAIN 回退和资源清理均通过 | 2026-07-26 host-tap：baseline median `2275.04 QPS`，server `2785.15`（`1.22x`），client `8346.38`（`3.67x`），both `8887.80`（`3.91x`）；`cleanup_status=0` | 已完成 |
 | K-01 | Kubernetes 路径探测 | `./bench/k8s_path_probe.sh` | 只读列出 node、CNI、pod-veth 和候选挂载点 | 在节点运行时会记录候选接口 | 已完成 |
 | K-02 | Kubernetes workload 证据 | `./bench/k8s_workload_evidence.sh` | 临时 namespace 产生 Pod-to-Service 流量，monitor 计数非零，结束后清理资源 | `k8s-workload-evidence/20260630-161729`：DNS `count=20 failed=0`；gRPC `count=20 failed=0`，pod-veth monitor `reqps=22 resps=44 p99=0.175ms` | 已完成 |
 
