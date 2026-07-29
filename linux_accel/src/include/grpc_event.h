@@ -10,6 +10,8 @@ enum grpc_direction {
 enum grpc_event_flags {
     GRPC_FLAG_H2_PREFACE = 1 << 0,
     GRPC_FLAG_H2_HEADERS = 1 << 1,
+    GRPC_FLAG_H2_DATA = 1 << 2,
+    GRPC_FLAG_H2_END_STREAM = 1 << 3,
 };
 
 struct grpc_config {
@@ -48,6 +50,7 @@ struct grpc_flow_key {
     __u32 server_ip;
     __u16 client_port;
     __u16 server_port;
+    __u32 stream_id;
 };
 
 struct grpc_event {
@@ -59,6 +62,7 @@ struct grpc_event {
     __u32 payload_len;
     __u32 src_ip;
     __u32 dst_ip;
+    __u32 stream_id;
     __u16 src_port;
     __u16 dst_port;
     __u8 is_response;

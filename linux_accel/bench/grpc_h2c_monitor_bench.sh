@@ -246,6 +246,22 @@ p50_us="$(extract_field p50_us "${out_dir}/latency.log")"
 p95_us="$(extract_field p95_us "${out_dir}/latency.log")"
 p99_us="$(extract_field p99_us "${out_dir}/latency.log")"
 metrics_line="$(grep 'grpc_metrics' "${out_dir}/grpc-monitor.log" | tail -1 || true)"
+stream_event_count="$(
+  grep -Ec 'stream_id=[1-9][0-9]*' "${out_dir}/grpc-monitor.log" || true
+)"
+matched_stream_count="$(
+  grep -Ec 'response stream_id=[1-9][0-9]* .*matched=1' \
+    "${out_dir}/grpc-monitor.log" || true
+)"
+
+if [[ "${stream_event_count}" -eq 0 ]]; then
+  echo "gRPC monitor did not report a non-zero HTTP/2 stream ID" >&2
+  exit 1
+fi
+if [[ "${matched_stream_count}" -eq 0 ]]; then
+  echo "gRPC monitor did not correlate a response by HTTP/2 stream ID" >&2
+  exit 1
+fi
 
 cat > "${out_dir}/summary.md" <<MD
 # gRPC h2c Monitor Benchmark
@@ -266,6 +282,8 @@ service=grpc.health.v1.Health/Check
 | p50_us | ${p50_us} |
 | p95_us | ${p95_us} |
 | p99_us | ${p99_us} |
+| stream-aware events | ${stream_event_count} |
+| matched stream responses | ${matched_stream_count} |
 
 latency bench: ${latency_line}
 

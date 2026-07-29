@@ -50,6 +50,7 @@ struct FlowKeyHash {
         mix(key.server_ip);
         mix(key.client_port);
         mix(key.server_port);
+        mix(key.stream_id);
         return h;
     }
 };
@@ -60,7 +61,8 @@ struct FlowKeyEqual {
         return lhs.client_ip == rhs.client_ip &&
                lhs.server_ip == rhs.server_ip &&
                lhs.client_port == rhs.client_port &&
-               lhs.server_port == rhs.server_port;
+               lhs.server_port == rhs.server_port &&
+               lhs.stream_id == rhs.stream_id;
     }
 };
 
@@ -71,6 +73,9 @@ struct WindowMetrics {
     uint64_t timeout_count = 0;
     uint64_t h2_preface_count = 0;
     uint64_t h2_headers_count = 0;
+    uint64_t h2_data_count = 0;
+    uint64_t h2_end_stream_count = 0;
+    uint64_t stream_aware_count = 0;
     uint64_t ringbuf_drop_delta = 0;
     std::vector<uint64_t> latency_samples_ns;
 };
@@ -219,6 +224,7 @@ grpc_flow_key build_user_flow_key(const grpc_event *event)
         key.client_port = event->src_port;
         key.server_port = event->dst_port;
     }
+    key.stream_id = event->stream_id;
     return key;
 }
 
@@ -229,10 +235,14 @@ void print_verbose_event(const grpc_event *event)
               << " -> "
               << ipv4_to_string(event->dst_ip) << ":" << event->dst_port
               << " " << (event->is_response ? "response" : "request")
+              << " stream_id=" << event->stream_id
               << " payload=" << event->payload_len
               << " matched=" << static_cast<int>(event->matched)
               << " h2_preface=" << !!(event->flags & GRPC_FLAG_H2_PREFACE)
               << " h2_headers=" << !!(event->flags & GRPC_FLAG_H2_HEADERS)
+              << " h2_data=" << !!(event->flags & GRPC_FLAG_H2_DATA)
+              << " h2_end_stream="
+              << !!(event->flags & GRPC_FLAG_H2_END_STREAM)
               << " latency_ms=" << std::fixed << std::setprecision(3)
               << ns_to_ms(event->latency_ns)
               << " len=" << event->packet_len
@@ -265,6 +275,12 @@ int handle_grpc_event(void *ctx, void *data, size_t data_sz)
         state->current.h2_preface_count++;
     if (event->flags & GRPC_FLAG_H2_HEADERS)
         state->current.h2_headers_count++;
+    if (event->flags & GRPC_FLAG_H2_DATA)
+        state->current.h2_data_count++;
+    if (event->flags & GRPC_FLAG_H2_END_STREAM)
+        state->current.h2_end_stream_count++;
+    if (event->stream_id != 0)
+        state->current.stream_aware_count++;
 
     if (state->options->verbose_events)
         print_verbose_event(event);
@@ -317,6 +333,9 @@ void print_metrics(ReaderState *state)
               << " p99=" << p99_ms << "ms"
               << " h2_preface=" << state->current.h2_preface_count
               << " h2_headers=" << state->current.h2_headers_count
+              << " h2_data=" << state->current.h2_data_count
+              << " h2_end_stream=" << state->current.h2_end_stream_count
+              << " stream_aware=" << state->current.stream_aware_count
               << " ringbuf_drop=" << state->current.ringbuf_drop_delta << "\n";
 
     state->current = WindowMetrics{};

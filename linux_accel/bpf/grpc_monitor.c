@@ -16,6 +16,12 @@
 #define RINGBUF_SIZE (1 << 24)
 #define GRPC_FLOW_MAX_ENTRIES 65536
 #define GRPC_RESPONSE_CACHE_MAX_ENTRIES 4096
+#define H2_FRAME_HEADER_LEN 9
+#define H2_PREFACE_LEN 24
+#define H2_MAX_FRAMES_PER_PACKET 4
+#define H2_FRAME_DATA 0x0
+#define H2_FRAME_HEADERS 0x1
+#define H2_FLAG_END_STREAM 0x1
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -92,7 +98,8 @@ static __always_inline void build_grpc_flow_key(struct grpc_flow_key *key,
                                                 const struct iphdr *ip,
                                                 __u16 src_port,
                                                 __u16 dst_port,
-                                                __u8 is_response)
+                                                __u8 is_response,
+                                                __u32 stream_id)
 {
     if (is_response) {
         key->client_ip = ip->daddr;
@@ -105,33 +112,85 @@ static __always_inline void build_grpc_flow_key(struct grpc_flow_key *key,
         key->client_port = src_port;
         key->server_port = dst_port;
     }
+    key->stream_id = stream_id;
 }
 
-static __always_inline __u8 detect_h2_flags(const struct __sk_buff *skb,
-                                            __u32 payload_offset,
-                                            __u32 payload_len)
-{
-    char preface[24] = {};
-    __u8 frame_type = 0;
-    __u8 flags = 0;
+struct grpc_h2_packet_info {
+    __u32 stream_id;
+    __u8 flags;
+};
 
-    if (payload_len >= 24 &&
+static __always_inline struct grpc_h2_packet_info
+detect_h2_packet(const struct __sk_buff *skb, __u32 payload_offset,
+                 __u32 payload_len)
+{
+    struct grpc_h2_packet_info info = {};
+    char preface[H2_PREFACE_LEN] = {};
+    __u32 scan_offset = payload_offset;
+    __u32 remaining = payload_len;
+
+    if (remaining >= H2_PREFACE_LEN &&
         read_packet(preface, skb, payload_offset, sizeof(preface)) == 0) {
         if (preface[0] == 'P' && preface[1] == 'R' && preface[2] == 'I' &&
             preface[3] == ' ' && preface[4] == '*' && preface[5] == ' ' &&
             preface[6] == 'H' && preface[7] == 'T' && preface[8] == 'T' &&
-            preface[9] == 'P' && preface[10] == '/' && preface[11] == '2') {
-            flags |= GRPC_FLAG_H2_PREFACE;
+            preface[9] == 'P' && preface[10] == '/' && preface[11] == '2' &&
+            preface[12] == '.' && preface[13] == '0' &&
+            preface[14] == '\r' && preface[15] == '\n' &&
+            preface[16] == '\r' && preface[17] == '\n' &&
+            preface[18] == 'S' && preface[19] == 'M' &&
+            preface[20] == '\r' && preface[21] == '\n' &&
+            preface[22] == '\r' && preface[23] == '\n') {
+            info.flags |= GRPC_FLAG_H2_PREFACE;
+            scan_offset += H2_PREFACE_LEN;
+            remaining -= H2_PREFACE_LEN;
         }
     }
 
-    if (payload_len >= 9 &&
-        read_packet(&frame_type, skb, payload_offset + 3, sizeof(frame_type)) == 0 &&
-        frame_type == 0x1) {
-        flags |= GRPC_FLAG_H2_HEADERS;
+#pragma unroll
+    for (int i = 0; i < H2_MAX_FRAMES_PER_PACKET; ++i) {
+        __u8 header[H2_FRAME_HEADER_LEN] = {};
+        __u32 frame_len;
+        __u32 stream_id;
+        __u8 frame_type;
+        __u8 frame_flags;
+
+        if (remaining < H2_FRAME_HEADER_LEN)
+            break;
+        if (read_packet(header, skb, scan_offset, sizeof(header)) < 0)
+            break;
+
+        frame_len = ((__u32)header[0] << 16) |
+                    ((__u32)header[1] << 8) |
+                    (__u32)header[2];
+        if (frame_len > remaining - H2_FRAME_HEADER_LEN)
+            break;
+
+        frame_type = header[3];
+        frame_flags = header[4];
+        stream_id = ((__u32)(header[5] & 0x7f) << 24) |
+                    ((__u32)header[6] << 16) |
+                    ((__u32)header[7] << 8) |
+                    (__u32)header[8];
+
+        if (stream_id != 0 &&
+            (frame_type == H2_FRAME_HEADERS ||
+             frame_type == H2_FRAME_DATA)) {
+            info.stream_id = stream_id;
+            if (frame_type == H2_FRAME_HEADERS)
+                info.flags |= GRPC_FLAG_H2_HEADERS;
+            else
+                info.flags |= GRPC_FLAG_H2_DATA;
+            if (frame_flags & H2_FLAG_END_STREAM)
+                info.flags |= GRPC_FLAG_H2_END_STREAM;
+            break;
+        }
+
+        scan_offset += H2_FRAME_HEADER_LEN + frame_len;
+        remaining -= H2_FRAME_HEADER_LEN + frame_len;
     }
 
-    return flags;
+    return info;
 }
 
 static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
@@ -151,7 +210,7 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     __u16 port = configured_port();
     __u8 is_response;
     __u8 matched = 0;
-    __u8 flags = 0;
+    struct grpc_h2_packet_info h2 = {};
     __u64 now;
     __u64 latency_ns = 0;
     __u64 *start_ns;
@@ -199,8 +258,9 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     payload_offset = offset + tcp_header_len;
     now = bpf_ktime_get_ns();
     is_response = src_port == port;
-    flags = detect_h2_flags(skb, payload_offset, payload_len);
-    build_grpc_flow_key(&flow_key, &ip, src_port, dst_port, is_response);
+    h2 = detect_h2_packet(skb, payload_offset, payload_len);
+    build_grpc_flow_key(&flow_key, &ip, src_port, dst_port, is_response,
+                        h2.stream_id);
 
     if (is_response) {
         start_ns = bpf_map_lookup_elem(&grpc_request_start, &flow_key);
@@ -230,11 +290,12 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     event->payload_len = payload_len;
     event->src_ip = ip.saddr;
     event->dst_ip = ip.daddr;
+    event->stream_id = h2.stream_id;
     event->src_port = src_port;
     event->dst_port = dst_port;
     event->is_response = is_response;
     event->matched = matched;
-    event->flags = flags;
+    event->flags = h2.flags;
     bpf_ringbuf_submit(event, 0);
     return TC_ACT_PIPE;
 }
