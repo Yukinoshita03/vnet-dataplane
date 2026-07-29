@@ -138,6 +138,28 @@ compute2: tap2200c160-c0 / ifindex 11
 ```
 
 这证明 Neutron binding 变化、源端卸载及目标端按新 ifindex 重挂载已经贯通。
-反向 `compute2 -> master` 迁移目前由 Nova/libvirt 报
-`Target device virtio options don't match the source`，属于虚拟化配置问题，
-尚未计为 Agent 往返迁移验证完成；修复后还需补做反向重挂载和双端清理验收。
+
+反向迁移首次失败的根因也已定位并修复：`compute2` 的
+`/etc/nova/nova-cpu.conf` 仍使用 `virt_type=qemu`，Nova 为迁移目标 XML
+重建了 `<driver name="qemu"/>`，而源实例实际以 `type=kvm` 运行，libvirt
+因此报告 `Target device virtio options don't match the source`。将
+`nova.conf`、`nova-cpu.conf` 和 DevStack `local.conf` 对齐到
+`virt_type=kvm`/`LIBVIRT_TYPE=kvm`，重启 `nova-compute` 并硬重启恢复实例后，
+真实反向块在线迁移完成：
+
+```text
+migration UUID: 3051c9f9-0459-4aeb-a5fe-2cfd97a20043
+compute2: tap2200c160-c0 / ifindex 14
+  -> missing_grace_1
+  -> detach (binding_left_host)
+
+master: tap2200c160-c0 / ifindex 29
+  -> attach (binding_local)
+  -> DNS/gRPC 进程健康
+  -> TC 0x1/0x2 位于 NetMig 0x65/0x66 之前
+```
+
+迁移结束时实例和 Neutron 端口均为 `ACTIVE`。停止两端 Agent 后再次验收：
+Agent/monitor 进程、Agent pin、XDP 和 TC `0x1/0x2` 均无残留，
+NetMig `0x65/0x66` 保留。因此 `master -> compute2 -> master` 往返迁移、
+重挂载与双端清理已经完成。

@@ -4,18 +4,24 @@
 
 ## 范围
 
-当前 gRPC monitor 故意限定在 transport 层：
+当前 gRPC monitor 仍挂在 transport 层，但对明文 h2c 做有界、best-effort
+的 HTTP/2 frame 识别：
 
 - 仅支持 IPv4 TCP。
 - 默认服务端口：`50051`。
 - 仅使用 tc ingress 和 egress。
 - 请求侧包定义为目的端口 `50051` 且带 TCP payload 的包。
 - 响应侧包定义为源端口 `50051` 且带 TCP payload 的包。
-- RTT 使用同一 flow 中首个 client-to-server payload 到首个 server-to-client payload 的时间差估算。
+- 能识别时，RTT 按 TCP 四元组加 31 位 HTTP/2 `stream_id` 关联请求和响应；
+  同一连接上的并发 stream 不再互相覆盖。
+- 解析不到 stream 时回退到 `stream_id=0` 的四元组关联，保持 fail-open。
 - 不解析 TLS payload。
-- 当前里程碑不实现完整 HTTP/2 和 gRPC message 解析。
+- 每个包最多扫描 4 个 HTTP/2 frame，并标记 HEADERS、DATA 和 END_STREAM；
+  当前里程碑仍不实现完整 HTTP/2 状态机和 gRPC message 解析。
 
-对于明文 h2c 流量，eBPF 程序会 best-effort 标记看起来包含 HTTP/2 client preface 或 HEADERS frame 的包。这些标记用于 demo，不作为指标正确性的必要条件。
+对于明文 h2c 流量，eBPF 程序会完整比对 24 字节 client preface，并对边界
+检查通过的 HEADERS/DATA frame 提取 stream ID。这些标记用于观测和请求响应
+关联，不用于修改数据包。
 
 ## 构建
 
@@ -49,19 +55,44 @@ sudo ./build/grpc_monitor --dev eth0 --port 50051 --timeout-ms 2000
 示例输出：
 
 ```text
-grpc_metrics dev=eth0 port=50051 reqps=120 resps=120 active_flows=0 pending=0 timeout=0 unmatched=0 avg=0.842ms p50=0.801ms p95=1.441ms p99=1.770ms h2_preface=1 h2_headers=120 ringbuf_drop=0
+grpc_metrics dev=veth_grpc_srv port=50051 reqps=6 resps=3 active_flows=0 pending=0 timeout=0 unmatched=0 avg=20.569ms p50=20.589ms p95=20.589ms p99=20.589ms h2_preface=1 h2_headers=6 h2_data=3 h2_end_stream=6 stream_aware=9 ringbuf_drop=0
 ```
 
 指标含义：
 
 - `reqps`：最近一个报告窗口中看到的请求侧 TCP payload 包数。
 - `resps`：最近一个报告窗口中看到的响应侧 TCP payload 包数。
-- `active_flows` / `pending`：已看到请求 payload、尚未匹配响应 payload 的 flow。
-- `timeout`：用户态过期清理的 pending flow。
+- `active_flows` / `pending`：已看到请求 payload、尚未匹配响应 payload 的
+  四元组加 stream 条目。
+- `timeout`：用户态过期清理的 pending stream。
 - `unmatched`：没有匹配 pending request 的响应 payload 包。
-- `avg/p50/p95/p99`：已匹配 flow 的 transport-level RTT 估算值。
-- `h2_preface` / `h2_headers`：明文 HTTP/2 best-effort 标记。
+- `avg/p50/p95/p99`：已匹配 stream 的 transport-level RTT 估算值。
+- `h2_preface` / `h2_headers` / `h2_data` / `h2_end_stream`：明文 HTTP/2
+  best-effort 标记。
+- `stream_aware`：成功提取非零 HTTP/2 stream ID 的事件数。
 - `ringbuf_drop`：BPF ring buffer 满导致丢失的事件数。
+
+## HTTP/2 stream 关联回归
+
+确定性回归使用一个 TCP 连接复用承载 stream 1、3、5，故意把请求拆成
+HEADERS 和 DATA frame，验证三个响应分别匹配原 stream：
+
+```bash
+sudo ./tests/grpc_stream_correlation_test.sh
+```
+
+2026-07-30 在 Shuka1 Ubuntu 内核上通过：
+
+```text
+grpc_stream_correlation_test: PASS streams=1,3,5
+request/response stream_id=1,3,5; response matched=1
+h2_data=3 h2_end_stream=6 stream_aware=9 ringbuf_drop=0
+```
+
+该测试是确定性的 h2c frame 协议回放，用于验证内核 parser、map key、ringbuf
+ABI 和用户态关联，不替代完整 Go gRPC 库互操作测试。真实 Go h2c runner
+仍由 `bench/grpc_h2c_monitor_bench.sh` 提供；本次环境访问
+`proxy.golang.org` 时 TLS 握手超时，因此没有把该次失败计为协议实现结果。
 
 ## 真实 h2c gRPC Demo Benchmark
 
@@ -132,7 +163,8 @@ policy_miss=1042 fallback=1042 fallback_error=0 tx_error=0
 
 在 `50051` 端口启动任意 TCP 或 gRPC 服务，运行 `grpc_monitor`，并向该端口发送流量。monitor 应显示请求和响应计数增加。如果选中接口能看到两个方向的包，RTT 分位数应变为非零。
 
-monitor 只观察。eBPF 程序始终返回 `TC_ACT_OK`，不 drop、不 redirect、不修改数据包。
+monitor 只观察。eBPF 程序始终返回 `TC_ACT_PIPE`，让同一 TC 链后续 NetMig
+filter 继续执行；它不 drop、不 redirect、不修改数据包。
 
 ## 可复现 tc Monitor Benchmark
 

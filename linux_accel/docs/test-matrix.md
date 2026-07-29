@@ -48,7 +48,8 @@
 | G-05 | gRPC NOT_SERVING 缓存命中 | 同 G-04 | 不同 payload 命中 NOT_SERVING 缓存响应，`not_serving_cache_hit > 0` | `2209.13 qps`，p99 `3932.00 us`，`not_serving_cache_hit=1042` | 已完成 |
 | G-06 | gRPC 响应缓存未命中回退 | 同 G-04，使用未缓存 payload | 请求回到后端，`response_cache_miss` 和 `fallback` 增加，`fallback_error=0` | `751.12 qps`，p99 `8203.98 us`，`response_cache_miss=1041 fallback=1041 fallback_error=0` | 已完成 |
 | G-07 | gRPC 策略未命中回退 | 同 G-04，使用未列入白名单的方法 | 请求回到后端，`policy_miss` 和 `fallback` 增加，`fallback_error=0` | `778.52 qps`，p99 `4844.19 us`，`policy_miss=1042 fallback=1042 fallback_error=0` | 已完成 |
-| G-08 | gRPC pinned response map 动态更新 | `cachectl --policy-file <policy> --grpc-response-map <path> --replace`；OpenStack 场景由 `bench/openstack_grpc_e2e.sh` 执行 | 同一 key 从 `SERVING` 更新为 `NOT_SERVING`，后端停止后 client 仍成功且状态切换 | 脚本和 harness 已完成；等待 Shuka1 恢复后的 Linux/OpenStack 实测日志 | 待验证 |
+| G-08 | gRPC pinned response map 动态更新 | `cachectl --policy-file <policy> --grpc-response-map <path> --replace`；OpenStack 场景由 `bench/openstack_grpc_e2e.sh` 执行 | 同一 key 从 `SERVING` 更新为 `NOT_SERVING`，后端停止后 client 仍成功且状态切换 | Ubuntu guest-eBPF 正式结果：`79.88 -> 184.49 qps`（`2.31x`），后端停止后 `100/100`，运行时更新 `NOT_SERVING=20/20` | 已完成 |
+| G-09 | HTTP/2 stream 级请求响应关联 | `sudo ./tests/grpc_stream_correlation_test.sh` | 同一 TCP 连接复用的 stream 1/3/5 独立关联；响应均 matched；DATA/END_STREAM 标记和清理通过 | 2026-07-30 Shuka1：`PASS streams=1,3,5`，`h2_data=3 h2_end_stream=6 stream_aware=9 ringbuf_drop=0` | 已完成 |
 
 ## 虚拟化与云原生证据
 
@@ -60,7 +61,7 @@
 | V-04 | OpenStack workload 证据 | `./bench/openstack_workload_evidence.sh` | summary 记录 OpenStack/OVS 状态、monitor 日志，并标注真实租户流量或 fallback | `openstack-workload-evidence/20260630-162110`：DNS `count=30 failed=0`，monitor `qps=33 rps=33`；gRPC `count=30 failed=0`，monitor `reqps=28 resps=29 p99=0.311ms` | 已完成 |
 | V-05 | OpenStack DNS 双端缓存 E2E | `REPEAT=5 REQUESTS=1000 WARMUP=100 GUEST_BPF=1 ./bench/openstack_dns_e2e.sh` | 五场景成功、回源计数断言、TTL/未信任 resolver/NXDOMAIN 回退和资源清理均通过 | 2026-07-26 host-tap：baseline median `2275.04 QPS`，server `2785.15`（`1.22x`），client `8346.38`（`3.67x`），both `8887.80`（`3.91x`）；`cleanup_status=0` | 已完成 |
 | V-06 | OpenStack DNS/gRPC 动态双端缓存 | `bench/openstack_dynamic_cache_campaign.sh` | 五种策略、五类负载各五轮；动态 epoch、两端命中、真实回源及严格清理均可追溯 | 2026-07-30：125 轮/625 窗口，DNS/gRPC 均零失败；动态切换后四类可缓存负载 `1.24x-2.13x`，回源降为 0；低命中五轮保持 BYPASS；`cleanup_status=0` | 已完成 |
-| V-07 | OpenStack 数据面 Agent | `python3 agent/openstack_dataplane_agent.py watch ...` | Neutron/OVS 精确发现；重复 reconcile 幂等；接口变化、迁移和 monitor 异常触发重挂载；只清理自有 hook | 2026-07-30：本机 attach/detach 与清理通过；真实 `master -> compute2` 迁移后，源端卸载、目标端在同名 tap 的新 ifindex 上重挂载，TC/XDP 顺序正确；反向迁移因 Nova/libvirt virtio 参数不一致待修复 | 部分完成 |
+| V-07 | OpenStack 数据面 Agent | `python3 agent/openstack_dataplane_agent.py watch ...` | Neutron/OVS 精确发现；重复 reconcile 幂等；接口变化、迁移和 monitor 异常触发重挂载；只清理自有 hook | 2026-07-30：真实 `master -> compute2 -> master` 往返块在线迁移完成；源端卸载、目标端按新 ifindex 重挂载；TC/XDP 顺序正确；停止后只保留 NetMig `0x65/0x66` | 已完成 |
 | K-01 | Kubernetes 路径探测 | `./bench/k8s_path_probe.sh` | 只读列出 node、CNI、pod-veth 和候选挂载点 | 在节点运行时会记录候选接口 | 已完成 |
 | K-02 | Kubernetes workload 证据 | `./bench/k8s_workload_evidence.sh` | 临时 namespace 产生 Pod-to-Service 流量，monitor 计数非零，结束后清理资源 | `k8s-workload-evidence/20260630-161729`：DNS `count=20 failed=0`；gRPC `count=20 failed=0`，pod-veth monitor `reqps=22 resps=44 p99=0.175ms` | 已完成 |
 
@@ -68,7 +69,7 @@
 
 | 环境 | 已验证路径 | DNS 加速结论 | gRPC 加速结论 | 结论边界 |
 | --- | --- | ---: | ---: | --- |
-| OpenStack / OVS / KVM | `br-int` 挂载 smoke 与 OpenStack workload 证据 | QPS `7.14x`，p99 `182.52x` | QPS `3.69x`，p99 `3.33x` | 快路径 benchmark + OpenStack 挂载/可见性证据，不声称完整生产 VM-to-VM 端到端加速 |
+| OpenStack / OVS / KVM | Ubuntu VM、OVN tenant path、host tap/guest bpffs | DNS 双端 `3.91x` | gRPC guest pinned-map cache `2.31x` | DNS 为 host-tap XDP；gRPC 为 guest eBPF map 加用户态 fast-cache，不声称内核直接生成 gRPC 响应 |
 | Kubernetes / CNI / Pod veth | Pod-to-Service workload 证据和非零 monitor 计数 | QPS `7.14x`，p99 `182.52x` | QPS `3.69x`，p99 `3.33x` | 快路径 benchmark + Kubernetes 挂载/可见性证据，不声称完整生产 Pod-to-Pod 端到端加速 |
 
 ## 基线与相关工作对比
@@ -113,6 +114,6 @@ not a guest eBPF acceleration claim; repeat with a Linux image and
 | 缺口 | 影响 | 后续工作 |
 | --- | --- | --- |
 | DNS XDP 只支持 IPv4 UDP、单问题、未压缩 `A/IN` 缓存命中 | 其他 DNS 记录类型会放行，不加速 | 当前 demo 稳定后扩展 AAAA/CNAME/EDNS |
-| gRPC fast-cache 只支持 h2c unary demo 流量 | 不加速 TLS、流式 RPC、任意 protobuf 序列化 | 扩展 HTTP/2 状态处理，并补 TLS 部署说明 |
-| OpenStack/Kubernetes 当前是挂载/可见性证据 + 快路径 benchmark | 证明集成可行，但不是完整生产端到端加速 | 在最终集群上跑专用 VM-to-VM 和 Pod-to-Pod 业务压测 |
+| gRPC monitor 已支持 h2c stream ID 关联，但 fast-cache 仍只支持 unary demo 流量 | 不加速 TLS、流式 RPC、任意 protobuf 序列化 | 扩展 fast-cache HTTP/2 状态处理，并补 TLS 部署说明 |
+| OpenStack 已有专用 VM E2E；Kubernetes 仍是挂载/可见性证据 + 快路径 benchmark | 尚未证明生产规模集群和 Pod-to-Pod 加速 | 在最终 Kubernetes 集群上跑专用业务压测 |
 | VMware 环境使用 generic XDP | 尚未展示 native XDP 性能 | 在支持 native XDP 的网卡/驱动上复测 |

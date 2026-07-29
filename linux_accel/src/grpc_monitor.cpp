@@ -268,7 +268,7 @@ int handle_grpc_event(void *ctx, void *data, size_t data_sz)
         state->pending.erase(key);
     } else {
         state->current.request_count++;
-        state->pending[key] = monotonic_now_ns();
+        state->pending.emplace(key, monotonic_now_ns());
     }
 
     if (event->flags & GRPC_FLAG_H2_PREFACE)

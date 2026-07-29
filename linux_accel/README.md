@@ -8,10 +8,11 @@
 
 项目当前已经形成一条比较完整的技术链路：
 
-- 用 `tc` 做 DNS / gRPC 观测，拿到请求、响应、RTT 等指标。
+- 用 `tc` 做 DNS / gRPC 观测，拿到请求、响应、RTT 和 HTTP/2 stream 级关联指标。
 - 用 `XDP` 做 DNS 缓存命中快路径，直接在内核侧回包。
 - 用用户态 `grpc_fast_cache` 做面向 h2c unary 场景的快速响应原型。
 - 用实时指标控制器在 `BYPASS`、服务端、客户端和双端缓存之间动态切换。
+- 用独立数据面 Agent 按 Neutron/OVSDB 精确发现 VM tap，并在往返热迁移后重挂载。
 - 用 `netns + bridge + veth` 复现虚拟化路径，并验证 OpenStack / OVS 挂载点。
 - 用新增的 **用户态 L2-L4 协议解析与服务分类模块** 解析原始帧，为后续虚拟化路径调试、流量分类和策略联动打基础。
 
@@ -36,12 +37,12 @@
 | DNS XDP 加速 | 已完成 | 对命中缓存的 DNS `A/IN` 查询直接 `XDP_TX` 回包 |
 | DNS 客户端自学习缓存 | 已实现，VM 已验证 | host-side veth XDP 命中回包，tc egress 从可信 DNS 响应学习 |
 | 多条 DNS 缓存 | 已完成 | 支持 `--cache-file` 批量加载域名、IP、TTL |
-| gRPC tc 监控 | 已完成 | 监控 TCP `50051` 端口请求包、响应包和传输层 RTT |
+| gRPC tc 监控 | 已完成 | 对 h2c HEADERS/DATA 做有界解析，按 HTTP/2 stream 关联请求、响应和传输层 RTT |
 | gRPC 快缓存 | 已完成原型 | 面向 h2c unary 健康检查类请求做快速响应 |
 | 统一策略工具 | 已完成 | `cachectl` 支持 DNS、gRPC、gRPC cache 策略校验与加载 |
 | 虚拟化路径基线 | 已完成 | 使用 `netns + bridge + veth` 复现虚拟化路径并输出 benchmark |
 | OpenStack 挂载验证 | 已完成 smoke test | 可发现 `br-int`、`br-ex`、veth、OVS 等候选接口并完成 tc attach |
-| OpenStack 数据面 Agent | 已实现，本机 smoke 已验证 | 从 Neutron/OVSDB 精确发现 VM 接口，保持 DNS/gRPC hook 并支持迁移重挂载 |
+| OpenStack 数据面 Agent | 已完成往返迁移验证 | 从 Neutron/OVSDB 精确发现 VM 接口，并在 `master -> compute2 -> master` 后按新 ifindex 重挂载 DNS/gRPC hook |
 | Kubernetes 路径探测 | 已完成脚本 | 只读发现 CNI、pod veth、node NIC 等可挂载位置 |
 | 用户态协议解析与服务分类 | 已完成原型 | 解析原始 Ethernet 帧并识别 `dns / grpc / other` |
 
@@ -331,18 +332,19 @@ sudo ./build/cachectl \
 ## 当前边界
 
 - DNS 加速当前聚焦 IPv4 UDP、单问题、`A/IN`、未压缩 QNAME、缓存命中请求。
-- gRPC 快缓存当前聚焦 h2c unary demo，不覆盖 TLS、流式 RPC 和完整 HTTP/2 状态机。
+- gRPC tc monitor 已能按明文 HTTP/2 stream 关联请求响应；gRPC 快缓存仍聚焦
+  h2c unary demo，不覆盖 TLS、流式 RPC 和完整 HTTP/2 状态机。
 - `virt_service_classifier` 当前只做 L2-L4 解析与基于端口的服务识别，还没有继续上卷到 HTTP/2、DNS payload 语义级解析。
-- OpenStack / Kubernetes 方向已有挂载性和路径可见性证据；OpenStack VM-to-VM
-  gRPC 脚本已准备好，但本轮仍需在 Shuka1 恢复后完成 Linux 编译和实测。
+- OpenStack 已有 Ubuntu VM DNS/gRPC E2E、动态策略五类负载五轮和数据面 Agent
+  往返迁移证据；Kubernetes 仍以挂载性和路径可见性证据为主。
 
 ## 下一步
 
 我认为这个仓库后面最值得继续做的，不是再堆新点子，而是把下面三件事做深：
 
-1. 在 Shuka1 上编译并实测已接入的运行时可更新 gRPC response pinned map。
-2. 把用户态协议解析模块继续扩展到 HTTP/2 frame 和更细粒度的服务识别。
-3. 在真实 OpenStack/KVM 或 Kubernetes 业务流量上做一轮带指标留痕的完整实验。
+1. 把 gRPC fast-cache 从 h2c unary 扩展到更完整的 HTTP/2 状态处理，并设计 TLS 部署边界。
+2. 增加 LDAP 等第三协议的监控和可缓存请求适配器。
+3. 在 Kubernetes 多节点环境补齐 Pod-to-Pod 动态策略正式实验。
 
 ## 参考资料
 
