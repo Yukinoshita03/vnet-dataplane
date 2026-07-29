@@ -84,7 +84,23 @@ c++ -std=c++17 -O2 -g \
   "${ROOT_DIR}/tests/tc_coexistence_test.cpp" \
   -o "${BUILD_DIR}/tc_coexistence_test"
 
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
+  -I"${ROOT_DIR}/include" \
+  "${ROOT_DIR}/src/dynamic_cache_controller_main.cpp" \
+  "${ROOT_DIR}/src/dynamic_cache_controller.cpp" \
+  "${ROOT_DIR}/src/bpf_cache_policy_publisher.cpp" \
+  -o "${BUILD_DIR}/dynamic_cache_controller" \
+  -lbpf -lelf -lz
+
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
+  "${ROOT_DIR}/tests/dynamic_cache_controller_test.cpp" \
+  "${ROOT_DIR}/src/dynamic_cache_controller.cpp" \
+  -o "${BUILD_DIR}/dynamic_cache_controller_test"
+
 "${BUILD_DIR}/tc_coexistence_test"
+"${BUILD_DIR}/dynamic_cache_controller_test"
 bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
@@ -96,5 +112,7 @@ echo "Built ${BUILD_DIR}/grpc_monitor"
 echo "Built ${BUILD_DIR}/grpc_fast_cache"
 echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
+echo "Built ${BUILD_DIR}/dynamic_cache_controller"
 echo "Passed ${BUILD_DIR}/tc_coexistence_test"
+echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"
 echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
