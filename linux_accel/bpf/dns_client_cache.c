@@ -209,6 +209,14 @@ static __always_inline int try_client_cache_response(
         return XDP_PASS;
 
     if (!client_cache_enabled()) {
+        cache_value = bpf_map_lookup_elem(&dns_client_cache, &cache_key);
+        if (cache_value && cache_value->expires_ns &&
+            now > cache_value->expires_ns) {
+            bpf_map_delete_elem(&dns_client_cache, &cache_key);
+            cache_value = 0;
+        }
+        increment_cache_stat(cache_value ? DNS_CACHE_STAT_SHADOW_HIT
+                                         : DNS_CACHE_STAT_SHADOW_MISS);
         build_dns_flow_key(&flow_key, ip, src_port, dst_port, dns_id, 0);
         pending.cache_key = cache_key;
         pending.started_ns = now;

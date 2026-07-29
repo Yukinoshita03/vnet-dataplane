@@ -386,7 +386,8 @@ void print_stats(const Options &options, const CacheStats &stats)
               << " response_cache_miss=" << stats.response_cache_miss
               << " fallback=" << stats.fallback
               << " fallback_error=" << stats.fallback_error
-              << " tx_error=" << stats.tx_error << "\n";
+              << " tx_error=" << stats.tx_error << "\n"
+              << std::flush;
 }
 
 void print_request_decision(const Options &options, const RequestInfo &request,
@@ -552,6 +553,7 @@ int main(int argc, char **argv)
               << " backend " << options.backend_host << ":"
               << options.backend_port
               << " method " << options.method << "\n";
+    print_stats(options, stats);
 
     while (!exiting) {
         sockaddr_in peer = {};

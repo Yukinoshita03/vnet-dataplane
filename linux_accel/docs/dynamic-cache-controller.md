@@ -116,6 +116,7 @@ sudo ./build/dynamic_cache_controller \
   --control-map /sys/fs/bpf/vnet-cache/client/cache_runtime_control \
   --control-map /sys/fs/bpf/vnet-cache/grpc/cache_runtime_control \
   --initial-mode bypass \
+  --initial-epoch 1 \
   --audit-log artifacts/dynamic-cache-decisions.log \
   < metrics.csv
 ```

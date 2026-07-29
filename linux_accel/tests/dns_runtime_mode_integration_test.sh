@@ -4,6 +4,7 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dns_monitor="${root_dir}/build/dns_monitor"
 controller="${root_dir}/build/dynamic_cache_controller"
+stats_reader="${root_dir}/build/dns_cache_stats_reader"
 server_bpf="${root_dir}/build/dns_xdp_monitor.bpf.o"
 client_bpf="${root_dir}/build/dns_client_cache.bpf.o"
 netns="vnet-dns-runtime-$$"
@@ -26,7 +27,8 @@ fi
 for command in ip python3; do
   command -v "${command}" >/dev/null
 done
-for file in "${dns_monitor}" "${controller}" "${server_bpf}" "${client_bpf}"; do
+for file in "${dns_monitor}" "${controller}" "${stats_reader}" \
+  "${server_bpf}" "${client_bpf}"; do
   test -e "${file}"
 done
 
@@ -149,6 +151,11 @@ expect_count() {
   fi
 }
 
+stat_field() {
+  tr ' ' '\n' <<<"$1" | awk -F= -v wanted="$2" \
+    '$1 == wanted {print $2; exit}'
+}
+
 mkdir -p "${pin_root}/server"
 "${dns_monitor}" --dev "${host_if}" --hook xdp --role server \
   --xdp-mode generic --bpf-object "${server_bpf}" \
@@ -173,6 +180,11 @@ expect_count 2
 publish_mode "${pin_root}/server/cache_runtime_control" dual
 query_once
 expect_count 2
+server_stats="$("${stats_reader}" "${pin_root}/server/dns_cache_stats")"
+if [[ "$(stat_field "${server_stats}" shadow_hit)" -lt 2 ]]; then
+  echo "dns_runtime_mode_integration_test: missing server shadow hits" >&2
+  exit 1
+fi
 cleanup_monitor
 
 mkdir -p "${pin_root}/client"
@@ -199,5 +211,11 @@ expect_count 4
 publish_mode "${pin_root}/client/cache_runtime_control" dual
 query_once
 expect_count 4
+client_stats="$("${stats_reader}" "${pin_root}/client/dns_cache_stats")"
+if [[ "$(stat_field "${client_stats}" shadow_hit)" -lt 1 ||
+      "$(stat_field "${client_stats}" shadow_miss)" -lt 1 ]]; then
+  echo "dns_runtime_mode_integration_test: missing client shadow metrics" >&2
+  exit 1
+fi
 
 echo "dns_runtime_mode_integration_test: PASS"

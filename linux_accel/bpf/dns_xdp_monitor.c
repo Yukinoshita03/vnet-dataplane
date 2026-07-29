@@ -146,6 +146,14 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
         return XDP_PASS;
     if (!server_cache_enabled()) {
+        cache_value = bpf_map_lookup_elem(&dns_cache, &cache_key);
+        if (cache_value && cache_value->expires_ns &&
+            now > cache_value->expires_ns) {
+            bpf_map_delete_elem(&dns_cache, &cache_key);
+            cache_value = 0;
+        }
+        increment_cache_stat(cache_value ? DNS_CACHE_STAT_SHADOW_HIT
+                                         : DNS_CACHE_STAT_SHADOW_MISS);
         increment_cache_stat(DNS_CACHE_STAT_POLICY_BYPASS);
         return XDP_PASS;
     }

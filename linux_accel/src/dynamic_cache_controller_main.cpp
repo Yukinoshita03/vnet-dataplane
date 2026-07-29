@@ -19,6 +19,7 @@ struct Options {
     std::string metrics_file;
     std::string audit_log;
     std::vector<std::string> control_maps;
+    uint64_t startup_epoch = 1;
     bool dry_run = false;
 };
 
@@ -27,7 +28,8 @@ public:
     bool publish(CacheMode mode, uint64_t epoch, std::string *) override
     {
         std::cout << "dynamic_cache_publish mode=" << cache_mode_name(mode)
-                  << " epoch=" << epoch << " dry_run=1\n";
+                  << " epoch=" << epoch << " dry_run=1\n"
+                  << std::flush;
         return true;
     }
 };
@@ -39,8 +41,16 @@ void usage(const char *program)
         << " [--metrics-file <csv>] [--control-map <pinned-map>]..."
         << " [--dry-run] [--audit-log <path>]"
         << " [--initial-mode bypass|server|client|dual]"
+        << " [--initial-epoch <n>]"
         << " [--window-size <n>] [--required-windows <n>]"
-        << " [--cooldown-ms <n>] [--min-window-requests <n>]\n"
+        << " [--cooldown-ms <n>] [--min-window-requests <n>]"
+        << " [--cache-enter-hit-ratio <n>]"
+        << " [--cache-exit-hit-ratio <n>]"
+        << " [--client-enter-p95-us <n>]"
+        << " [--client-exit-p95-us <n>]"
+        << " [--dual-enter-backend-qps <n>]"
+        << " [--dual-exit-backend-qps <n>]"
+        << " [--bypass-error-rate <n>]\n"
         << "CSV columns: timestamp_ms,dns_hits,dns_misses,dns_p95_us,"
         << "grpc_hits,grpc_misses,grpc_p95_us,backend_qps,error_rate\n";
 }
@@ -67,6 +77,8 @@ bool parse_size(const std::string &text, size_t *value)
     return true;
 }
 
+bool parse_double(const std::string &text, double *value);
+
 bool parse_options(int argc, char **argv, Options *options)
 {
     for (int i = 1; i < argc; ++i) {
@@ -82,6 +94,10 @@ bool parse_options(int argc, char **argv, Options *options)
         } else if (arg == "--initial-mode" && i + 1 < argc) {
             if (!parse_cache_mode(argv[++i], &options->config.initial_mode))
                 return false;
+        } else if (arg == "--initial-epoch" && i + 1 < argc) {
+            if (!parse_u64(argv[++i], &options->startup_epoch) ||
+                options->startup_epoch == 0)
+                return false;
         } else if (arg == "--window-size" && i + 1 < argc) {
             if (!parse_size(argv[++i], &options->config.window_size))
                 return false;
@@ -94,6 +110,34 @@ bool parse_options(int argc, char **argv, Options *options)
         } else if (arg == "--min-window-requests" && i + 1 < argc) {
             if (!parse_u64(argv[++i], &options->config.min_window_requests))
                 return false;
+        } else if (arg == "--cache-enter-hit-ratio" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.cache_enter_hit_ratio))
+                return false;
+        } else if (arg == "--cache-exit-hit-ratio" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.cache_exit_hit_ratio))
+                return false;
+        } else if (arg == "--client-enter-p95-us" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.client_enter_p95_us))
+                return false;
+        } else if (arg == "--client-exit-p95-us" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.client_exit_p95_us))
+                return false;
+        } else if (arg == "--dual-enter-backend-qps" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.dual_enter_backend_qps))
+                return false;
+        } else if (arg == "--dual-exit-backend-qps" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.dual_exit_backend_qps))
+                return false;
+        } else if (arg == "--bypass-error-rate" && i + 1 < argc) {
+            if (!parse_double(argv[++i],
+                              &options->config.bypass_error_rate))
+                return false;
         } else if (arg == "-h" || arg == "--help") {
             return false;
         } else {
@@ -101,6 +145,19 @@ bool parse_options(int argc, char **argv, Options *options)
             return false;
         }
     }
+    if (options->config.cache_exit_hit_ratio < 0.0 ||
+        options->config.cache_enter_hit_ratio > 1.0 ||
+        options->config.cache_exit_hit_ratio >
+            options->config.cache_enter_hit_ratio ||
+        options->config.client_exit_p95_us < 0.0 ||
+        options->config.client_exit_p95_us >
+            options->config.client_enter_p95_us ||
+        options->config.dual_exit_backend_qps < 0.0 ||
+        options->config.dual_exit_backend_qps >
+            options->config.dual_enter_backend_qps ||
+        options->config.bypass_error_rate < 0.0 ||
+        options->config.bypass_error_rate > 1.0)
+        return false;
     const bool has_control_maps = !options->control_maps.empty();
     return options->dry_run != has_control_maps;
 }
@@ -185,15 +242,15 @@ int main(int argc, char **argv)
         publisher = std::make_unique<BpfCachePolicyPublisher>(
             options.control_maps);
 
-    constexpr uint64_t startup_epoch = 1;
     std::string publish_error;
-    if (!publisher->publish(options.config.initial_mode, startup_epoch,
+    if (!publisher->publish(options.config.initial_mode,
+                            options.startup_epoch,
                             &publish_error)) {
         std::cerr << "Failed to publish initial cache mode: "
                   << publish_error << "\n";
         return 1;
     }
-    options.config.initial_epoch = startup_epoch;
+    options.config.initial_epoch = options.startup_epoch;
 
     std::ifstream metrics_file;
     std::istream *input = &std::cin;
@@ -233,7 +290,7 @@ int main(int argc, char **argv)
         }
         const DynamicCacheResult result = controller.observe(sample);
         const std::string output = result_line(sample, result);
-        std::cout << output << "\n";
+        std::cout << output << "\n" << std::flush;
         if (audit) {
             audit << output << "\n";
             audit.flush();

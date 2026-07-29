@@ -101,6 +101,8 @@ struct ReaderState {
     uint64_t last_cache_learn_rejected = 0;
     uint64_t last_cache_pending_expired = 0;
     uint64_t last_cache_policy_bypass = 0;
+    uint64_t last_cache_shadow_hit = 0;
+    uint64_t last_cache_shadow_miss = 0;
     int dropped_events_fd = -1;
     int cache_stats_fd = -1;
 };

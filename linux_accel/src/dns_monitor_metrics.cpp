@@ -294,6 +294,10 @@ void print_metrics(ReaderState *state)
         state->cache_stats_fd, DNS_CACHE_STAT_PENDING_EXPIRED);
     uint64_t cache_policy_bypass = read_percpu_counter_total(
         state->cache_stats_fd, DNS_CACHE_STAT_POLICY_BYPASS);
+    uint64_t cache_shadow_hit = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_SHADOW_HIT);
+    uint64_t cache_shadow_miss = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_SHADOW_MISS);
 
     uint64_t cache_hit_delta = counter_delta(cache_hits, &state->last_cache_hits);
     uint64_t cache_miss_delta = counter_delta(cache_misses, &state->last_cache_misses);
@@ -308,6 +312,10 @@ void print_metrics(ReaderState *state)
         cache_pending_expired, &state->last_cache_pending_expired);
     uint64_t cache_policy_bypass_delta = counter_delta(
         cache_policy_bypass, &state->last_cache_policy_bypass);
+    uint64_t cache_shadow_hit_delta = counter_delta(
+        cache_shadow_hit, &state->last_cache_shadow_hit);
+    uint64_t cache_shadow_miss_delta = counter_delta(
+        cache_shadow_miss, &state->last_cache_shadow_miss);
 
     double avg_ms = average_ms(state->current.latency_samples_ns);
     double p95_ms = percentile_ms(state->current.latency_samples_ns, 95.0);
@@ -347,6 +355,8 @@ void print_metrics(ReaderState *state)
                << " learn_rejected=" << cache_learn_rejected_delta
                << " pending_expired=" << cache_pending_expired_delta
                << " policy_bypass=" << cache_policy_bypass_delta
+               << " shadow_hit=" << cache_shadow_hit_delta
+               << " shadow_miss=" << cache_shadow_miss_delta
                << " alerts=" << alerts << "\n";
 
     state->history.push_back(

@@ -222,8 +222,34 @@ static uint64_t percentile(uint64_t *samples, int count, double fraction)
     return samples[index];
 }
 
-static int run_client(const char *server_ip, int port, const char *domain,
-                      const char *expected_ip, int requests, int warmup)
+static int workload_domain(char *out, size_t out_len, const char *base_domain,
+                           const char *pattern, int index, int requests,
+                           int warmup, int measured, int key_count)
+{
+    int written;
+    if (strcmp(pattern, "fixed") == 0)
+        written = snprintf(out, out_len, "%s", base_domain);
+    else if (strcmp(pattern, "hot") == 0)
+        written = snprintf(out, out_len, "hot.%s", base_domain);
+    else if (strcmp(pattern, "stable") == 0)
+        written = snprintf(out, out_len, "key-%d.%s",
+                           index % key_count, base_domain);
+    else if (strcmp(pattern, "shifting") == 0)
+        written = snprintf(out, out_len, "shift-%c.%s",
+                           measured && index >= requests / 2 ? 'b' : 'a',
+                           base_domain);
+    else if (strcmp(pattern, "low-hit-rate") == 0)
+        written = snprintf(out, out_len, "unique-%d.%s",
+                           measured ? warmup + index : index, base_domain);
+    else
+        return -1;
+    return written > 0 && (size_t)written < out_len ? 0 : -1;
+}
+
+static int run_client_workload(const char *server_ip, int port,
+                               const char *domain, const char *expected_ip,
+                               int requests, int warmup, const char *pattern,
+                               int key_count)
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
@@ -239,9 +265,17 @@ static int run_client(const char *server_ip, int port, const char *domain,
         return 2;
     uint8_t query[DNS_MAX_PACKET];
     uint8_t response[DNS_MAX_PACKET];
+    char request_domain[256];
+    if (requests <= 0 || warmup < 0 || key_count <= 0)
+        return 2;
     for (int i = 0; i < warmup; ++i) {
         uint16_t id = (uint16_t)(0x1000u + (unsigned int)i);
-        int query_len = build_query(query, sizeof(query), id, domain);
+        if (workload_domain(request_domain, sizeof(request_domain), domain,
+                            pattern, i, requests, warmup, 0,
+                            key_count) < 0)
+            return 2;
+        int query_len =
+            build_query(query, sizeof(query), id, request_domain);
         if (query_len < 0)
             return 2;
         sendto(fd, query, (size_t)query_len, 0,
@@ -257,7 +291,15 @@ static int run_client(const char *server_ip, int port, const char *domain,
     uint64_t start = now_ns();
     for (int i = 0; i < requests; ++i) {
         uint16_t id = (uint16_t)(0x4000u + (unsigned int)i);
-        int query_len = build_query(query, sizeof(query), id, domain);
+        if (workload_domain(request_domain, sizeof(request_domain), domain,
+                            pattern, i, requests, warmup, 1,
+                            key_count) < 0) {
+            free(samples);
+            close(fd);
+            return 2;
+        }
+        int query_len =
+            build_query(query, sizeof(query), id, request_domain);
         uint64_t request_start = now_ns();
         ssize_t received = query_len > 0
                                ? sendto(fd, query, (size_t)query_len, 0,
@@ -282,14 +324,22 @@ static int run_client(const char *server_ip, int port, const char *domain,
     double qps = elapsed ? (double)requests * 1000000000.0 / (double)elapsed : 0.0;
     double avg_us = success ? (double)total_ns / (double)success / 1000.0 : 0.0;
     printf("success=%d failed=%d qps=%.2f avg_us=%.2f p50_us=%.2f "
-           "p95_us=%.2f p99_us=%.2f\n",
+           "p95_us=%.2f p99_us=%.2f workload=%s keys=%d\n",
            success, failed, qps, avg_us,
            (double)percentile(samples, success, 0.50) / 1000.0,
            (double)percentile(samples, success, 0.95) / 1000.0,
-           (double)percentile(samples, success, 0.99) / 1000.0);
+           (double)percentile(samples, success, 0.99) / 1000.0,
+           pattern, key_count);
     free(samples);
     close(fd);
     return failed == 0 && success == requests ? 0 : 1;
+}
+
+static int run_client(const char *server_ip, int port, const char *domain,
+                      const char *expected_ip, int requests, int warmup)
+{
+    return run_client_workload(server_ip, port, domain, expected_ip,
+                               requests, warmup, "fixed", 1);
 }
 
 int main(int argc, char **argv)
@@ -302,9 +352,15 @@ int main(int argc, char **argv)
     if (argc >= 2 && strcmp(argv[1], "client") == 0 && argc >= 8)
         return run_client(argv[2], atoi(argv[3]), argv[4], argv[5],
                           atoi(argv[6]), atoi(argv[7]));
+    if (argc >= 2 && strcmp(argv[1], "client-workload") == 0 && argc >= 10)
+        return run_client_workload(
+            argv[2], atoi(argv[3]), argv[4], argv[5], atoi(argv[6]),
+            atoi(argv[7]), argv[8], atoi(argv[9]));
     fprintf(stderr,
             "usage: %s server <bind-ip> <port> <domain> <answer-ip> <ttl> <count-file> [nxdomain]\n"
-            "       %s client <server-ip> <port> <domain> <answer-ip> <requests> <warmup>\n",
-            argv[0], argv[0]);
+            "       %s client <server-ip> <port> <domain> <answer-ip> <requests> <warmup>\n"
+            "       %s client-workload <server-ip> <port> <base-domain> <answer-ip> "
+            "<requests> <warmup> <fixed|hot|stable|shifting|low-hit-rate> <keys>\n",
+            argv[0], argv[0], argv[0]);
     return 2;
 }

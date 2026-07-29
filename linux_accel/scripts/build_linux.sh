@@ -95,6 +95,12 @@ c++ -std=c++17 -O2 -g \
 
 c++ -std=c++17 -O2 -g \
   -I"${ROOT_DIR}/src/include" \
+  "${ROOT_DIR}/src/dns_cache_stats_reader.cpp" \
+  -o "${BUILD_DIR}/dns_cache_stats_reader" \
+  -lbpf -lelf -lz
+
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
   "${ROOT_DIR}/tests/dynamic_cache_controller_test.cpp" \
   "${ROOT_DIR}/src/dynamic_cache_controller.cpp" \
   -o "${BUILD_DIR}/dynamic_cache_controller_test"
@@ -123,6 +129,7 @@ echo "Built ${BUILD_DIR}/grpc_fast_cache"
 echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
 echo "Built ${BUILD_DIR}/dynamic_cache_controller"
+echo "Built ${BUILD_DIR}/dns_cache_stats_reader"
 echo "Built ${BUILD_DIR}/openstack_grpc_harness"
 echo "Passed ${BUILD_DIR}/tc_coexistence_test"
 echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"
