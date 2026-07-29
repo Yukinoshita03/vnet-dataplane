@@ -384,6 +384,8 @@ void print_stats(const Options &options, const CacheStats &stats)
               << " serving_cache_hit=" << stats.serving_cache_hit
               << " not_serving_cache_hit=" << stats.not_serving_cache_hit
               << " response_cache_miss=" << stats.response_cache_miss
+              << " shadow_hit=" << stats.shadow_hit
+              << " shadow_miss=" << stats.shadow_miss
               << " fallback=" << stats.fallback
               << " fallback_error=" << stats.fallback_error
               << " tx_error=" << stats.tx_error << "\n"
@@ -576,17 +578,19 @@ int main(int argc, char **argv)
         if (request.method.empty())
             request.method = options.method;
 
+        bool policy_allowed = false;
         bool allowed = false;
         RuntimeCacheDecision runtime_decision = RuntimeCacheDecision::Allow;
         if (parsed) {
             runtime_decision = runtime_cache_decision(
                 runtime_map_fd, options.cache_role, &stats.runtime_epoch);
-            if (runtime_decision == RuntimeCacheDecision::Allow) {
-                allowed = map_fd >= 0
-                              ? policy_allows_method(map_fd, request.method)
-                              : userspace_policy_allows_method(response_cache,
-                                                               request.method);
-            }
+            policy_allowed =
+                map_fd >= 0
+                    ? policy_allows_method(map_fd, request.method)
+                    : userspace_policy_allows_method(response_cache,
+                                                     request.method);
+            allowed = runtime_decision == RuntimeCacheDecision::Allow &&
+                      policy_allowed;
         }
         if (!parsed) {
             stats.parse_error++;
@@ -598,6 +602,13 @@ int main(int argc, char **argv)
                 print_request_decision(options, request, "parse_fallback_error");
             }
         } else if (runtime_decision != RuntimeCacheDecision::Allow) {
+            CacheEntry shadow_entry = {};
+            if (policy_allowed &&
+                lookup_response_cache(response_cache, response_map_fd,
+                                      request, &shadow_entry))
+                stats.shadow_hit++;
+            else
+                stats.shadow_miss++;
             if (runtime_decision == RuntimeCacheDecision::Error)
                 stats.runtime_map_error++;
             else

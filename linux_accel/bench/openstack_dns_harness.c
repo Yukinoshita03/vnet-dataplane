@@ -165,16 +165,31 @@ static int run_server(const char *bind_ip, int port, const char *domain,
     struct sockaddr_in address = {0};
     address.sin_family = AF_INET;
     address.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, bind_ip, &address.sin_addr) != 1 ||
-        bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    if (inet_pton(AF_INET, bind_ip, &address.sin_addr) != 1) {
+        fprintf(stderr, "invalid DNS bind address: %s\n", bind_ip);
+        close(fd);
         return 2;
+    }
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        perror("DNS bind");
+        close(fd);
+        return 2;
+    }
     struct in_addr answer = {0};
-    if (inet_pton(AF_INET, answer_ip, &answer) != 1)
+    if (inet_pton(AF_INET, answer_ip, &answer) != 1) {
+        fprintf(stderr, "invalid DNS answer address: %s\n", answer_ip);
+        close(fd);
         return 2;
+    }
     FILE *counter = fopen(count_file, "w");
-    if (!counter)
+    if (!counter) {
+        perror("DNS count file");
+        close(fd);
         return 2;
+    }
     unsigned long long requests = 0;
+    fprintf(counter, "0\n");
+    fflush(counter);
     uint8_t query[DNS_MAX_PACKET];
     uint8_t response[DNS_MAX_PACKET];
     for (;;) {

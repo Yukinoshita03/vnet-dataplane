@@ -319,6 +319,8 @@ sudo ./build/cachectl \
 | `docs/virtualization-path-benchmark.md` | 虚拟化路径 benchmark 说明 |
 | `docs/cloud-native-integration.md` | OpenStack / Kubernetes 接入说明 |
 | `docs/dual-ended-cache-design.md` | 双端缓存设计 |
+| `docs/openstack-dynamic-cache-campaign.md` | OpenStack 五类负载动态双端缓存实验 |
+| `docs/openstack-dynamic-cache-results-20260730.md` | OpenStack 动态双端缓存正式五轮结果 |
 | `docs/cachectl-runtime-policy.md` | 策略工具说明 |
 | `docs/related-work-and-baselines.md` | 相关工作与基线对比 |
 | `docs/demo-runbook.md` | Demo 演示流程 |

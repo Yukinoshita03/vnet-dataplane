@@ -69,6 +69,8 @@ struct CacheStats {
     uint64_t serving_cache_hit = 0;
     uint64_t not_serving_cache_hit = 0;
     uint64_t response_cache_miss = 0;
+    uint64_t shadow_hit = 0;
+    uint64_t shadow_miss = 0;
     uint64_t fallback = 0;
     uint64_t fallback_error = 0;
     uint64_t tx_error = 0;

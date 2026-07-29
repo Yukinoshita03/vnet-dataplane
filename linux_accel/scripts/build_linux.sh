@@ -111,6 +111,10 @@ c++ -std=c++17 -O2 -g \
   -o "${BUILD_DIR}/cache_runtime_control_test"
 
 cc -O2 -g \
+  "${ROOT_DIR}/bench/openstack_dns_harness.c" \
+  -o "${BUILD_DIR}/openstack_dns_harness"
+
+cc -O2 -g \
   "${ROOT_DIR}/bench/openstack_grpc_harness.c" \
   -o "${BUILD_DIR}/openstack_grpc_harness"
 
@@ -130,6 +134,7 @@ echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
 echo "Built ${BUILD_DIR}/dynamic_cache_controller"
 echo "Built ${BUILD_DIR}/dns_cache_stats_reader"
+echo "Built ${BUILD_DIR}/openstack_dns_harness"
 echo "Built ${BUILD_DIR}/openstack_grpc_harness"
 echo "Passed ${BUILD_DIR}/tc_coexistence_test"
 echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"

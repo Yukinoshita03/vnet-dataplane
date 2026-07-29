@@ -102,12 +102,14 @@ backend_pid=$!
   --listen "127.0.0.1:${server_cache_port}" \
   --backend "127.0.0.1:${backend_port}" \
   --method /grpc.health.v1.Health/Check \
+  --verbose \
   >"${temp_dir}/server-cache.log" 2>&1 &
 server_cache_pid=$!
 sleep 0.2
 
 publish_mode bypass
 expect_success "${server_cache_port}"
+grep -Eq 'shadow_hit=[1-9][0-9]*' "${temp_dir}/server-cache.log"
 stop_process "${backend_pid}"
 backend_pid=""
 publish_mode server
@@ -123,12 +125,14 @@ expect_success "${server_cache_port}"
   --listen "127.0.0.1:${client_cache_port}" \
   --backend "127.0.0.1:${backend_port}" \
   --method /grpc.health.v1.Health/Check \
+  --verbose \
   >"${temp_dir}/client-cache.log" 2>&1 &
 client_cache_pid=$!
 sleep 0.2
 
 publish_mode server
 expect_failure "${client_cache_port}"
+grep -Eq 'shadow_hit=[1-9][0-9]*' "${temp_dir}/client-cache.log"
 publish_mode client
 expect_success "${client_cache_port}"
 publish_mode dual
