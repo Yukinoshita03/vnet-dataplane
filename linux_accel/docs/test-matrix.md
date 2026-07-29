@@ -60,6 +60,7 @@
 | V-04 | OpenStack workload 证据 | `./bench/openstack_workload_evidence.sh` | summary 记录 OpenStack/OVS 状态、monitor 日志，并标注真实租户流量或 fallback | `openstack-workload-evidence/20260630-162110`：DNS `count=30 failed=0`，monitor `qps=33 rps=33`；gRPC `count=30 failed=0`，monitor `reqps=28 resps=29 p99=0.311ms` | 已完成 |
 | V-05 | OpenStack DNS 双端缓存 E2E | `REPEAT=5 REQUESTS=1000 WARMUP=100 GUEST_BPF=1 ./bench/openstack_dns_e2e.sh` | 五场景成功、回源计数断言、TTL/未信任 resolver/NXDOMAIN 回退和资源清理均通过 | 2026-07-26 host-tap：baseline median `2275.04 QPS`，server `2785.15`（`1.22x`），client `8346.38`（`3.67x`），both `8887.80`（`3.91x`）；`cleanup_status=0` | 已完成 |
 | V-06 | OpenStack DNS/gRPC 动态双端缓存 | `bench/openstack_dynamic_cache_campaign.sh` | 五种策略、五类负载各五轮；动态 epoch、两端命中、真实回源及严格清理均可追溯 | 2026-07-30：125 轮/625 窗口，DNS/gRPC 均零失败；动态切换后四类可缓存负载 `1.24x-2.13x`，回源降为 0；低命中五轮保持 BYPASS；`cleanup_status=0` | 已完成 |
+| V-07 | OpenStack 数据面 Agent | `python3 agent/openstack_dataplane_agent.py watch ...` | Neutron/OVS 精确发现；重复 reconcile 幂等；接口变化、迁移和 monitor 异常触发重挂载；只清理自有 hook | 2026-07-30：本机 attach/detach 与清理通过；真实 `master -> compute2` 迁移后，源端卸载、目标端在同名 tap 的新 ifindex 上重挂载，TC/XDP 顺序正确；反向迁移因 Nova/libvirt virtio 参数不一致待修复 | 部分完成 |
 | K-01 | Kubernetes 路径探测 | `./bench/k8s_path_probe.sh` | 只读列出 node、CNI、pod-veth 和候选挂载点 | 在节点运行时会记录候选接口 | 已完成 |
 | K-02 | Kubernetes workload 证据 | `./bench/k8s_workload_evidence.sh` | 临时 namespace 产生 Pod-to-Service 流量，monitor 计数非零，结束后清理资源 | `k8s-workload-evidence/20260630-161729`：DNS `count=20 failed=0`；gRPC `count=20 failed=0`，pod-veth monitor `reqps=22 resps=44 p99=0.175ms` | 已完成 |
 

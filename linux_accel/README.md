@@ -41,6 +41,7 @@
 | 统一策略工具 | 已完成 | `cachectl` 支持 DNS、gRPC、gRPC cache 策略校验与加载 |
 | 虚拟化路径基线 | 已完成 | 使用 `netns + bridge + veth` 复现虚拟化路径并输出 benchmark |
 | OpenStack 挂载验证 | 已完成 smoke test | 可发现 `br-int`、`br-ex`、veth、OVS 等候选接口并完成 tc attach |
+| OpenStack 数据面 Agent | 已实现，本机 smoke 已验证 | 从 Neutron/OVSDB 精确发现 VM 接口，保持 DNS/gRPC hook 并支持迁移重挂载 |
 | Kubernetes 路径探测 | 已完成脚本 | 只读发现 CNI、pod veth、node NIC 等可挂载位置 |
 | 用户态协议解析与服务分类 | 已完成原型 | 解析原始 Ethernet 帧并识别 `dns / grpc / other` |
 
@@ -321,6 +322,7 @@ sudo ./build/cachectl \
 | `docs/dual-ended-cache-design.md` | 双端缓存设计 |
 | `docs/openstack-dynamic-cache-campaign.md` | OpenStack 五类负载动态双端缓存实验 |
 | `docs/openstack-dynamic-cache-results-20260730.md` | OpenStack 动态双端缓存正式五轮结果 |
+| `docs/openstack-dataplane-agent.md` | Neutron/OVS 自动发现、挂载与迁移重挂载 Agent |
 | `docs/cachectl-runtime-policy.md` | 策略工具说明 |
 | `docs/related-work-and-baselines.md` | 相关工作与基线对比 |
 | `docs/demo-runbook.md` | Demo 演示流程 |

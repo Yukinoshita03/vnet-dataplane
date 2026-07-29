@@ -8,6 +8,7 @@ mkdir -p "${BUILD_DIR}"
 
 command -v clang >/dev/null
 command -v c++ >/dev/null
+command -v python3 >/dev/null
 command -v tc >/dev/null
 
 MULTIARCH_INCLUDE="/usr/include/$(gcc -print-multiarch 2>/dev/null || true)"
@@ -122,6 +123,8 @@ cc -O2 -g \
 "${BUILD_DIR}/dynamic_cache_controller_test"
 "${BUILD_DIR}/cache_runtime_control_test"
 bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
+(cd "${ROOT_DIR}" &&
+  python3 -m unittest tests.test_openstack_dataplane_agent)
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_xdp_monitor.bpf.o"
@@ -140,3 +143,4 @@ echo "Passed ${BUILD_DIR}/tc_coexistence_test"
 echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"
 echo "Passed ${BUILD_DIR}/cache_runtime_control_test"
 echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_dataplane_agent.py"
