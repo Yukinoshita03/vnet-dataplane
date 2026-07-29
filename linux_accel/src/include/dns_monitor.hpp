@@ -59,6 +59,7 @@ struct Options {
     std::string cache_domain;
     std::string cache_ip;
     std::string cache_file;
+    std::string pin_dir;
     std::vector<std::string> trusted_dns;
     int cache_ttl = 60;
     int max_learn_ttl = 300;
@@ -99,6 +100,7 @@ struct ReaderState {
     uint64_t last_cache_learned = 0;
     uint64_t last_cache_learn_rejected = 0;
     uint64_t last_cache_pending_expired = 0;
+    uint64_t last_cache_policy_bypass = 0;
     int dropped_events_fd = -1;
     int cache_stats_fd = -1;
 };

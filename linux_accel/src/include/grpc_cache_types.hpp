@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache_runtime_control.h"
+
 enum class HealthStatus : uint8_t {
     Serving = 1,
     NotServing = 2,
@@ -48,15 +50,20 @@ struct Options {
     int backend_port = 0;
     std::string grpc_map_path;
     std::string grpc_response_map_path;
+    std::string runtime_control_map_path;
     std::string cache_file;
     std::string method = "/grpc.health.v1.Health/Check";
     std::vector<std::string> cache_entries;
+    uint32_t cache_role = CACHE_RUNTIME_ROLE_SERVER;
     bool verbose = false;
 };
 
 struct CacheStats {
     uint64_t accepted = 0;
     uint64_t policy_miss = 0;
+    uint64_t policy_bypass = 0;
+    uint64_t runtime_map_error = 0;
+    uint64_t runtime_epoch = 0;
     uint64_t parse_error = 0;
     uint64_t cache_hit = 0;
     uint64_t serving_cache_hit = 0;

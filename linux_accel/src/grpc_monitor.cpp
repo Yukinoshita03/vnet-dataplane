@@ -398,7 +398,8 @@ bool pin_grpc_maps(bpf_object *obj, const std::string &pin_dir)
     // Keep the ELF/kernel map name within BPF_OBJ_NAME_LEN while preserving
     // the longer, stable pinned path used by cachectl and benchmark scripts.
     return pin_map(obj, pin_dir, "grpc_policy_map", "grpc_policy_map") &&
-           pin_map(obj, pin_dir, "grpc_resp_cache", "grpc_response_cache");
+           pin_map(obj, pin_dir, "grpc_resp_cache", "grpc_response_cache") &&
+           pin_map(obj, pin_dir, "cache_rt_ctl", "cache_runtime_control");
 }
 
 } // namespace

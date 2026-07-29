@@ -8,6 +8,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "cache_runtime_control.h"
 #include "grpc_event.h"
 
 #define GRPC_DEFAULT_PORT 50051
@@ -54,6 +55,13 @@ struct {
     __type(key, struct grpc_response_cache_key);
     __type(value, struct grpc_response_cache_value);
 } grpc_resp_cache SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cache_runtime_control);
+} cache_rt_ctl SEC(".maps");
 
 static __always_inline int read_packet(void *dst, const struct __sk_buff *skb,
                                        __u32 offset, __u32 len)

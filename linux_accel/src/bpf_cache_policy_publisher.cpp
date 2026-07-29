@@ -109,16 +109,15 @@ bool BpfCachePolicyPublisher::publish(CacheMode mode, uint64_t epoch,
         maps.push_back(std::move(map));
     }
 
-    cache_runtime_control next = {};
-    next.epoch = epoch;
-    next.mode = static_cast<uint32_t>(mode);
-    next.flags = CACHE_RUNTIME_COMMITTED;
+    cache_runtime_control staged = {};
+    staged.epoch = epoch;
+    staged.mode = static_cast<uint32_t>(mode);
 
     size_t applied = 0;
     for (; applied < maps.size(); ++applied) {
-        if (bpf_map_update_elem(maps[applied].fd, &key, &next, BPF_ANY) != 0) {
+        if (bpf_map_update_elem(maps[applied].fd, &key, &staged, BPF_ANY) != 0) {
             if (error)
-                *error = "publish " + maps[applied].path + ": " +
+                *error = "stage " + maps[applied].path + ": " +
                          strerror(errno);
             rollback_maps(&maps, applied, error);
             close_maps(&maps);
@@ -129,10 +128,39 @@ bool BpfCachePolicyPublisher::publish(CacheMode mode, uint64_t epoch,
     for (const OpenMap &map : maps) {
         cache_runtime_control observed = {};
         if (bpf_map_lookup_elem(map.fd, &key, &observed) != 0 ||
-            observed.epoch != next.epoch || observed.mode != next.mode ||
-            observed.flags != next.flags) {
+            observed.epoch != staged.epoch ||
+            observed.mode != staged.mode || observed.flags != 0) {
             if (error)
-                *error = "verify " + map.path;
+                *error = "verify staged " + map.path;
+            rollback_maps(&maps, maps.size(), error);
+            close_maps(&maps);
+            return false;
+        }
+    }
+
+    cache_runtime_control committed = staged;
+    committed.flags = CACHE_RUNTIME_COMMITTED;
+    applied = 0;
+    for (; applied < maps.size(); ++applied) {
+        if (bpf_map_update_elem(maps[applied].fd, &key, &committed,
+                                BPF_ANY) != 0) {
+            if (error)
+                *error = "commit " + maps[applied].path + ": " +
+                         strerror(errno);
+            rollback_maps(&maps, maps.size(), error);
+            close_maps(&maps);
+            return false;
+        }
+    }
+
+    for (const OpenMap &map : maps) {
+        cache_runtime_control observed = {};
+        if (bpf_map_lookup_elem(map.fd, &key, &observed) != 0 ||
+            observed.epoch != committed.epoch ||
+            observed.mode != committed.mode ||
+            observed.flags != committed.flags) {
+            if (error)
+                *error = "verify committed " + map.path;
             rollback_maps(&maps, maps.size(), error);
             close_maps(&maps);
             return false;

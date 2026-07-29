@@ -22,7 +22,8 @@ enum dns_cache_stat_key {
     DNS_CACHE_STAT_LEARNED = 4,
     DNS_CACHE_STAT_LEARN_REJECTED = 5,
     DNS_CACHE_STAT_PENDING_EXPIRED = 6,
-    DNS_CACHE_STAT_COUNT = 7,
+    DNS_CACHE_STAT_POLICY_BYPASS = 7,
+    DNS_CACHE_STAT_COUNT = 8,
 };
 
 struct dns_flow_key {

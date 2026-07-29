@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -191,6 +192,34 @@ bool install_client_config(bpf_object *obj, const Options &options)
     return true;
 }
 
+bool pin_runtime_control_map(bpf_object *obj, const std::string &pin_dir)
+{
+    if (pin_dir.empty())
+        return true;
+    if (mkdir(pin_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        std::cerr << "Failed to create pin dir " << pin_dir << ": "
+                  << strerror(errno) << "\n";
+        return false;
+    }
+
+    bpf_map *map = bpf_object__find_map_by_name(obj, "cache_rt_ctl");
+    if (!map) {
+        std::cerr << "Failed to find cache_rt_ctl map\n";
+        return false;
+    }
+
+    const std::string pin_path = pin_dir + "/cache_runtime_control";
+    unlink(pin_path.c_str());
+    const int err = bpf_map__pin(map, pin_path.c_str());
+    if (err) {
+        std::cerr << "Failed to pin cache_rt_ctl at " << pin_path << ": "
+                  << strerror(-err) << "\n";
+        return false;
+    }
+    std::cout << "Pinned cache_rt_ctl at " << pin_path << "\n";
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -266,6 +295,11 @@ int main(int argc, char **argv)
     }
     if (options.hook == "xdp" && options.role == "client" &&
         !install_client_config(obj, options)) {
+        bpf_object__close(obj);
+        return 1;
+    }
+    if (options.hook == "xdp" &&
+        !pin_runtime_control_map(obj, options.pin_dir)) {
         bpf_object__close(obj);
         return 1;
     }
@@ -350,6 +384,8 @@ int main(int argc, char **argv)
         state.cache_stats_fd, DNS_CACHE_STAT_LEARN_REJECTED);
     state.last_cache_pending_expired = read_percpu_counter_total(
         state.cache_stats_fd, DNS_CACHE_STAT_PENDING_EXPIRED);
+    state.last_cache_policy_bypass = read_percpu_counter_total(
+        state.cache_stats_fd, DNS_CACHE_STAT_POLICY_BYPASS);
 
     ring_buffer *ring =
         ring_buffer__new(bpf_map__fd(events_map), handle_dns_event, &state, nullptr);

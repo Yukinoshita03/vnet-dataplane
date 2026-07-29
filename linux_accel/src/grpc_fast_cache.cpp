@@ -25,10 +25,15 @@
 namespace {
 
 volatile sig_atomic_t exiting = 0;
+volatile sig_atomic_t listener_fd = -1;
 
 void handle_signal(int)
 {
     exiting = 1;
+    if (listener_fd >= 0) {
+        close(listener_fd);
+        listener_fd = -1;
+    }
 }
 
 uint64_t hash_grpc_method(const std::string &method)
@@ -65,6 +70,8 @@ void print_usage(const char *program)
     std::cerr << "Usage: " << program
               << " [--grpc-map <pinned-map-path>]"
               << " [--grpc-response-map <pinned-map-path>]"
+              << " [--runtime-control-map <pinned-map-path>]"
+              << " [--cache-role server|client]"
               << " [--listen 0.0.0.0:50051]"
               << " [--backend 127.0.0.1:50051]"
               << " [--cache-file policy.txt]"
@@ -161,6 +168,16 @@ bool parse_options(int argc, char **argv, Options *options)
             options->grpc_map_path = argv[++i];
         } else if (arg == "--grpc-response-map" && i + 1 < argc) {
             options->grpc_response_map_path = argv[++i];
+        } else if (arg == "--runtime-control-map" && i + 1 < argc) {
+            options->runtime_control_map_path = argv[++i];
+        } else if (arg == "--cache-role" && i + 1 < argc) {
+            const std::string role = argv[++i];
+            if (role == "server")
+                options->cache_role = CACHE_RUNTIME_ROLE_SERVER;
+            else if (role == "client")
+                options->cache_role = CACHE_RUNTIME_ROLE_CLIENT;
+            else
+                return false;
         } else if (arg == "--listen" && i + 1 < argc) {
             if (!parse_host_port(argv[++i], &options->listen_host,
                                  &options->listen_port))
@@ -203,6 +220,50 @@ bool policy_allows_method(int map_fd, const std::string &method)
     if (bpf_map_lookup_elem(map_fd, &key, &value) != 0)
         return false;
     return value.idempotent && value.ttl > 0;
+}
+
+enum class RuntimeCacheDecision {
+    Allow,
+    Bypass,
+    Error,
+};
+
+RuntimeCacheDecision runtime_cache_decision(int map_fd, uint32_t role,
+                                            uint64_t *epoch)
+{
+    if (map_fd < 0)
+        return RuntimeCacheDecision::Allow;
+
+    const uint32_t key = 0;
+    cache_runtime_control control = {};
+    if (bpf_map_lookup_elem(map_fd, &key, &control) != 0)
+        return RuntimeCacheDecision::Error;
+    *epoch = control.epoch;
+    return cache_runtime_control_allows(&control, role)
+               ? RuntimeCacheDecision::Allow
+               : RuntimeCacheDecision::Bypass;
+}
+
+bool validate_runtime_control_map(int map_fd)
+{
+    bpf_map_info info = {};
+    uint32_t info_len = sizeof(info);
+    if (bpf_obj_get_info_by_fd(map_fd, &info, &info_len) != 0)
+        return false;
+    if (info.type != BPF_MAP_TYPE_ARRAY ||
+        info.key_size != sizeof(uint32_t) ||
+        info.value_size != sizeof(cache_runtime_control) ||
+        info.max_entries < 1) {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+void close_if_open(int fd)
+{
+    if (fd >= 0)
+        close(fd);
 }
 
 int connect_backend(const Options &options)
@@ -310,8 +371,14 @@ void print_stats(const Options &options, const CacheStats &stats)
               << " backend=" << options.backend_host << ":"
               << options.backend_port
               << " default_method=" << options.method
+              << " cache_role="
+              << (options.cache_role == CACHE_RUNTIME_ROLE_CLIENT ? "client"
+                                                                  : "server")
               << " accepted=" << stats.accepted
               << " policy_miss=" << stats.policy_miss
+              << " policy_bypass=" << stats.policy_bypass
+              << " runtime_map_error=" << stats.runtime_map_error
+              << " runtime_epoch=" << stats.runtime_epoch
               << " parse_error=" << stats.parse_error
               << " cache_hit=" << stats.cache_hit
               << " serving_cache_hit=" << stats.serving_cache_hit
@@ -428,15 +495,29 @@ int main(int argc, char **argv)
         }
     }
 
-    int listener = create_listener(options);
-    if (listener < 0) {
+    int runtime_map_fd = -1;
+    if (!options.runtime_control_map_path.empty()) {
+        runtime_map_fd =
+            bpf_obj_get(options.runtime_control_map_path.c_str());
+        if (runtime_map_fd < 0 ||
+            !validate_runtime_control_map(runtime_map_fd)) {
+            std::cerr << "Failed to open compatible runtime control map "
+                      << options.runtime_control_map_path << ": "
+                      << strerror(errno) << "\n";
+            close_if_open(runtime_map_fd);
+            close_if_open(response_map_fd);
+            close_if_open(map_fd);
+            return 1;
+        }
+    }
+
+    listener_fd = create_listener(options);
+    if (listener_fd < 0) {
         std::cerr << "Failed to listen on " << options.listen_host << ":"
                   << options.listen_port << ": " << strerror(errno) << "\n";
-        if (response_map_fd >= 0)
-            close(response_map_fd);
-        if (map_fd >= 0)
-            if (map_fd >= 0)
-                close(map_fd);
+        close_if_open(runtime_map_fd);
+        close_if_open(response_map_fd);
+        close_if_open(map_fd);
         return 1;
     }
 
@@ -446,20 +527,21 @@ int main(int argc, char **argv)
     ResponseCache response_cache;
     if (!options.cache_file.empty() &&
         !load_response_cache_file(options.cache_file, &response_cache)) {
-        if (response_map_fd >= 0)
-            close(response_map_fd);
-        close(listener);
-        if (map_fd >= 0)
-            close(map_fd);
+        close_if_open(runtime_map_fd);
+        close_if_open(response_map_fd);
+        close_if_open(listener_fd);
+        listener_fd = -1;
+        close_if_open(map_fd);
         return 1;
     }
     for (const std::string &entry : options.cache_entries) {
         if (!parse_cache_entry_arg(entry, &response_cache)) {
             std::cerr << "Invalid --cache-entry: " << entry << "\n";
-            if (response_map_fd >= 0)
-                close(response_map_fd);
-            close(listener);
-            close(map_fd);
+            close_if_open(runtime_map_fd);
+            close_if_open(response_map_fd);
+            close_if_open(listener_fd);
+            listener_fd = -1;
+            close_if_open(map_fd);
             return 1;
         }
     }
@@ -474,8 +556,11 @@ int main(int argc, char **argv)
     while (!exiting) {
         sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
-        int client = accept(listener, reinterpret_cast<sockaddr *>(&peer), &peer_len);
+        int client =
+            accept(listener_fd, reinterpret_cast<sockaddr *>(&peer), &peer_len);
         if (client < 0) {
+            if (exiting)
+                break;
             if (errno == EINTR)
                 continue;
             std::cerr << "accept failed: " << strerror(errno) << "\n";
@@ -490,11 +575,16 @@ int main(int argc, char **argv)
             request.method = options.method;
 
         bool allowed = false;
+        RuntimeCacheDecision runtime_decision = RuntimeCacheDecision::Allow;
         if (parsed) {
-            allowed = map_fd >= 0
-                          ? policy_allows_method(map_fd, request.method)
-                          : userspace_policy_allows_method(response_cache,
-                                                           request.method);
+            runtime_decision = runtime_cache_decision(
+                runtime_map_fd, options.cache_role, &stats.runtime_epoch);
+            if (runtime_decision == RuntimeCacheDecision::Allow) {
+                allowed = map_fd >= 0
+                              ? policy_allows_method(map_fd, request.method)
+                              : userspace_policy_allows_method(response_cache,
+                                                               request.method);
+            }
         }
         if (!parsed) {
             stats.parse_error++;
@@ -504,6 +594,26 @@ int main(int argc, char **argv)
             } else {
                 stats.fallback_error++;
                 print_request_decision(options, request, "parse_fallback_error");
+            }
+        } else if (runtime_decision != RuntimeCacheDecision::Allow) {
+            if (runtime_decision == RuntimeCacheDecision::Error)
+                stats.runtime_map_error++;
+            else
+                stats.policy_bypass++;
+            if (fallback_to_backend(client, options, raw_request)) {
+                stats.fallback++;
+                print_request_decision(
+                    options, request,
+                    runtime_decision == RuntimeCacheDecision::Error
+                        ? "runtime_map_error"
+                        : "policy_bypass");
+            } else {
+                stats.fallback_error++;
+                print_request_decision(
+                    options, request,
+                    runtime_decision == RuntimeCacheDecision::Error
+                        ? "runtime_map_error_fallback_error"
+                        : "policy_bypass_fallback_error");
             }
         } else if (!allowed) {
             stats.policy_miss++;
@@ -554,10 +664,10 @@ int main(int argc, char **argv)
     }
 
     print_stats(options, stats);
-    close(listener);
-    if (response_map_fd >= 0)
-        close(response_map_fd);
-    if (map_fd >= 0)
-        close(map_fd);
+    close_if_open(listener_fd);
+    listener_fd = -1;
+    close_if_open(runtime_map_fd);
+    close_if_open(response_map_fd);
+    close_if_open(map_fd);
     return 0;
 }

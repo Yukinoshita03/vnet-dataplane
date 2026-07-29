@@ -7,6 +7,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "cache_runtime_control.h"
 #include "dns_event.h"
 #include "dns_xdp_cache_helpers.h"
 
@@ -47,6 +48,22 @@ struct {
     __type(key, __u32);
     __type(value, __u64);
 } dns_cache_stats SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cache_runtime_control);
+} cache_rt_ctl SEC(".maps");
+
+static __always_inline __u8 server_cache_enabled(void)
+{
+    __u32 key = 0;
+    struct cache_runtime_control *control =
+        bpf_map_lookup_elem(&cache_rt_ctl, &key);
+
+    return cache_runtime_control_allows(control, CACHE_RUNTIME_ROLE_SERVER);
+}
 
 static __always_inline void increment_dropped_events(void)
 {
@@ -128,6 +145,10 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
         return XDP_PASS;
     if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
         return XDP_PASS;
+    if (!server_cache_enabled()) {
+        increment_cache_stat(DNS_CACHE_STAT_POLICY_BYPASS);
+        return XDP_PASS;
+    }
 
     cache_value = bpf_map_lookup_elem(&dns_cache, &cache_key);
     if (!cache_value) {

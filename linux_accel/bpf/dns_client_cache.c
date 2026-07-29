@@ -8,6 +8,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "cache_runtime_control.h"
 #include "dns_event.h"
 #include "dns_xdp_cache_helpers.h"
 
@@ -64,6 +65,13 @@ struct {
     __type(value, struct dns_client_config);
 } dns_client_config SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct cache_runtime_control);
+} cache_rt_ctl SEC(".maps");
+
 static __always_inline void increment_dropped_events(void)
 {
     __u32 key = 0;
@@ -115,6 +123,15 @@ static __always_inline struct dns_client_config *client_config(void)
     __u32 key = 0;
 
     return bpf_map_lookup_elem(&dns_client_config, &key);
+}
+
+static __always_inline __u8 client_cache_enabled(void)
+{
+    __u32 key = 0;
+    struct cache_runtime_control *control =
+        bpf_map_lookup_elem(&cache_rt_ctl, &key);
+
+    return cache_runtime_control_allows(control, CACHE_RUNTIME_ROLE_CLIENT);
 }
 
 static __always_inline void emit_dns_event(__u32 direction, __u32 ifindex,
@@ -190,6 +207,15 @@ static __always_inline int try_client_cache_response(
         return XDP_PASS;
     if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
         return XDP_PASS;
+
+    if (!client_cache_enabled()) {
+        build_dns_flow_key(&flow_key, ip, src_port, dst_port, dns_id, 0);
+        pending.cache_key = cache_key;
+        pending.started_ns = now;
+        bpf_map_update_elem(&dns_client_pending, &flow_key, &pending, BPF_ANY);
+        increment_cache_stat(DNS_CACHE_STAT_POLICY_BYPASS);
+        return XDP_PASS;
+    }
 
     cache_value = bpf_map_lookup_elem(&dns_client_cache, &cache_key);
     if (cache_value && cache_value->expires_ns && now > cache_value->expires_ns) {

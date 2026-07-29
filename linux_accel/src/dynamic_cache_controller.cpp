@@ -61,7 +61,8 @@ bool parse_cache_mode(const std::string &text, CacheMode *mode)
 DynamicCacheController::DynamicCacheController(
     DynamicCacheConfig config, CachePolicyPublisher *publisher)
     : config_(std::move(config)), publisher_(publisher),
-      mode_(config_.initial_mode), candidate_(config_.initial_mode)
+      mode_(config_.initial_mode), candidate_(config_.initial_mode),
+      epoch_(config_.initial_epoch)
 {
     if (config_.window_size == 0)
         config_.window_size = 1;
@@ -146,6 +147,13 @@ DynamicCacheController::observe(const CacheMetricSample &sample)
     result.candidate = candidate_;
     result.epoch = epoch_;
 
+    if (sample_seen_ && sample.timestamp_ms < last_sample_ms_) {
+        result.reason = "stale_timestamp";
+        return result;
+    }
+    last_sample_ms_ = sample.timestamp_ms;
+    sample_seen_ = true;
+
     samples_.push_back(sample);
     while (samples_.size() > config_.window_size)
         samples_.pop_front();
@@ -184,7 +192,7 @@ DynamicCacheController::observe(const CacheMetricSample &sample)
     }
 
     if (changed_once_ &&
-        sample.timestamp_ms < last_change_ms_ + config_.cooldown_ms) {
+        sample.timestamp_ms - last_change_ms_ < config_.cooldown_ms) {
         result.reason = "cooldown";
         return result;
     }

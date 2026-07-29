@@ -99,8 +99,18 @@ c++ -std=c++17 -O2 -g \
   "${ROOT_DIR}/src/dynamic_cache_controller.cpp" \
   -o "${BUILD_DIR}/dynamic_cache_controller_test"
 
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
+  "${ROOT_DIR}/tests/cache_runtime_control_test.cpp" \
+  -o "${BUILD_DIR}/cache_runtime_control_test"
+
+cc -O2 -g \
+  "${ROOT_DIR}/bench/openstack_grpc_harness.c" \
+  -o "${BUILD_DIR}/openstack_grpc_harness"
+
 "${BUILD_DIR}/tc_coexistence_test"
 "${BUILD_DIR}/dynamic_cache_controller_test"
+"${BUILD_DIR}/cache_runtime_control_test"
 bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
@@ -113,6 +123,8 @@ echo "Built ${BUILD_DIR}/grpc_fast_cache"
 echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
 echo "Built ${BUILD_DIR}/dynamic_cache_controller"
+echo "Built ${BUILD_DIR}/openstack_grpc_harness"
 echo "Passed ${BUILD_DIR}/tc_coexistence_test"
 echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"
+echo "Passed ${BUILD_DIR}/cache_runtime_control_test"
 echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"

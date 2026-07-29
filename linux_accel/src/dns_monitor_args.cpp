@@ -36,6 +36,7 @@ void print_usage(const char *program)
               << " [--role server|client]"
               << " [--cache-domain <name> --cache-ip <ipv4> [--cache-ttl <sec>]]"
               << " [--cache-file <path>]"
+              << " [--pin-dir <bpffs-dir>]"
               << " [--trusted-dns <ipv4>] [--max-learn-ttl <sec>]"
               << " [--learn-window-ms <ms>]"
               << " [--timeout-ms <ms>] [--verbose-events]"
@@ -68,6 +69,8 @@ bool parse_options(int argc, char **argv, Options *options)
             options->cache_ip = argv[++i];
         } else if (arg == "--cache-file" && i + 1 < argc) {
             options->cache_file = argv[++i];
+        } else if (arg == "--pin-dir" && i + 1 < argc) {
+            options->pin_dir = argv[++i];
         } else if (arg == "--trusted-dns" && i + 1 < argc) {
             options->trusted_dns.emplace_back(argv[++i]);
         } else if (arg == "--cache-ttl" && i + 1 < argc) {
@@ -111,6 +114,10 @@ bool parse_options(int argc, char **argv, Options *options)
     }
     if (options->role == "client" && options->hook != "xdp") {
         std::cerr << "--role client requires --hook xdp\n";
+        return false;
+    }
+    if (!options->pin_dir.empty() && options->hook != "xdp") {
+        std::cerr << "--pin-dir is only supported with --hook xdp\n";
         return false;
     }
     if (options->role == "client" && options->trusted_dns.empty()) {

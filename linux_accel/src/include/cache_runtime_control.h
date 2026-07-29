@@ -34,3 +34,13 @@ static __inline __u8 cache_runtime_mode_allows(__u32 mode, __u32 role)
         return mode == CACHE_RUNTIME_CLIENT;
     return 0;
 }
+
+static __inline __u8 cache_runtime_control_allows(
+    const struct cache_runtime_control *control, __u32 role)
+{
+    if (!control)
+        return 1;
+    if (!(control->flags & CACHE_RUNTIME_COMMITTED))
+        return control->epoch == 0;
+    return cache_runtime_mode_allows(control->mode, role);
+}

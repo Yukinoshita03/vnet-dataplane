@@ -142,6 +142,32 @@ void expect_error_rate_forces_bypass()
         fail("high error rate did not force BYPASS");
 }
 
+void expect_initial_epoch_is_preserved()
+{
+    RecordingPublisher publisher;
+    DynamicCacheConfig config = test_config();
+    config.initial_epoch = 41;
+    DynamicCacheController controller(config, &publisher);
+    controller.observe(sample(100, 70, 30, 1000.0, 100.0));
+    controller.observe(sample(200, 70, 30, 1000.0, 100.0));
+    DynamicCacheResult changed =
+        controller.observe(sample(300, 70, 30, 1000.0, 100.0));
+    if (!changed.changed || changed.epoch != 42 || publisher.epoch != 42)
+        fail("initial epoch was not carried into the next publication");
+}
+
+void expect_stale_sample_is_ignored()
+{
+    RecordingPublisher publisher;
+    DynamicCacheController controller(test_config(), &publisher);
+    controller.observe(sample(200, 70, 30, 1000.0, 100.0));
+    DynamicCacheResult stale =
+        controller.observe(sample(100, 70, 30, 1000.0, 100.0));
+    if (stale.window_ready || stale.changed ||
+        stale.reason != "stale_timestamp" || publisher.calls != 0)
+        fail("stale metrics sample affected controller state");
+}
+
 } // namespace
 
 int main()
@@ -151,6 +177,8 @@ int main()
     expect_cooldown();
     expect_publish_failure_keeps_epoch();
     expect_error_rate_forces_bypass();
+    expect_initial_epoch_is_preserved();
+    expect_stale_sample_is_ignored();
     std::cout << "dynamic_cache_controller_test: PASS\n";
     return 0;
 }

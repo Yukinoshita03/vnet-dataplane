@@ -40,6 +40,7 @@ struct DynamicCacheConfig {
     double dual_exit_backend_qps = 800.0;
     double bypass_error_rate = 0.05;
     CacheMode initial_mode = CacheMode::Bypass;
+    uint64_t initial_epoch = 0;
 };
 
 class CachePolicyPublisher {
@@ -93,5 +94,7 @@ private:
     size_t candidate_windows_ = 0;
     uint64_t epoch_ = 0;
     uint64_t last_change_ms_ = 0;
+    uint64_t last_sample_ms_ = 0;
     bool changed_once_ = false;
+    bool sample_seen_ = false;
 };

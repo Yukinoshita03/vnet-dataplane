@@ -1,6 +1,8 @@
 #include "bpf_cache_policy_publisher.hpp"
 #include "dynamic_cache_controller.hpp"
 
+#include <cerrno>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -45,9 +47,12 @@ void usage(const char *program)
 
 bool parse_u64(const std::string &text, uint64_t *value)
 {
+    if (text.empty() || text[0] == '-')
+        return false;
+    errno = 0;
     char *end = nullptr;
     unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
-    if (!end || *end != '\0')
+    if (errno == ERANGE || !end || *end != '\0')
         return false;
     *value = static_cast<uint64_t>(parsed);
     return true;
@@ -96,7 +101,8 @@ bool parse_options(int argc, char **argv, Options *options)
             return false;
         }
     }
-    return options->dry_run != options->control_maps.empty();
+    const bool has_control_maps = !options->control_maps.empty();
+    return options->dry_run != has_control_maps;
 }
 
 std::vector<std::string> split_csv(const std::string &line)
@@ -111,9 +117,11 @@ std::vector<std::string> split_csv(const std::string &line)
 
 bool parse_double(const std::string &text, double *value)
 {
+    errno = 0;
     char *end = nullptr;
     double parsed = std::strtod(text.c_str(), &end);
-    if (!end || *end != '\0')
+    if (errno == ERANGE || !end || *end != '\0' ||
+        !std::isfinite(parsed))
         return false;
     *value = parsed;
     return true;
@@ -124,15 +132,19 @@ bool parse_sample(const std::string &line, CacheMetricSample *sample)
     const std::vector<std::string> fields = split_csv(line);
     if (fields.size() != 9)
         return false;
-    return parse_u64(fields[0], &sample->timestamp_ms) &&
-           parse_u64(fields[1], &sample->dns_hits) &&
-           parse_u64(fields[2], &sample->dns_misses) &&
-           parse_double(fields[3], &sample->dns_p95_us) &&
-           parse_u64(fields[4], &sample->grpc_hits) &&
-           parse_u64(fields[5], &sample->grpc_misses) &&
-           parse_double(fields[6], &sample->grpc_p95_us) &&
-           parse_double(fields[7], &sample->backend_qps) &&
-           parse_double(fields[8], &sample->error_rate);
+    if (!parse_u64(fields[0], &sample->timestamp_ms) ||
+        !parse_u64(fields[1], &sample->dns_hits) ||
+        !parse_u64(fields[2], &sample->dns_misses) ||
+        !parse_double(fields[3], &sample->dns_p95_us) ||
+        !parse_u64(fields[4], &sample->grpc_hits) ||
+        !parse_u64(fields[5], &sample->grpc_misses) ||
+        !parse_double(fields[6], &sample->grpc_p95_us) ||
+        !parse_double(fields[7], &sample->backend_qps) ||
+        !parse_double(fields[8], &sample->error_rate))
+        return false;
+    return sample->dns_p95_us >= 0.0 && sample->grpc_p95_us >= 0.0 &&
+           sample->backend_qps >= 0.0 && sample->error_rate >= 0.0 &&
+           sample->error_rate <= 1.0;
 }
 
 std::string result_line(const CacheMetricSample &sample,
@@ -172,6 +184,16 @@ int main(int argc, char **argv)
     else
         publisher = std::make_unique<BpfCachePolicyPublisher>(
             options.control_maps);
+
+    constexpr uint64_t startup_epoch = 1;
+    std::string publish_error;
+    if (!publisher->publish(options.config.initial_mode, startup_epoch,
+                            &publish_error)) {
+        std::cerr << "Failed to publish initial cache mode: "
+                  << publish_error << "\n";
+        return 1;
+    }
+    options.config.initial_epoch = startup_epoch;
 
     std::ifstream metrics_file;
     std::istream *input = &std::cin;
