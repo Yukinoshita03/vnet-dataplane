@@ -32,6 +32,9 @@ ssh_ready_timeout=${SSH_READY_TIMEOUT_SEC:-$((ssh_wait_attempts * 2))}
 ssh_probe_timeout=${SSH_PROBE_TIMEOUT_SEC:-8}
 ssh_command_timeout=${SSH_COMMAND_TIMEOUT_SEC:-45}
 keep_resources=${KEEP_RESOURCES:-0}
+existing_client_server=${CLIENT_SERVER:-}
+existing_backend_server=${BACKEND_SERVER:-}
+require_tc_coexistence=${REQUIRE_TC_COEXISTENCE:-0}
 sudo_password=${SUDO_PASS:-}
 sudo_askpass=
 
@@ -61,6 +64,7 @@ client_ssh_ip=
 client_port_id=
 client_tap_if=
 client_cache_mode=guest-ebpf
+owns_servers=1
 security_group_id=
 floating_ip_ids=()
 monitor_pids=()
@@ -186,7 +190,7 @@ stop_guest_processes() {
         client_host_monitor_pid=
     fi
     if [[ -n "$client_tap_if" ]]; then
-        host_root_cmd "tc qdisc del dev '$client_tap_if' clsact 2>/dev/null || true" || true
+        host_root_cmd "tc filter del dev '$client_tap_if' ingress pref 1 handle 1 bpf 2>/dev/null || true; tc filter del dev '$client_tap_if' egress pref 1 handle 1 bpf 2>/dev/null || true" || true
     fi
     guest_root_cmd "$backend_ssh_ip" 'for f in /tmp/dns-backend.pid /tmp/dns-server-monitor.pid; do if [ -s "$f" ]; then kill -TERM "$(cat "$f")" 2>/dev/null || true; fi; done; fuser -k -TERM 53/udp 2>/dev/null || true; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; fuser -k -KILL 53/udp 2>/dev/null || true; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count; true' || true
     guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then kill -TERM "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-client-monitor.pid; true' || true
@@ -197,10 +201,16 @@ cleanup() {
     set +e
     if [[ -n "$backend_ssh_ip" && -n "$client_ssh_ip" ]]; then
         stop_guest_processes
+        guest_root_cmd "$client_ssh_ip" \
+            'rm -f /tmp/openstack_dns_harness /tmp/dns_monitor /tmp/dns_client_cache.bpf.o /tmp/dns_monitor.bpf.o'
+        guest_root_cmd "$backend_ssh_ip" \
+            'rm -f /tmp/openstack_dns_harness /tmp/dns_monitor /tmp/dns_xdp_monitor.bpf.o /tmp/dns_monitor.bpf.o'
     fi
     if [[ "$keep_resources" != 1 ]]; then
-        [[ -n "$backend_id" ]] && openstack_cmd server delete --wait "$backend_id" >/dev/null 2>&1 || true
-        [[ -n "$client_id" ]] && openstack_cmd server delete --wait "$client_id" >/dev/null 2>&1 || true
+        if [[ "$owns_servers" == 1 ]]; then
+            [[ -n "$backend_id" ]] && openstack_cmd server delete --wait "$backend_id" >/dev/null 2>&1 || true
+            [[ -n "$client_id" ]] && openstack_cmd server delete --wait "$client_id" >/dev/null 2>&1 || true
+        fi
         for id in "${floating_ip_ids[@]}"; do
             [[ -n "$id" ]] && openstack_cmd floating ip delete "$id" >/dev/null 2>&1 || true
         done
@@ -245,20 +255,32 @@ printf 'netns=%s\n' "${netns:-none}" > "$out_dir/environment.md"
     echo "GUEST_BPF must be 0 or 1" >&2
     exit 1
 }
+if [[ -n "$existing_client_server" || -n "$existing_backend_server" ]]; then
+    [[ -n "$existing_client_server" && -n "$existing_backend_server" ]] || {
+        echo "CLIENT_SERVER and BACKEND_SERVER must be set together" >&2
+        exit 1
+    }
+fi
 
-security_group_id=$(openstack_cmd security group create "$prefix-sg" -f value -c id)
-private_cidr=${PRIVATE_CIDR:-0.0.0.0/0}
-ssh_cidr=$private_cidr
-[[ "$use_floating_ip" == 1 ]] && ssh_cidr=$floating_cidr
-openstack_cmd security group rule create --protocol tcp --dst-port 22 \
-    --remote-ip "$ssh_cidr" "$security_group_id" >/dev/null
-openstack_cmd security group rule create --protocol udp --dst-port 53 \
-    --remote-ip "$private_cidr" "$security_group_id" >/dev/null
-openstack_cmd security group rule create --protocol icmp \
-    --remote-ip "$private_cidr" "$security_group_id" >/dev/null
+if [[ -n "$existing_client_server" ]]; then
+    client_id=$(openstack_cmd server show "$existing_client_server" -f value -c id)
+    backend_id=$(openstack_cmd server show "$existing_backend_server" -f value -c id)
+    owns_servers=0
+else
+    security_group_id=$(openstack_cmd security group create "$prefix-sg" -f value -c id)
+    private_cidr=${PRIVATE_CIDR:-0.0.0.0/0}
+    ssh_cidr=$private_cidr
+    [[ "$use_floating_ip" == 1 ]] && ssh_cidr=$floating_cidr
+    openstack_cmd security group rule create --protocol tcp --dst-port 22 \
+        --remote-ip "$ssh_cidr" "$security_group_id" >/dev/null
+    openstack_cmd security group rule create --protocol udp --dst-port 53 \
+        --remote-ip "$private_cidr" "$security_group_id" >/dev/null
+    openstack_cmd security group rule create --protocol icmp \
+        --remote-ip "$private_cidr" "$security_group_id" >/dev/null
 
-client_id=$(create_server "$prefix-client")
-backend_id=$(create_server "$prefix-backend")
+    client_id=$(create_server "$prefix-client")
+    backend_id=$(create_server "$prefix-backend")
+fi
 client_ip=$(server_fixed_ip "$client_id")
 backend_ip=$(server_fixed_ip "$backend_id")
 if [[ "$use_floating_ip" == 1 ]]; then
@@ -383,6 +405,29 @@ monitor_line() {
     fi
 }
 
+verify_client_tc_coexistence() {
+    local scenario=$1
+    [[ "$require_tc_coexistence" == 1 ]] || return 0
+    local ingress_log="$out_dir/${scenario}.tc-ingress.txt"
+    local egress_log="$out_dir/${scenario}.tc-egress.txt"
+    local dns_line netmig_line
+
+    sudo_cmd tc filter show dev "$client_tap_if" ingress > "$ingress_log"
+    sudo_cmd tc filter show dev "$client_tap_if" egress > "$egress_log"
+    dns_line=$(grep -n 'handle 0x1 ' "$ingress_log" | head -n 1 | cut -d: -f1 || true)
+    netmig_line=$(grep -n 'handle 0x65 ' "$ingress_log" | head -n 1 | cut -d: -f1 || true)
+    [[ -n "$dns_line" && -n "$netmig_line" && "$dns_line" -lt "$netmig_line" ]] || {
+        echo "$scenario ingress TC coexistence order is invalid" >&2
+        return 1
+    }
+    dns_line=$(grep -n 'handle 0x1 ' "$egress_log" | head -n 1 | cut -d: -f1 || true)
+    netmig_line=$(grep -n 'handle 0x66 ' "$egress_log" | head -n 1 | cut -d: -f1 || true)
+    [[ -n "$dns_line" && -n "$netmig_line" && "$dns_line" -lt "$netmig_line" ]] || {
+        echo "$scenario egress TC coexistence order is invalid" >&2
+        return 1
+    }
+}
+
 run_client() {
     guest_cmd "$client_ssh_ip" \
         "timeout 120 /tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' '$requests' '$warmup'"
@@ -410,6 +455,9 @@ run_scenario() {
     start_backend
     start_monitor server "$name"
     start_monitor client "$name"
+    if [[ "$name" == client-only || "$name" == both ]]; then
+        verify_client_tc_coexistence "$name"
+    fi
     local result
     if [[ "$name" == baseline ]]; then
         result=$(run_client)
@@ -446,6 +494,7 @@ run_safety_checks() {
     stop_guest_processes
     start_backend 1
     start_monitor client ttl
+    verify_client_tc_coexistence ttl
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 1" > "$out_dir/ttl-hit.log" || true
     sleep 2
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 0" > "$out_dir/ttl-expired.log" || true
@@ -459,6 +508,7 @@ run_safety_checks() {
 
     start_backend 60
     start_monitor client untrusted
+    verify_client_tc_coexistence untrusted
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/untrusted.log" || true
     count=$(backend_count) || { echo "untrusted backend count read failed" >&2; return 1; }
     printf 'untrusted_backend_requests=%s\n' "$count" | tee "$out_dir/untrusted-summary.txt"
@@ -467,6 +517,7 @@ run_safety_checks() {
 
     start_backend 60 nxdomain
     start_monitor client nxdomain
+    verify_client_tc_coexistence nxdomain
     guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/nxdomain.log" || true
     count=$(backend_count) || { echo "NXDOMAIN backend count read failed" >&2; return 1; }
     printf 'nxdomain_backend_requests=%s\n' "$count" | tee "$out_dir/nxdomain-summary.txt"

@@ -436,37 +436,37 @@ int dns_client_cache_egress(struct __sk_buff *skb)
     __u32 ttl;
 
     if (read_packet(&eth, skb, offset, sizeof(eth)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (bpf_ntohs(eth.h_proto) != ETH_P_IP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += sizeof(eth);
     if (read_packet(&ip, skb, offset, sizeof(ip)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (ip.version != 4 || ip.protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (bpf_ntohs(ip.frag_off) & IP_FRAGMENT_MASK)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     ip_header_len = ip.ihl * 4;
     if (ip_header_len != sizeof(ip))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     offset += ip_header_len;
     if (read_packet(&udp, skb, offset, sizeof(udp)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     src_port = bpf_ntohs(udp.source);
     dst_port = bpf_ntohs(udp.dest);
     if (src_port != DNS_PORT)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += sizeof(udp);
     if (read_packet(&dns, skb, offset, sizeof(dns)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     dns_flags = bpf_ntohs(dns.flags);
     if (!(dns_flags & DNS_FLAG_RESPONSE))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     now = bpf_ktime_get_ns();
     dns_id = bpf_ntohs(dns.id);
@@ -526,7 +526,7 @@ int dns_client_cache_egress(struct __sk_buff *skb)
     emit_dns_event(DNS_DIR_CLIENT_TC_EGRESS, skb->ifindex, skb->len, &ip,
                    src_port, dst_port, dns_id, 1, rcode, matched, now,
                    latency_ns);
-    return TC_ACT_OK;
+    return TC_ACT_PIPE;
 }
 
 char LICENSE[] SEC("license") = "GPL";

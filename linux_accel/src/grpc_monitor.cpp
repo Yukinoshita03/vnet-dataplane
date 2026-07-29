@@ -1,4 +1,5 @@
 #include "grpc_event.h"
+#include "grpc_tc_attach_plan.hpp"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -473,15 +474,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    constexpr GrpcTcAttachPlan tc_plan = grpc_tc_attach_plan();
+
     ingress_opts.sz = sizeof(ingress_opts);
     ingress_opts.prog_fd = bpf_program__fd(ingress_prog);
-    ingress_opts.handle = 2;
-    ingress_opts.priority = 2;
+    ingress_opts.handle = tc_plan.ingress_handle;
+    ingress_opts.priority = tc_plan.ingress_priority;
 
     egress_opts.sz = sizeof(egress_opts);
     egress_opts.prog_fd = bpf_program__fd(egress_prog);
-    egress_opts.handle = 2;
-    egress_opts.priority = 2;
+    egress_opts.handle = tc_plan.egress_handle;
+    egress_opts.priority = tc_plan.egress_priority;
 
     hook.attach_point = BPF_TC_INGRESS;
     bpf_tc_detach(&hook, &ingress_opts);

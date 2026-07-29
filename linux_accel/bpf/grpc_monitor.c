@@ -151,42 +151,42 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     struct grpc_event *event;
 
     if (read_packet(&eth, skb, offset, sizeof(eth)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (bpf_ntohs(eth.h_proto) != ETH_P_IP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += sizeof(eth);
     if (read_packet(&ip, skb, offset, sizeof(ip)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (ip.version != 4 || ip.protocol != IPPROTO_TCP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     if (bpf_ntohs(ip.frag_off) & IP_FRAGMENT_MASK)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     ip_header_len = ip.ihl * 4;
     if (ip_header_len < sizeof(ip))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += ip_header_len;
     if (read_packet(&tcp, skb, offset, sizeof(tcp)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     src_port = bpf_ntohs(tcp.source);
     dst_port = bpf_ntohs(tcp.dest);
     if (src_port != port && dst_port != port)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     tcp_header_len = tcp.doff * 4;
     if (tcp_header_len < sizeof(tcp))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     ip_total_len = bpf_ntohs(ip.tot_len);
     if (ip_total_len < ip_header_len + tcp_header_len)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     payload_len = ip_total_len - ip_header_len - tcp_header_len;
     if (payload_len == 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     payload_offset = offset + tcp_header_len;
     now = bpf_ktime_get_ns();
@@ -210,7 +210,7 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     event = bpf_ringbuf_reserve(&grpc_events, sizeof(*event), 0);
     if (!event) {
         increment_dropped_events();
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     }
 
     __builtin_memset(event, 0, sizeof(*event));
@@ -228,7 +228,7 @@ static __always_inline int handle_grpc_packet(struct __sk_buff *skb,
     event->matched = matched;
     event->flags = flags;
     bpf_ringbuf_submit(event, 0);
-    return TC_ACT_OK;
+    return TC_ACT_PIPE;
 }
 
 SEC("tc/ingress")

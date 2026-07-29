@@ -106,37 +106,37 @@ static __always_inline int handle_dns_packet(struct __sk_buff *skb,
     struct dns_event *event;
 
     if (read_packet(&eth, skb, offset, sizeof(eth)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (bpf_ntohs(eth.h_proto) != ETH_P_IP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += sizeof(eth);
     if (read_packet(&ip, skb, offset, sizeof(ip)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (ip.version != 4 || ip.protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     if (bpf_ntohs(ip.frag_off) & IP_FRAGMENT_MASK)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     ip_header_len = ip.ihl * 4;
     if (ip_header_len < sizeof(ip))
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += ip_header_len;
     if (read_packet(&udp, skb, offset, sizeof(udp)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     src_port = bpf_ntohs(udp.source);
     dst_port = bpf_ntohs(udp.dest);
     if (src_port != DNS_PORT && dst_port != DNS_PORT)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     offset += sizeof(udp);
     if (read_packet(&dns, skb, offset, sizeof(dns)) < 0)
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
 
     now = bpf_ktime_get_ns();
     dns_id = bpf_ntohs(dns.id);
@@ -161,7 +161,7 @@ static __always_inline int handle_dns_packet(struct __sk_buff *skb,
     event = bpf_ringbuf_reserve(&dns_events, sizeof(*event), 0);
     if (!event) {
         increment_dropped_events();
-        return TC_ACT_OK;
+        return TC_ACT_PIPE;
     }
 
     __builtin_memset(event, 0, sizeof(*event));
@@ -179,7 +179,7 @@ static __always_inline int handle_dns_packet(struct __sk_buff *skb,
     event->rcode = rcode;
     event->matched = matched;
     bpf_ringbuf_submit(event, 0);
-    return TC_ACT_OK;
+    return TC_ACT_PIPE;
 }
 
 SEC("tc/ingress")

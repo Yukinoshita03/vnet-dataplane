@@ -1,4 +1,5 @@
 #include "dns_monitor.hpp"
+#include "dns_tc_attach_plan.hpp"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -282,11 +283,17 @@ int main(int argc, char **argv)
             return 1;
         }
     } else if (options.role == "client") {
+        constexpr DnsClientTcAttachPlan tc_plan =
+            dns_client_tc_attach_plan();
         if (!ensure_tc_hook(&attachments, ifindex) ||
-            !attach_tc_filter(&attachments, egress_prog, BPF_TC_INGRESS, 100,
-                              100, &attachments.tc_ingress_attached) ||
-            !attach_tc_filter(&attachments, egress_prog, BPF_TC_EGRESS, 101,
-                              101, &attachments.tc_egress_attached)) {
+            !attach_tc_filter(&attachments, egress_prog, BPF_TC_INGRESS,
+                              tc_plan.ingress_handle,
+                              tc_plan.ingress_priority,
+                              &attachments.tc_ingress_attached) ||
+            !attach_tc_filter(&attachments, egress_prog, BPF_TC_EGRESS,
+                              tc_plan.egress_handle,
+                              tc_plan.egress_priority,
+                              &attachments.tc_egress_attached)) {
             cleanup_attachments(&attachments, ifindex, xdp_mode);
             bpf_object__close(obj);
             return 1;

@@ -79,6 +79,14 @@ c++ -std=c++17 -O2 -g \
   "${ROOT_DIR}/src/virt_service_classifier.cpp" \
   -o "${BUILD_DIR}/virt_service_classifier"
 
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
+  "${ROOT_DIR}/tests/tc_coexistence_test.cpp" \
+  -o "${BUILD_DIR}/tc_coexistence_test"
+
+"${BUILD_DIR}/tc_coexistence_test"
+bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
+
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_xdp_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_client_cache.bpf.o"
@@ -88,3 +96,5 @@ echo "Built ${BUILD_DIR}/grpc_monitor"
 echo "Built ${BUILD_DIR}/grpc_fast_cache"
 echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
+echo "Passed ${BUILD_DIR}/tc_coexistence_test"
+echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
