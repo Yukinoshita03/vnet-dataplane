@@ -137,6 +137,11 @@ handle `0x65` 之前，egress observer 位于 `0x66` 之前。
 NotFound/404 才计为已清理；认证、API 或网络错误会让 campaign 以清理失败退出，
 并保留规则 ID 与诊断输出。
 
+该开关不管理 guest SSH 控制通道。调用前，`NETNS` 的实际 IPv4 源地址必须已对
+两台 guest 的 `TCP/22` 放通；实验引导若临时创建该规则，必须限制为该源 `/32`，
+在独立 artifact 中记录规则 ID，并在 run 后按 ID 删除和以 NotFound/404 复查。
+不得把这个仅用于部署和回收的 SSH 规则计入业务数据面或性能结果。
+
 ## 证据与清理
 
 每次运行保留：
