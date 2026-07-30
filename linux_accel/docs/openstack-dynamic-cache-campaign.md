@@ -140,14 +140,20 @@ handle `0x65` 之前，egress observer 位于 `0x66` 之前。
 
 对 TC/XDP monitor hook，当前脚本只通过结束自己启动的 monitor 触发清理；不会使用
 固定 handle 的 `tc filter del` 或 `xdp off` 作为兜底。monitor 会先核对程序 ID；
-所有权丢失时保留 hook 并让 cleanup audit 失败，而不是删除未知程序。guest 侧的
-DNS/gRPC harness helper 仍以共享进程名执行 `killall` 作为旧实验启动/收尾逻辑，
-因此同一对 guest 不应并发运行 campaign；P1 会把这些 helper 也改为 PID 级生命周期。
+所有权丢失时保留 hook 并让 cleanup audit 失败，而不是删除未知程序。每次 campaign
+会生成经过清洗的 `RUN_TOKEN`，将 guest 二进制、日志、PID 文件和 DNS 计数写入私有
+目录，并在私有 BPF pin 根目录下工作。helper 以私有 `setsid` 进程组启动；收尾前会
+核对 PID、进程组和启动时间，不匹配时拒绝发送信号并保留证据。脚本不再使用
+`killall` 或共享的 guest 临时文件名，因此不同运行不会相互删除 helper 进程或
+工件。动态 campaign 会对同一个 host tap 使用 `flock` 串行化，并为每次启动追加
+不可复用 nonce；它们仍不得绕过该锁并发占用同一个 TC/XDP hook。发生所有权异常时，
+脚本拒绝发送信号、保留 run 目录和 pin 根目录，并以非零 cleanup 状态结束供人工审计。
 
 `dynamic_cache_controller --dry-run` 只给出候选模式和 epoch；该 campaign 再以
 host、client、server 的串行方式发布 map。它是可审计的实验编排，不是跨主机原子
 事务。P1 的 prepare/readback/commit 与失败强制 `BYPASS` 完成前，不应将这批数据
 描述为“分布式原子发布”。
 
-2026-07-30 的正式五轮结果见
-`docs/openstack-dynamic-cache-results-20260730.md`。
+`docs/openstack-dynamic-cache-results-20260730.md` 记录的是 `.1` 生命周期修订前的
+2026-07-30 历史五轮结果。它可作为功能和性能基线，不是 `.1` 的生命周期验证；P2
+需要使用修订后的脚本重新跑完整的五策略、五负载矩阵。

@@ -5,6 +5,14 @@ script_dir=$(cd "$(dirname "$0")" && pwd)
 accel_dir=$(cd "$script_dir/.." && pwd)
 out_dir=${OUT_DIR:-$accel_dir/artifacts/openstack-dns-e2e/$(date +%Y%m%d-%H%M%S)}
 prefix=${NAME_PREFIX:-codex-dns-e2e-$(date +%Y%m%d-%H%M%S)-$$}
+run_token=$(printf '%s' "${RUN_TOKEN:-$prefix}" | tr -c 'A-Za-z0-9_-' '_')
+[[ -n "$run_token" ]] || { echo "RUN_TOKEN is empty after sanitization" >&2; exit 1; }
+guest_run_dir="/tmp/vnet-dns-e2e-${run_token}"
+guest_harness="${guest_run_dir}/openstack_dns_harness"
+guest_monitor="${guest_run_dir}/dns_monitor"
+guest_client_bpf="${guest_run_dir}/dns_client_cache.bpf.o"
+guest_server_bpf="${guest_run_dir}/dns_xdp_monitor.bpf.o"
+guest_tc_bpf="${guest_run_dir}/dns_monitor.bpf.o"
 openrc=${OPENRC:-/opt/stack/devstack/openrc}
 openrc_user=${OPENRC_USER:-admin}
 openrc_project=${OPENRC_PROJECT:-admin}
@@ -69,6 +77,7 @@ security_group_id=
 floating_ip_ids=()
 monitor_pids=()
 client_host_monitor_pid=
+client_host_monitor_start_time=
 mkdir -p "$out_dir"
 if [[ -n "$sudo_password" ]]; then
     sudo_askpass="$out_dir/.sudo-askpass"
@@ -179,80 +188,152 @@ create_server() {
 }
 
 backend_count() {
-    guest_cmd "$backend_ssh_ip" "test -s /tmp/dns-backend-count && tail -n 1 /tmp/dns-backend-count | tr -d '[:space:]' || printf 0"
+    guest_cmd "$backend_ssh_ip" "test -s '$guest_run_dir/dns-backend-count' && tail -n 1 '$guest_run_dir/dns-backend-count' | tr -d '[:space:]' || printf 0"
+}
+
+host_process_start_time() {
+    local pid=$1
+    local start_time pgid sid
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    start_time=$(sudo_cmd awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+    pgid=$(sudo_cmd ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    sid=$(sudo_cmd ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    [[ "$start_time" =~ ^[0-9]+$ && "$pgid" == "$pid" && "$sid" == "$pid" ]] ||
+        return 1
+    printf '%s\n' "$start_time"
 }
 
 stop_host_monitor() {
     local pid=$1
+    local expected_start_time=$2
+    local current_start_time
     [[ -n "$pid" ]] || return 0
-    [[ "$pid" =~ ^[0-9]+$ ]] || {
-        echo "invalid monitor pid: $pid" >&2
+    [[ "$pid" =~ ^[0-9]+$ && "$expected_start_time" =~ ^[0-9]+$ ]] || {
+        echo "invalid monitor process identity: pid=$pid start=$expected_start_time" >&2
         return 1
     }
-    # Monitors are started under setsid, so stop their private process group
-    # before falling back to the wrapper PID.
-    sudo_cmd kill -TERM -- "-$pid" >/dev/null 2>&1 || \
-        sudo_cmd kill -TERM "$pid" >/dev/null 2>&1 || true
+    if ! sudo_cmd kill -0 "$pid" >/dev/null 2>&1; then
+        if sudo_cmd kill -0 -- "-$pid" >/dev/null 2>&1; then
+            echo "monitor leader $pid exited while its process group remains" >&2
+            return 1
+        fi
+        return 0
+    fi
+    current_start_time=$(host_process_start_time "$pid") || {
+        echo "refusing to stop monitor without its private process group: $pid" >&2
+        return 1
+    }
+    [[ "$current_start_time" == "$expected_start_time" ]] || {
+        echo "refusing to stop reused monitor pid: $pid" >&2
+        return 1
+    }
+    sudo_cmd kill -TERM -- "-$pid" >/dev/null 2>&1 || true
     for _ in $(seq 1 50); do
-        sudo_cmd kill -0 "$pid" >/dev/null 2>&1 || return 0
+        sudo_cmd kill -0 -- "-$pid" >/dev/null 2>&1 || return 0
         sleep 0.1
     done
     echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
-    sudo_cmd kill -KILL -- "-$pid" >/dev/null 2>&1 || \
-        sudo_cmd kill -KILL "$pid" >/dev/null 2>&1 || true
+    sudo_cmd kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+    if sudo_cmd kill -0 -- "-$pid" >/dev/null 2>&1; then
+        echo "monitor process group $pid did not stop" >&2
+        return 1
+    fi
+}
+
+stop_guest_owned_processes() {
+    local ip=$1
+    shift
+    local names=()
+    local name
+    for name in "$@"; do
+        [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+            echo "unsafe owned process name: $name" >&2
+            return 1
+        }
+        names+=("$name")
+    done
+    local names_literal=""
+    for name in "${names[@]}"; do
+        names_literal+=" '$name'"
+    done
+    guest_root_cmd "$ip" "run_dir='$guest_run_dir'
+    stop_pid_file() {
+        [ -s \"\$1\" ] || return 0
+        pid=\"\$(cat \"\$1\")\"
+        case \"\$pid\" in
+            *[!0-9]*|\"\") echo \"invalid monitor pid: \$pid\" >&2; return 1 ;;
+        esac
+        cmdline=\"\$(tr '\\0' ' ' < \"/proc/\$pid/cmdline\" 2>/dev/null || true)\"
+        case \"\$cmdline\" in
+            *\"\$run_dir\"*) ;;
+            *)
+                echo \"refusing to stop pid \$pid outside this run directory\" >&2
+                return 1
+                ;;
+        esac
+        pgid=\"\$(ps -o pgid= -p \"\$pid\" 2>/dev/null | tr -d '[:space:]')\"
+        if [ \"\$pgid\" != \"\$pid\" ]; then
+            echo \"refusing to stop pid \$pid with unexpected process group \$pgid\" >&2
+            return 1
+        fi
+        kill -TERM -- \"-\$pid\" 2>/dev/null || true
+        for i in \$(seq 1 50); do
+            kill -0 -- \"-\$pid\" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 -- \"-\$pid\" 2>/dev/null; then
+            echo \"monitor pid \$pid did not stop gracefully; refusing blind hook cleanup\" >&2
+            kill -KILL -- \"-\$pid\" 2>/dev/null || true
+        fi
+        if kill -0 -- \"-\$pid\" 2>/dev/null; then
+            echo \"monitor process group \$pid did not stop\" >&2
+            return 1
+        fi
+        rm -f -- \"\$1\"
+    }
+    for name in ${names_literal}; do
+        stop_pid_file \"\$run_dir/\$name.pid\"
+    done"
 }
 
 stop_guest_processes() {
+    local lifecycle_failed=0
     if [[ -n "$client_host_monitor_pid" ]]; then
-        stop_host_monitor "$client_host_monitor_pid"
-        client_host_monitor_pid=
-    fi
-    guest_root_cmd "$backend_ssh_ip" 'stop_pid_file() {
-        [ -s "$1" ] || return 0
-        pid="$(cat "$1")"
-        case "$pid" in
-            *[!0-9]*|"") echo "invalid monitor pid: $pid" >&2; return 1 ;;
-        esac
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        for i in $(seq 1 50); do
-            kill -0 "$pid" 2>/dev/null || return 0
-            sleep 0.1
-        done
-        echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
-        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    }
-    stop_pid_file /tmp/dns-backend.pid
-    stop_pid_file /tmp/dns-server-monitor.pid
-    rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count' || true
-    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then
-        pid="$(cat /tmp/dns-client-monitor.pid)"
-        case "$pid" in
-            *[!0-9]*|"") echo "invalid monitor pid: $pid" >&2; return 1 ;;
-        esac
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        for i in $(seq 1 50); do
-            kill -0 "$pid" 2>/dev/null || break
-            sleep 0.1
-        done
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
-            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        if stop_host_monitor "$client_host_monitor_pid" "$client_host_monitor_start_time"; then
+            client_host_monitor_pid=
+            client_host_monitor_start_time=
+        else
+            lifecycle_failed=1
         fi
     fi
-    rm -f /tmp/dns-client-monitor.pid' || true
+    stop_guest_owned_processes "$backend_ssh_ip" dns-backend dns-server-monitor || lifecycle_failed=1
+    stop_guest_owned_processes "$client_ssh_ip" dns-client-monitor || lifecycle_failed=1
+    if (( lifecycle_failed == 0 )); then
+        guest_root_cmd "$backend_ssh_ip" \
+            "rm -f -- '$guest_run_dir/dns-backend-count'" || lifecycle_failed=1
+    fi
+    return "$lifecycle_failed"
 }
 
 cleanup() {
     local status=$?
+    local lifecycle_failed=0
     set +e
     if [[ -n "$backend_ssh_ip" && -n "$client_ssh_ip" ]]; then
-        stop_guest_processes
-        guest_root_cmd "$client_ssh_ip" \
-            'rm -f /tmp/openstack_dns_harness /tmp/dns_monitor /tmp/dns_client_cache.bpf.o /tmp/dns_monitor.bpf.o'
-        guest_root_cmd "$backend_ssh_ip" \
-            'rm -f /tmp/openstack_dns_harness /tmp/dns_monitor /tmp/dns_xdp_monitor.bpf.o /tmp/dns_monitor.bpf.o'
+        stop_guest_processes || lifecycle_failed=1
+        if (( lifecycle_failed == 0 )); then
+            guest_root_cmd "$client_ssh_ip" \
+                "rm -rf -- '$guest_run_dir'" || lifecycle_failed=1
+            guest_root_cmd "$backend_ssh_ip" \
+                "rm -rf -- '$guest_run_dir'" || lifecycle_failed=1
+        else
+            echo "preserving guest run directories after lifecycle validation failure" >&2
+        fi
     fi
-    if [[ "$keep_resources" != 1 ]]; then
+    if (( lifecycle_failed != 0 )); then
+        [[ "$status" -ne 0 ]] || status=1
+    fi
+    if [[ "$keep_resources" != 1 && "$lifecycle_failed" == 0 ]]; then
         if [[ "$owns_servers" == 1 ]]; then
             [[ -n "$backend_id" ]] && openstack_cmd server delete --wait "$backend_id" >/dev/null 2>&1 || true
             [[ -n "$client_id" ]] && openstack_cmd server delete --wait "$client_id" >/dev/null 2>&1 || true
@@ -262,14 +343,17 @@ cleanup() {
         done
         [[ -n "$security_group_id" ]] && openstack_cmd security group delete "$security_group_id" >/dev/null 2>&1 || true
         [[ -n "$temporary_key_name" ]] && openstack_cmd keypair delete "$temporary_key_name" >/dev/null 2>&1 || true
-    else
+    elif [[ "$keep_resources" == 1 ]]; then
         echo "KEEP_RESOURCES=1; temporary servers and network resources preserved"
+    else
+        echo "lifecycle cleanup failed; temporary OpenStack resources preserved" >&2
     fi
     if [[ "$status" -ne 0 ]]; then
         echo "benchmark failed with exit=$status"
         openstack_cmd server list --name "$prefix" -f value -c ID -c Name -c Status || true
     fi
-    printf 'cleanup_status=%s\n' "$status" > "$out_dir/cleanup-status.txt"
+    printf 'cleanup_status=%s\ncleanup_lifecycle_failed=%s\n' \
+        "$status" "$lifecycle_failed" > "$out_dir/cleanup-status.txt"
     [[ -n "$sudo_askpass" ]] && rm -f "$sudo_askpass"
     exit "$status"
 }
@@ -384,14 +468,16 @@ c++ -std=c++17 -O2 -static -I"$accel_dir/src/include" -I"$accel_dir/include" \
     "$accel_dir/src/dns_monitor_args.cpp" \
     "$accel_dir/src/dns_monitor_metrics.cpp" \
     -o "$dns_monitor" -lbpf -lelf -lz -lzstd -static-libstdc++ -static-libgcc
-copy_guest "$client_ssh_ip" "$harness" /tmp/openstack_dns_harness
-copy_guest "$backend_ssh_ip" "$harness" /tmp/openstack_dns_harness
-copy_guest "$client_ssh_ip" "$dns_monitor" /tmp/dns_monitor
-copy_guest "$backend_ssh_ip" "$dns_monitor" /tmp/dns_monitor
-copy_guest "$client_ssh_ip" "$accel_dir/build/dns_client_cache.bpf.o" /tmp/dns_client_cache.bpf.o
-copy_guest "$client_ssh_ip" "$accel_dir/build/dns_monitor.bpf.o" /tmp/dns_monitor.bpf.o
-copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_xdp_monitor.bpf.o" /tmp/dns_xdp_monitor.bpf.o
-copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_monitor.bpf.o" /tmp/dns_monitor.bpf.o
+guest_cmd "$client_ssh_ip" "mkdir -p '$guest_run_dir'"
+guest_cmd "$backend_ssh_ip" "mkdir -p '$guest_run_dir'"
+copy_guest "$client_ssh_ip" "$harness" "$guest_harness"
+copy_guest "$backend_ssh_ip" "$harness" "$guest_harness"
+copy_guest "$client_ssh_ip" "$dns_monitor" "$guest_monitor"
+copy_guest "$backend_ssh_ip" "$dns_monitor" "$guest_monitor"
+copy_guest "$client_ssh_ip" "$accel_dir/build/dns_client_cache.bpf.o" "$guest_client_bpf"
+copy_guest "$client_ssh_ip" "$accel_dir/build/dns_monitor.bpf.o" "$guest_tc_bpf"
+copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_xdp_monitor.bpf.o" "$guest_server_bpf"
+copy_guest "$backend_ssh_ip" "$accel_dir/build/dns_monitor.bpf.o" "$guest_tc_bpf"
 
 if [[ "$guest_bpf" == 1 ]]; then
     guest_root_cmd "$client_ssh_ip" 'mountpoint -q /sys/fs/bpf || timeout 10 mount -t bpf bpf /sys/fs/bpf'
@@ -404,22 +490,22 @@ start_backend() {
     local mode_arg=
     [[ "$mode" == nxdomain ]] && mode_arg=nxdomain
     guest_root_cmd "$backend_ssh_ip" \
-        "rm -f /tmp/dns-backend-count /tmp/dns-backend.pid; nohup /tmp/openstack_dns_harness server 0.0.0.0 53 '$domain' '$answer_ip' '$ttl' /tmp/dns-backend-count '$mode_arg' >/tmp/dns-backend.log 2>&1 </dev/null & echo \$! >/tmp/dns-backend.pid"
+        "rm -f -- '$guest_run_dir/dns-backend-count' '$guest_run_dir/dns-backend.pid'; setsid nohup '$guest_harness' server 0.0.0.0 53 '$domain' '$answer_ip' '$ttl' '$guest_run_dir/dns-backend-count' '$mode_arg' >'$guest_run_dir/dns-backend.log' 2>&1 </dev/null & echo \$! >'$guest_run_dir/dns-backend.pid'"
     sleep 1
-    guest_root_cmd "$backend_ssh_ip" 'test -s /tmp/dns-backend.pid && kill -0 "$(cat /tmp/dns-backend.pid)"'
+    guest_root_cmd "$backend_ssh_ip" "test -s '$guest_run_dir/dns-backend.pid' && kill -0 \"\$(cat '$guest_run_dir/dns-backend.pid')\""
 }
 
 start_monitor() {
     local side=$1
     local scenario=$2
-    local log=/tmp/dns-${side}-${scenario}.log
+    local log="$guest_run_dir/dns-${side}-${scenario}.log"
     if [[ "$side" == server ]]; then
         if [[ "$scenario" == server-only || "$scenario" == both ]]; then
             guest_root_cmd "$backend_ssh_ip" \
-                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook xdp --role server --xdp-mode generic --bpf-object /tmp/dns_xdp_monitor.bpf.o --cache-domain '$domain' --cache-ip '$answer_ip' --cache-ttl '$backend_ttl' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
+                "setsid nohup timeout 90 '$guest_monitor' --dev '$backend_dev' --hook xdp --role server --xdp-mode generic --bpf-object '$guest_server_bpf' --cache-domain '$domain' --cache-ip '$answer_ip' --cache-ttl '$backend_ttl' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >'$guest_run_dir/dns-server-monitor.pid'"
         elif [[ "$scenario" == monitor-only ]]; then
             guest_root_cmd "$backend_ssh_ip" \
-                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$backend_dev' --hook tc --bpf-object /tmp/dns_monitor.bpf.o --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-server-monitor.pid"
+                "setsid nohup timeout 90 '$guest_monitor' --dev '$backend_dev' --hook tc --bpf-object '$guest_tc_bpf' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >'$guest_run_dir/dns-server-monitor.pid'"
         fi
     else
         if [[ "$scenario" == client-only || "$scenario" == both || "$scenario" == ttl || "$scenario" == untrusted || "$scenario" == nxdomain ]]; then
@@ -429,11 +515,15 @@ start_monitor() {
                 local host_log="$out_dir/${scenario}.client-host.log"
                 local host_cmd="setsid timeout 90 '$dns_monitor' --dev '$client_tap_if' --hook xdp --role client --xdp-mode generic --bpf-object '$accel_dir/build/dns_client_cache.bpf.o' --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$host_log' 2>&1 </dev/null & echo \$!"
                 client_host_monitor_pid=$(host_root_cmd "$host_cmd" | tail -n 1)
+                client_host_monitor_start_time=$(host_process_start_time "$client_host_monitor_pid") || {
+                    echo "failed to record host monitor process identity" >&2
+                    return 1
+                }
                 sleep 2
                 return
             fi
             guest_root_cmd "$client_ssh_ip" \
-                "setsid nohup timeout 90 /tmp/dns_monitor --dev '$client_dev' --hook xdp --role client --xdp-mode generic --bpf-object /tmp/dns_client_cache.bpf.o --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >/tmp/dns-client-monitor.pid"
+                "setsid nohup timeout 90 '$guest_monitor' --dev '$client_dev' --hook xdp --role client --xdp-mode generic --bpf-object '$guest_client_bpf' --max-learn-ttl 300 --learn-window-ms 2000 --trusted-dns '$trusted' --verbose-events >'$log' 2>&1 </dev/null & echo \$! >'$guest_run_dir/dns-client-monitor.pid'"
         fi
     fi
     sleep 2
@@ -476,7 +566,7 @@ verify_client_tc_coexistence() {
 
 run_client() {
     guest_cmd "$client_ssh_ip" \
-        "timeout 120 /tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' '$requests' '$warmup'"
+        "timeout 120 '$guest_harness' client '$backend_ip' 53 '$domain' '$answer_ip' '$requests' '$warmup'"
 }
 
 record_scenario() {
@@ -523,17 +613,17 @@ run_scenario() {
     # dns_monitor emits its final aggregate when SIGTERM is handled.  Stop it
     # before copying the logs so the artifacts contain cache learn/hit/tx data.
     stop_guest_processes
-    local client_metrics_log=/tmp/dns-client-$name.log
+    local client_metrics_log="$guest_run_dir/dns-client-$name.log"
     local client_metrics_target=$client_ssh_ip
     if [[ "$client_cache_mode" == host-ebpf ]]; then
         client_metrics_log="$out_dir/${name}.client-host.log"
         client_metrics_target=host
         cp "$client_metrics_log" "$out_dir/${name}.client-monitor.log" 2>/dev/null || true
     else
-        guest_cmd "$client_ssh_ip" "cat /tmp/dns-client-monitor.log /tmp/dns-client-$name.log 2>/dev/null || true" > "$out_dir/${name}.client-monitor.log" || true
+        guest_cmd "$client_ssh_ip" "cat '$guest_run_dir/dns-client-monitor.log' '$guest_run_dir/dns-client-$name.log' 2>/dev/null || true" > "$out_dir/${name}.client-monitor.log" || true
     fi
-    guest_cmd "$backend_ssh_ip" "cat /tmp/dns-server-$name.log 2>/dev/null || true" > "$out_dir/${name}.server-monitor.log" || true
-    record_scenario "$name" "$result" "$count" "$client_metrics_log" "/tmp/dns-server-$name.log" "$client_metrics_target"
+    guest_cmd "$backend_ssh_ip" "cat '$guest_run_dir/dns-server-$name.log' 2>/dev/null || true" > "$out_dir/${name}.server-monitor.log" || true
+    record_scenario "$name" "$result" "$count" "$client_metrics_log" "$guest_run_dir/dns-server-$name.log" "$client_metrics_target"
 }
 
 run_safety_checks() {
@@ -541,9 +631,9 @@ run_safety_checks() {
     start_backend 1
     start_monitor client ttl
     verify_client_tc_coexistence ttl
-    guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 1" > "$out_dir/ttl-hit.log" || true
+    guest_cmd "$client_ssh_ip" "'$guest_harness' client '$backend_ip' 53 '$domain' '$answer_ip' 1 1" > "$out_dir/ttl-hit.log" || true
     sleep 2
-    guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 1 0" > "$out_dir/ttl-expired.log" || true
+    guest_cmd "$client_ssh_ip" "'$guest_harness' client '$backend_ip' 53 '$domain' '$answer_ip' 1 0" > "$out_dir/ttl-expired.log" || true
     local count
     count=$(backend_count) || { echo "TTL backend count read failed" >&2; return 1; }
     printf 'ttl_backend_requests=%s\n' "$count" | tee "$out_dir/ttl-summary.txt"
@@ -555,7 +645,7 @@ run_safety_checks() {
     start_backend 60
     start_monitor client untrusted
     verify_client_tc_coexistence untrusted
-    guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/untrusted.log" || true
+    guest_cmd "$client_ssh_ip" "'$guest_harness' client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/untrusted.log" || true
     count=$(backend_count) || { echo "untrusted backend count read failed" >&2; return 1; }
     printf 'untrusted_backend_requests=%s\n' "$count" | tee "$out_dir/untrusted-summary.txt"
     [[ "$count" == 2 ]] || { echo "untrusted resolver check failed: $count" >&2; return 1; }
@@ -564,7 +654,7 @@ run_safety_checks() {
     start_backend 60 nxdomain
     start_monitor client nxdomain
     verify_client_tc_coexistence nxdomain
-    guest_cmd "$client_ssh_ip" "/tmp/openstack_dns_harness client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/nxdomain.log" || true
+    guest_cmd "$client_ssh_ip" "'$guest_harness' client '$backend_ip' 53 '$domain' '$answer_ip' 2 0" > "$out_dir/nxdomain.log" || true
     count=$(backend_count) || { echo "NXDOMAIN backend count read failed" >&2; return 1; }
     printf 'nxdomain_backend_requests=%s\n' "$count" | tee "$out_dir/nxdomain-summary.txt"
     [[ "$count" == 2 ]] || { echo "NXDOMAIN check failed: $count" >&2; return 1; }
@@ -572,8 +662,8 @@ run_safety_checks() {
 }
 
 printf '# OpenStack DNS Dual-End Cache E2E\n\n' > "$out_dir/summary.md"
-printf 'mode=%s\nguest_bpf_requested=%s\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
-    "$client_cache_mode" "$guest_bpf" "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
+printf 'mode=%s\nguest_bpf_requested=%s\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\nguest_run_dir=%s\n' \
+    "$client_cache_mode" "$guest_bpf" "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" "$guest_run_dir" > "$out_dir/environment.md"
 printf 'backend_interface=%s\nclient_interface=%s\nclient_tap=%s\nclient_cache_mode=%s\n' \
     "$backend_dev" "$client_dev" "$client_tap_if" "$client_cache_mode" >> "$out_dir/environment.md"
 

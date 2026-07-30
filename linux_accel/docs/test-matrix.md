@@ -21,6 +21,7 @@
 | B-01 | Linux 构建 | `./scripts/build_linux.sh` | 生成 `dns_monitor.bpf.o`、`dns_xdp_monitor.bpf.o`、`grpc_monitor.bpf.o`、`dns_monitor`、`grpc_monitor`、`grpc_fast_cache`、`cachectl` | 最新 VM benchmark 前构建通过 | 已完成 |
 | B-02 | 敏感信息扫描 | `rg -n "<known-secret>|SUDO_PASS=[0-9]" bench docs README.md` | 仓库文档/脚本中不出现真实密码或数字形式 `SUDO_PASS` 示例 | 最新扫描无命中 | 已完成 |
 | B-03 | Demo 清理检查 | `ip netns list`；`ip link show <bench-iface>` | benchmark 脚本结束后清理临时 netns、veth、bridge | DNS/gRPC 脚本会清理默认实验资源 | 已完成 |
+| B-04 | OpenStack campaign 生命周期静态检查 | `bash ./tests/openstack_campaign_lifecycle_test.sh` | 四个 campaign 通过 shell 语法检查，且不含 `killall`、共享 guest 工件或共享 pin 根；动态脚本含唯一 nonce、tap lock 与主机身份校验标记 | 2026-07-30 Git Bash 静态检查通过；发布归档将在 `master` 再执行 | 已完成（静态，不替代真实 E2E 清理证明） |
 
 ## DNS 监控与 XDP 加速
 
@@ -59,8 +60,8 @@
 | V-02 | OpenStack 路径探测 | `./bench/openstack_path_probe.sh` | 只读列出 OVS/libvirt/OpenStack 可挂载接口 | DevStack 探测发现 12 个候选接口，包括 `br-ex`、`br-int`、`ens33`、`ovs-system`、`virbr0`、veth 链路 | 已完成 |
 | V-03 | OpenStack tc 挂载 smoke | `./bench/openstack_tc_attach_smoke.sh` | DNS 和 gRPC tc monitor 能在 `br-int` 挂载并卸载 | `openstack-tc-attach-smoke/20260627-160408`：`dns_tc=attached grpc_tc=attached` | 已完成 |
 | V-04 | OpenStack workload 证据 | `./bench/openstack_workload_evidence.sh` | summary 记录 OpenStack/OVS 状态、monitor 日志，并标注真实租户流量或 fallback | `openstack-workload-evidence/20260630-162110`：DNS `count=30 failed=0`，monitor `qps=33 rps=33`；gRPC `count=30 failed=0`，monitor `reqps=28 resps=29 p99=0.311ms` | 已完成 |
-| V-05 | OpenStack DNS 双端缓存 E2E | `CLIENT_SERVER=<id> BACKEND_SERVER=<id> REPEAT=5 REQUESTS=1000 WARMUP=100 GUEST_BPF=1 REQUIRE_TC_COEXISTENCE=1 ./bench/openstack_dns_e2e.sh` | 五场景成功、回源计数断言、TTL/未信任 resolver/NXDOMAIN 回退和资源清理均通过 | 2026-07-30 `/tmp/vnet-p0-dns-formal-20260730-115435`：baseline median `2081.12 QPS`，server `2678.64`（`1.29x`），client `9859.51`（`4.74x`），both `10208.86`（`4.91x`）；25 主场景 `1000/1000`，`cleanup_status=0`，NetMig `0x65/0x66` 保留 | 已完成 |
-| V-06 | OpenStack DNS/gRPC 动态双端缓存 | `bench/openstack_dynamic_cache_campaign.sh` | 五种策略、五类负载各五轮；动态 epoch、两端命中、真实回源及严格清理均可追溯 | 2026-07-30：125 轮/625 窗口，DNS/gRPC 均零失败；动态切换后四类可缓存负载 `1.24x-2.13x`，回源降为 0；低命中五轮保持 BYPASS；`cleanup_status=0`。跨主机 map 发布为串行实验编排 | 已完成（P1 原子闭环待完成） |
+| V-05 | OpenStack DNS 双端缓存 E2E | `CLIENT_SERVER=<id> BACKEND_SERVER=<id> REPEAT=5 REQUESTS=1000 WARMUP=100 GUEST_BPF=1 REQUIRE_TC_COEXISTENCE=1 ./bench/openstack_dns_e2e.sh` | 五场景成功、回源计数断言、TTL/未信任 resolver/NXDOMAIN 回退和资源清理均通过 | 2026-07-30 `/tmp/vnet-p0-dns-formal-pid-20260730-1240`：baseline median `1962.21 QPS`，server `2359.44`（`1.20x`），client `9576.06`（`4.88x`），both `9207.57`（`4.69x`）；25 主场景 `1000/1000`，`cleanup_status=0`，两端 token 目录/进程均清理，未见测试自有 pin 残留，NetMig `0x65/0x66` 保留 | 已完成 |
+| V-06 | OpenStack DNS/gRPC 动态双端缓存 | `bench/openstack_dynamic_cache_campaign.sh` | 五种策略、五类负载各五轮；动态 epoch、两端命中、真实回源及严格清理均可追溯 | 2026-07-30 历史（`.1` 生命周期修订前）：125 轮/625 窗口，DNS/gRPC 均零失败；动态切换后四类可缓存负载 `1.24x-2.13x`，回源降为 0；低命中五轮保持 BYPASS。跨主机 map 发布为串行实验编排 | 历史性能完成；`.1` 重跑和 P1 原子闭环待完成 |
 | V-07 | OpenStack 数据面 Agent | `python3 agent/openstack_dataplane_agent.py watch ...` | Neutron/OVS 精确发现；重复 reconcile 幂等；接口变化触发重挂载；只清理可验证的自有 hook | 历史 `master -> compute2 -> master` attach/re-attach 证据存在；当前没有 systemd、多端口健康 API、迁移冻结或失败强制 BYPASS | 部分完成，P1 待完成 |
 | K-01 | Kubernetes 路径探测 | `./bench/k8s_path_probe.sh` | 只读列出 node、CNI、pod-veth 和候选挂载点 | 在节点运行时会记录候选接口 | 已完成 |
 | K-02 | Kubernetes workload 证据 | `./bench/k8s_workload_evidence.sh` | 临时 namespace 产生 Pod-to-Service 流量，monitor 计数非零，结束后清理资源 | `k8s-workload-evidence/20260630-161729`：DNS `count=20 failed=0`；gRPC `count=20 failed=0`，pod-veth monitor `reqps=22 resps=44 p99=0.175ms` | 已完成 |
@@ -69,7 +70,7 @@
 
 | 环境 | 已验证路径 | DNS 加速结论 | gRPC 加速结论 | 结论边界 |
 | --- | --- | ---: | ---: | --- |
-| OpenStack / OVS / KVM | Ubuntu VM、OVN tenant path、host tap/guest bpffs | DNS 双端 `4.91x`（2026-07-30 P0 五轮中位数；历史值 `3.91x`） | gRPC guest pinned-map cache `2.31x` | DNS 为 host-tap XDP；gRPC 为 guest eBPF map 加用户态 fast-cache，不声称内核直接生成 gRPC 响应 |
+| OpenStack / OVS / KVM | Ubuntu VM、OVN tenant path、host tap/guest bpffs | DNS 双端 `4.69x`（2026-07-30 P0 生命周期隔离五轮中位数） | gRPC guest pinned-map cache `2.31x` | DNS 为 host-tap XDP；gRPC 为 guest eBPF map 加用户态 fast-cache，不声称内核直接生成 gRPC 响应 |
 | Kubernetes / CNI / Pod veth | Pod-to-Service workload 证据和非零 monitor 计数 | QPS `7.14x`，p99 `182.52x` | QPS `3.69x`，p99 `3.33x` | 快路径 benchmark + Kubernetes 挂载/可见性证据，不声称完整生产 Pod-to-Pod 端到端加速 |
 
 ## 基线与相关工作对比

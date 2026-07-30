@@ -42,16 +42,53 @@ grpc_bpf="${accel_dir}/build/grpc_monitor.bpf.o"
 controller="${accel_dir}/build/dynamic_cache_controller"
 stats_reader="${accel_dir}/build/dns_cache_stats_reader"
 
-host_client_pin="/sys/fs/bpf/vnet-dynamic-client"
-host_grpc_pin="/sys/fs/bpf/vnet-dynamic-grpc-monitor"
-guest_server_pin="/sys/fs/bpf/vnet-dynamic-server"
-guest_client_grpc_pin="/sys/fs/bpf/vnet-dynamic-grpc-client"
-guest_server_grpc_pin="/sys/fs/bpf/vnet-dynamic-grpc-server"
-guest_backend_count="/run/vnet-dynamic/dns-backend-count"
-sudo_askpass="/tmp/vnet-dynamic-askpass-$$"
+run_token="$(printf '%s' "${RUN_TOKEN:-dynamic-$(date +%Y%m%d-%H%M%S)-$$}" | tr -c 'A-Za-z0-9_-' '_')"
+run_token="${run_token:0:64}"
+[[ -n "${run_token}" ]] || {
+  echo "RUN_TOKEN is empty after sanitization" >&2
+  exit 2
+}
+run_nonce="$(date +%s%N)-$$-${RANDOM}"
+run_id="vnet-dynamic-${run_token}-${run_nonce}"
+guest_run_dir="/tmp/${run_id}"
+host_pin_root="/sys/fs/bpf/${run_id}"
+guest_pin_root="/sys/fs/bpf/${run_id}"
+host_client_pin="${host_pin_root}/dns-client"
+host_grpc_pin="${host_pin_root}/grpc-monitor"
+guest_server_pin="${guest_pin_root}/dns-server"
+guest_client_grpc_pin="${guest_pin_root}/grpc-client"
+guest_server_grpc_pin="${guest_pin_root}/grpc-server"
+guest_backend_count="${guest_run_dir}/dns-backend-count"
+guest_dns_harness="${guest_run_dir}/openstack_dns_harness"
+guest_grpc_harness="${guest_run_dir}/openstack_grpc_harness"
+guest_grpc_cache="${guest_run_dir}/grpc_fast_cache"
+guest_cachectl="${guest_run_dir}/cachectl"
+guest_dns_monitor="${guest_run_dir}/dns_monitor"
+guest_dns_server_bpf="${guest_run_dir}/dns_xdp_monitor.bpf.o"
+guest_controller="${guest_run_dir}/dynamic_cache_controller"
+guest_stats_reader="${guest_run_dir}/dns_cache_stats_reader"
+guest_server_cache="${guest_run_dir}/server-cache.txt"
+guest_client_grpc_policy="${guest_run_dir}/grpc-client-policy.txt"
+guest_server_grpc_policy="${guest_run_dir}/grpc-server-policy.txt"
+guest_dns_backend_log="${guest_run_dir}/dns-backend.log"
+guest_grpc_backend_log="${guest_run_dir}/grpc-backend.log"
+guest_grpc_client_log="${guest_run_dir}/grpc-client.log"
+guest_grpc_server_log="${guest_run_dir}/grpc-server.log"
+guest_dns_monitor_log="${guest_run_dir}/dns-monitor.log"
+guest_dns_backend_pid="${guest_run_dir}/dns-backend.pid"
+guest_grpc_backend_pid="${guest_run_dir}/grpc-backend.pid"
+guest_grpc_client_pid="${guest_run_dir}/grpc-client.pid"
+guest_grpc_server_pid="${guest_run_dir}/grpc-server.pid"
+guest_dns_monitor_pid="${guest_run_dir}/dns-monitor.pid"
+sudo_askpass="${out_dir}/.sudo-askpass-${run_token}"
+lock_key="$(printf '%s' "${client_tap}" | tr -c 'A-Za-z0-9_-' '_')"
+campaign_lock_path="/tmp/vnet-dynamic-${lock_key}.lock"
+campaign_lock_fd=""
 
 dns_client_pid=""
+dns_client_start_time=""
 grpc_monitor_pid=""
+grpc_monitor_start_time=""
 dynamic_in_fd=""
 dynamic_out_fd=""
 dynamic_pid=""
@@ -143,6 +180,121 @@ copy_guest() {
       "base64 -d | gzip -d > '${target_file}' && chmod +x '${target_file}'"
 }
 
+guest_process_helpers() {
+  cat <<'EOF'
+record_owned_process() {
+  local state_file="$1"
+  local pid="$2"
+  local pgid start_time
+
+  pgid="$(sudo -n ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  start_time="$(sudo -n awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$start_time" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$pid" != "$pgid" ]; then
+    echo "refusing to track non-private process group for pid $pid" >&2
+    return 1
+  fi
+  printf '%s %s %s\n' "$pid" "$pgid" "$start_time" >"$state_file"
+}
+
+stop_owned_process() {
+  local state_file="$1"
+  local pid pgid start_time actual_pgid actual_start
+
+  [ -s "$state_file" ] || return 0
+  read -r pid pgid start_time <"$state_file" || return 1
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$pgid" in ''|*[!0-9]*) return 1 ;; esac
+  case "$start_time" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$pid" = "$pgid" ] || return 1
+
+  actual_pgid="$(sudo -n ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  actual_start="$(sudo -n awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+  if [ "$actual_pgid" != "$pgid" ] || [ "$actual_start" != "$start_time" ]; then
+    echo "owned process identity changed for pid $pid; not signaling it" >&2
+    return 1
+  fi
+
+  sudo -n kill -TERM -- "-$pgid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    sudo -n kill -0 -- "-$pgid" 2>/dev/null || break
+    sleep 0.05
+  done
+  if sudo -n kill -0 -- "-$pgid" 2>/dev/null; then
+    sudo -n kill -KILL -- "-$pgid" 2>/dev/null || true
+  fi
+  if sudo -n kill -0 -- "-$pgid" 2>/dev/null; then
+    echo "owned process group $pgid did not stop" >&2
+    return 1
+  fi
+  rm -f -- "$state_file"
+}
+EOF
+}
+
+guest_start_tracked_process() {
+  local ip="$1"
+  local state_file="$2"
+  local log_file="$3"
+  local command="$4"
+  local encoded
+
+  encoded="$(printf '%s' "${command}" | base64 | tr -d '\n')"
+  guest_cmd "${ip}" "$(guest_process_helpers)
+setsid nohup bash -c 'echo ${encoded} | base64 -d | bash' >'${log_file}' 2>&1 </dev/null &
+pid=\$!
+record_owned_process '${state_file}' \"\$pid\""
+}
+
+guest_run_tracked_process() {
+  local ip="$1"
+  local state_file="$2"
+  local command="$3"
+  local encoded
+
+  encoded="$(printf '%s' "${command}" | base64 | tr -d '\n')"
+  guest_cmd "${ip}" "$(guest_process_helpers)
+setsid bash -c 'echo ${encoded} | base64 -d | bash' </dev/null &
+pid=\$!
+record_owned_process '${state_file}' \"\$pid\" || exit 1
+wait \"\$pid\"
+status=\$?
+rm -f -- '${state_file}'
+exit \"\$status\""
+}
+
+stop_guest_owned_processes() {
+  local ip="$1"
+  shift
+  local state_file
+  local command
+
+  command="$(guest_process_helpers)"
+  for state_file in "$@"; do
+    [[ "${state_file}" == "${guest_run_dir}/"* ]] || {
+      echo "unsafe owned process state: ${state_file}" >&2
+      return 1
+    }
+    command+=$'\n'
+    command+="stop_owned_process '${state_file}'"
+  done
+  guest_cmd "${ip}" "${command}"
+}
+
+stop_all_guest_owned_processes() {
+  local ip="$1"
+
+  guest_cmd "${ip}" "$(guest_process_helpers)
+status=0
+for state_file in '${guest_run_dir}'/*.pid; do
+  [ -e \"\$state_file\" ] || continue
+  stop_owned_process \"\$state_file\" || status=1
+done
+exit \"\$status\""
+}
+
 field() {
   tr ' ' '\n' <<<"$1" | awk -F= -v wanted="$2" \
     '$1 == wanted {print $2; exit}'
@@ -158,58 +310,92 @@ delta_field() {
   printf '%s\n' "$((after_value - before_value))"
 }
 
+host_process_start_time() {
+  local pid="$1"
+  local start_time pgid sid
+
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  start_time="$(sudo_cmd awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null)"
+  pgid="$(sudo_cmd ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
+  sid="$(sudo_cmd ps -o sid= -p "${pid}" 2>/dev/null | tr -d '[:space:]')"
+  [[ "${start_time}" =~ ^[0-9]+$ && "${pgid}" == "${pid}" &&
+     "${sid}" == "${pid}" ]] || return 1
+  printf '%s\n' "${start_time}"
+}
+
 stop_host_process() {
   local pid="$1"
+  local expected_start_time="$2"
+  local current_start_time
+
   [[ -n "${pid}" ]] || return 0
-  sudo_cmd kill -TERM "${pid}" >/dev/null 2>&1 || true
+  [[ "${pid}" =~ ^[0-9]+$ && "${expected_start_time}" =~ ^[0-9]+$ ]] || {
+    echo "invalid host monitor identity: pid=${pid} start=${expected_start_time}" >&2
+    return 1
+  }
+  if ! sudo_cmd kill -0 "${pid}" >/dev/null 2>&1; then
+    if sudo_cmd kill -0 -- "-${pid}" >/dev/null 2>&1; then
+      echo "host monitor leader ${pid} exited while its process group remains" >&2
+      return 1
+    fi
+    return 0
+  fi
+  current_start_time="$(host_process_start_time "${pid}")" || {
+    echo "refusing to signal host monitor without its private process group: ${pid}" >&2
+    return 1
+  }
+  [[ "${current_start_time}" == "${expected_start_time}" ]] || {
+    echo "refusing to signal reused host monitor pid: ${pid}" >&2
+    return 1
+  }
+  sudo_cmd kill -TERM -- "-${pid}" >/dev/null 2>&1 || true
   for _ in {1..50}; do
-    sudo_cmd kill -0 "${pid}" >/dev/null 2>&1 || return 0
+    sudo_cmd kill -0 -- "-${pid}" >/dev/null 2>&1 || return 0
     sleep 0.05
   done
-  sudo_cmd kill -KILL "${pid}" >/dev/null 2>&1 || true
+  sudo_cmd kill -KILL -- "-${pid}" >/dev/null 2>&1 || true
+  sudo_cmd kill -0 -- "-${pid}" >/dev/null 2>&1 && {
+    echo "host monitor process group ${pid} did not stop" >&2
+    return 1
+  }
 }
 
 stop_monitors() {
-  stop_host_process "${grpc_monitor_pid}"
-  stop_host_process "${dns_client_pid}"
-  grpc_monitor_pid=""
-  dns_client_pid=""
-  guest_cmd "${client_ip}" \
-    'if [ -s /tmp/vnet-dynamic-grpc-client.pid ]; then
-       pid="$(cat /tmp/vnet-dynamic-grpc-client.pid)"
-       sudo -n kill -TERM "$pid" 2>/dev/null || true
-       for i in $(seq 1 50); do
-         sudo -n kill -0 "$pid" 2>/dev/null || break
-         sleep 0.05
-       done
-       sudo -n kill -KILL "$pid" 2>/dev/null || true
-     fi
-     rm -f /tmp/vnet-dynamic-grpc-client.pid' >/dev/null 2>&1 || true
-  guest_cmd "${backend_ip}" \
-    'for pid_file in /tmp/vnet-dynamic-grpc-server.pid /tmp/vnet-dynamic-dns-monitor.pid; do
-       [ -s "$pid_file" ] || continue
-       pid="$(cat "$pid_file")"
-       sudo -n kill -TERM "$pid" 2>/dev/null || true
-       for i in $(seq 1 50); do
-         sudo -n kill -0 "$pid" 2>/dev/null || break
-         sleep 0.05
-       done
-       sudo -n kill -KILL "$pid" 2>/dev/null || true
-     done
-     rm -f /tmp/vnet-dynamic-grpc-server.pid
-     rm -f /tmp/vnet-dynamic-dns-monitor.pid' >/dev/null 2>&1 || true
+  local status=0
+
+  if [[ -n "${grpc_monitor_pid}" ]]; then
+    if stop_host_process "${grpc_monitor_pid}" "${grpc_monitor_start_time}"; then
+      grpc_monitor_pid=""
+      grpc_monitor_start_time=""
+    else
+      status=1
+    fi
+  fi
+  if [[ -n "${dns_client_pid}" ]]; then
+    if stop_host_process "${dns_client_pid}" "${dns_client_start_time}"; then
+      dns_client_pid=""
+      dns_client_start_time=""
+    else
+      status=1
+    fi
+  fi
+  stop_guest_owned_processes "${client_ip}" \
+    "${guest_grpc_client_pid}" || status=1
+  stop_guest_owned_processes "${backend_ip}" \
+    "${guest_grpc_server_pid}" "${guest_dns_monitor_pid}" || status=1
   if [[ -n "${active_label}" ]]; then
     guest_cmd "${client_ip}" \
-      'cat /tmp/vnet-dynamic-grpc-client.log 2>/dev/null || true' \
+      "cat '${guest_grpc_client_log}' 2>/dev/null || true" \
       >"${out_dir}/monitors/${active_label}.grpc-client-cache.log" 2>&1 || true
     guest_cmd "${backend_ip}" \
-      'cat /tmp/vnet-dynamic-grpc-server.log 2>/dev/null || true' \
+      "cat '${guest_grpc_server_log}' 2>/dev/null || true" \
       >"${out_dir}/monitors/${active_label}.grpc-server-cache.log" 2>&1 || true
     guest_cmd "${backend_ip}" \
-      'cat /tmp/vnet-dynamic-dns-monitor.log 2>/dev/null || true' \
+      "cat '${guest_dns_monitor_log}' 2>/dev/null || true" \
       >"${out_dir}/monitors/${active_label}.dns-server.log" 2>&1 || true
   fi
   active_label=""
+  return "${status}"
 }
 
 stop_dynamic_controller() {
@@ -236,38 +422,36 @@ cleanup() {
   trap - EXIT
   set +e
   stop_dynamic_controller
-  stop_monitors
+  stop_monitors || cleanup_failed=1
+  stop_all_guest_owned_processes "${client_ip}" || cleanup_failed=1
+  stop_all_guest_owned_processes "${backend_ip}" || cleanup_failed=1
   guest_cmd "${backend_ip}" \
     'echo "--- dns backend ---"
-     cat /tmp/vnet-dynamic-dns-backend.log 2>/dev/null || true
+     cat '"${guest_dns_backend_log}"' 2>/dev/null || true
      echo "--- grpc backend ---"
-     cat /tmp/vnet-dynamic-grpc-backend.log 2>/dev/null || true' \
+     cat '"${guest_grpc_backend_log}"' 2>/dev/null || true' \
     >"${out_dir}/monitors/backend-startup.log" 2>&1 || true
-  sudo_cmd rm -rf -- "${host_client_pin}" "${host_grpc_pin}"
-  guest_cmd "${client_ip}" \
-    'sudo -n killall -q openstack_dns_harness openstack_grpc_harness grpc_fast_cache 2>/dev/null || true
-     sudo -n rm -rf -- /sys/fs/bpf/vnet-dynamic-grpc-client
-     rm -f /tmp/openstack_dns_harness /tmp/openstack_grpc_harness
-     rm -f /tmp/grpc_fast_cache /tmp/cachectl /tmp/dynamic_cache_controller
-     rm -f /tmp/vnet-dynamic-*.txt /tmp/vnet-dynamic-*.log
-     rm -f /tmp/vnet-dynamic-*.pid'
-  guest_cmd "${backend_ip}" \
-    'sudo -n killall -q openstack_dns_harness openstack_grpc_harness grpc_fast_cache dns_monitor 2>/dev/null || true
-     sudo -n rm -rf -- /sys/fs/bpf/vnet-dynamic-server /sys/fs/bpf/vnet-dynamic-grpc-server
-     rm -f /tmp/openstack_dns_harness /tmp/openstack_grpc_harness
-     rm -f /tmp/grpc_fast_cache /tmp/cachectl /tmp/dns_monitor
-     rm -f /tmp/dns_xdp_monitor.bpf.o /tmp/dynamic_cache_controller
-     rm -f /tmp/dns_cache_stats_reader /tmp/vnet-dynamic-*.txt
-     rm -f /tmp/vnet-dynamic-*.log /tmp/vnet-dynamic-*.pid
-     sudo -n rm -rf -- /run/vnet-dynamic'
+  if (( cleanup_failed == 0 )); then
+    sudo_cmd rm -rf -- "${host_pin_root}" || cleanup_failed=1
+    guest_cmd "${client_ip}" \
+      "sudo -n rm -rf -- '${guest_pin_root}' '${guest_run_dir}'" || cleanup_failed=1
+    guest_cmd "${backend_ip}" \
+      "sudo -n rm -rf -- '${guest_pin_root}' '${guest_run_dir}'" || cleanup_failed=1
+  else
+    echo "preserving run directories and pin roots after lifecycle validation failure" >&2
+  fi
+
+  if (( cleanup_failed != 0 )); then
+    [[ "${status}" -ne 0 ]] || status=1
+  fi
 
   if ! host_pin_residue="$(sudo_cmd find /sys/fs/bpf -maxdepth 1 -type d \
-       \( -name 'vnet-dynamic-client' -o -name 'vnet-dynamic-grpc-monitor' \) \
+       -name "${run_id}" \
        -print 2>/dev/null)"; then
     host_pin_residue="host_pin_audit_failed"
   fi
   host_process_residue="$(ps -eo pid=,args= |
-    grep -E 'vnet-dynamic-(client|grpc-monitor)' |
+    grep -F "${run_id}" |
     grep -v grep || true)"
   if host_tc_state="$(
        sudo_cmd tc filter show dev "${client_tap}" ingress &&
@@ -279,14 +463,15 @@ cleanup() {
     host_tc_residue="${host_tc_state}"
   fi
   if ! client_residue="$(guest_cmd "${client_ip}" \
-       "ps -eo pid=,args= | grep -E '/tmp/(openstack_(dns|grpc)_harness|grpc_fast_cache)' | grep -v grep || true
-        sudo -n find /sys/fs/bpf -maxdepth 1 -type d -name 'vnet-dynamic-grpc-client' -print")"; then
+       "ps -eo pid=,args= | grep -F '${guest_run_dir}' | grep -v grep || true
+        sudo -n find /sys/fs/bpf -maxdepth 1 -type d -name '${run_id}' -print
+        sudo -n test ! -e '${guest_run_dir}' || echo '${guest_run_dir}'")"; then
     client_residue="client_guest_audit_failed"
   fi
   if ! backend_residue="$(guest_cmd "${backend_ip}" \
-       "ps -eo pid=,args= | grep -E '/tmp/(openstack_(dns|grpc)_harness|grpc_fast_cache|dns_monitor)' | grep -v grep || true
-        sudo -n find /sys/fs/bpf -maxdepth 1 -type d \\( -name 'vnet-dynamic-server' -o -name 'vnet-dynamic-grpc-server' \\) -print
-        sudo -n test ! -d /run/vnet-dynamic || echo /run/vnet-dynamic")"; then
+       "ps -eo pid=,args= | grep -F '${guest_run_dir}' | grep -v grep || true
+        sudo -n find /sys/fs/bpf -maxdepth 1 -type d -name '${run_id}' -print
+        sudo -n test ! -e '${guest_run_dir}' || echo '${guest_run_dir}'")"; then
     backend_residue="backend_guest_audit_failed"
   fi
 
@@ -382,6 +567,16 @@ if (( has_dynamic && windows < 3 )); then
   exit 2
 fi
 
+command -v flock >/dev/null 2>&1 || {
+  echo "flock is required to serialize campaigns on ${client_tap}" >&2
+  exit 2
+}
+exec {campaign_lock_fd}>"${campaign_lock_path}"
+flock -n "${campaign_lock_fd}" || {
+  echo "another dynamic campaign already owns ${client_tap}" >&2
+  exit 2
+}
+
 {
   echo "timestamp=$(date --iso-8601=seconds)"
   echo "kernel=$(uname -r)"
@@ -394,6 +589,9 @@ fi
   echo "requests_per_window=${requests_per_window}"
   echo "policies=${policies[*]}"
   echo "workloads=${workloads[*]}"
+  echo "run_token=${run_token}"
+  echo "run_id=${run_id}"
+  echo "campaign_lock=${campaign_lock_path}"
   echo "require_netmig_tc=${require_netmig_tc}"
   echo "require_openstack_evidence=${require_openstack_evidence}"
   echo "source_revision=${source_revision}"
@@ -403,19 +601,21 @@ sudo_cmd ovs-vsctl show >"${out_dir}/ovs-topology.txt" 2>&1 || true
 sudo_cmd ip -details link show "${client_tap}" \
   >"${out_dir}/client-interface.txt" 2>&1
 
-copy_guest "${client_ip}" "${dns_harness}" /tmp/openstack_dns_harness
-copy_guest "${client_ip}" "${grpc_harness}" /tmp/openstack_grpc_harness
-copy_guest "${client_ip}" "${grpc_cache}" /tmp/grpc_fast_cache
-copy_guest "${client_ip}" "${cachectl}" /tmp/cachectl
-copy_guest "${client_ip}" "${controller}" /tmp/dynamic_cache_controller
-copy_guest "${backend_ip}" "${dns_harness}" /tmp/openstack_dns_harness
-copy_guest "${backend_ip}" "${grpc_harness}" /tmp/openstack_grpc_harness
-copy_guest "${backend_ip}" "${grpc_cache}" /tmp/grpc_fast_cache
-copy_guest "${backend_ip}" "${cachectl}" /tmp/cachectl
-copy_guest "${backend_ip}" "${dns_monitor}" /tmp/dns_monitor
-copy_guest "${backend_ip}" "${dns_server_bpf}" /tmp/dns_xdp_monitor.bpf.o
-copy_guest "${backend_ip}" "${controller}" /tmp/dynamic_cache_controller
-copy_guest "${backend_ip}" "${stats_reader}" /tmp/dns_cache_stats_reader
+guest_cmd "${client_ip}" "umask 077; mkdir -p -- '${guest_run_dir}'"
+guest_cmd "${backend_ip}" "umask 077; mkdir -p -- '${guest_run_dir}'"
+copy_guest "${client_ip}" "${dns_harness}" "${guest_dns_harness}"
+copy_guest "${client_ip}" "${grpc_harness}" "${guest_grpc_harness}"
+copy_guest "${client_ip}" "${grpc_cache}" "${guest_grpc_cache}"
+copy_guest "${client_ip}" "${cachectl}" "${guest_cachectl}"
+copy_guest "${client_ip}" "${controller}" "${guest_controller}"
+copy_guest "${backend_ip}" "${dns_harness}" "${guest_dns_harness}"
+copy_guest "${backend_ip}" "${grpc_harness}" "${guest_grpc_harness}"
+copy_guest "${backend_ip}" "${grpc_cache}" "${guest_grpc_cache}"
+copy_guest "${backend_ip}" "${cachectl}" "${guest_cachectl}"
+copy_guest "${backend_ip}" "${dns_monitor}" "${guest_dns_monitor}"
+copy_guest "${backend_ip}" "${dns_server_bpf}" "${guest_dns_server_bpf}"
+copy_guest "${backend_ip}" "${controller}" "${guest_controller}"
+copy_guest "${backend_ip}" "${stats_reader}" "${guest_stats_reader}"
 
 server_cache_file="${out_dir}/server-cache.txt"
 printf 'hot.%s %s 600\n' "${domain}" "${answer_ip}" >"${server_cache_file}"
@@ -425,34 +625,31 @@ for key in $(seq 0 7); do
   printf 'key-%s.%s %s 600\n' "${key}" "${domain}" "${answer_ip}" \
     >>"${server_cache_file}"
 done
-copy_guest "${backend_ip}" "${server_cache_file}" /tmp/vnet-dynamic-server-cache.txt
+copy_guest "${backend_ip}" "${server_cache_file}" "${guest_server_cache}"
 
 guest_cmd "${backend_ip}" \
   "set -e
-   sudo -n killall -q openstack_dns_harness openstack_grpc_harness grpc_fast_cache dns_monitor 2>/dev/null || true
-   sleep 0.2
    sudo -n mkdir -p /sys/fs/bpf
    mountpoint -q /sys/fs/bpf || sudo -n mount -t bpf bpf /sys/fs/bpf
-   sudo -n rm -rf -- ${guest_server_pin} ${guest_server_grpc_pin}
-   sudo -n install -d -m 0755 /run/vnet-dynamic
-   printf '0\n' | sudo -n tee ${guest_backend_count} >/dev/null
-   setsid nohup sudo -n /tmp/openstack_dns_harness server '${backend_ip}' 53 '${domain}' '${answer_ip}' 600 ${guest_backend_count} >/tmp/vnet-dynamic-dns-backend.log 2>&1 </dev/null & echo \$! >/tmp/vnet-dynamic-dns-backend.pid
-   setsid nohup sudo -n /tmp/openstack_grpc_harness server '${backend_ip}' 50051 300 >/tmp/vnet-dynamic-grpc-backend.log 2>&1 </dev/null & echo \$! >/tmp/vnet-dynamic-grpc-backend.pid
-   sleep 0.3
-   sudo -n kill -0 \"\$(cat /tmp/vnet-dynamic-dns-backend.pid)\"
-   sudo -n kill -0 \"\$(cat /tmp/vnet-dynamic-grpc-backend.pid)\"
-   ss -lun | grep -q '${backend_ip}:53 '
-   ss -ltn | grep -q '${backend_ip}:50051 '"
+   sudo -n install -d -m 0755 '${guest_pin_root}'
+   sudo -n rm -rf -- '${guest_server_pin}' '${guest_server_grpc_pin}'
+   printf '0\n' | sudo -n tee '${guest_backend_count}' >/dev/null"
+guest_start_tracked_process "${backend_ip}" "${guest_dns_backend_pid}" \
+  "${guest_dns_backend_log}" \
+  "sudo -n '${guest_dns_harness}' server '${backend_ip}' 53 '${domain}' '${answer_ip}' 600 '${guest_backend_count}'"
+guest_start_tracked_process "${backend_ip}" "${guest_grpc_backend_pid}" \
+  "${guest_grpc_backend_log}" \
+  "sudo -n '${guest_grpc_harness}' server '${backend_ip}' 50051 300"
 guest_cmd "${client_ip}" \
-  "sudo -n killall -q grpc_fast_cache 2>/dev/null || true
-   sudo -n mkdir -p /sys/fs/bpf
+  "sudo -n mkdir -p /sys/fs/bpf
    mountpoint -q /sys/fs/bpf || sudo -n mount -t bpf bpf /sys/fs/bpf
-   sudo -n rm -rf -- ${guest_client_grpc_pin}"
+   sudo -n install -d -m 0755 '${guest_pin_root}'
+   sudo -n rm -rf -- '${guest_client_grpc_pin}'"
 sleep 1
 
 guest_cmd "${backend_ip}" \
   "set -e
-   ps -ef | grep -E 'openstack_(dns|grpc)_harness' | grep -v grep
+   ps -eo pid=,args= | grep -F '${guest_run_dir}' | grep -v grep
    ss -lunp | grep '${backend_ip}:53 '
    ss -ltnp | grep ':50051 '" >"${out_dir}/service-state.txt"
 
@@ -491,34 +688,52 @@ verify_tc_order() {
 
 start_monitors() {
   local label="$1"
-  stop_monitors
+  stop_monitors || {
+    echo "previous monitor lifecycle could not be verified" >&2
+    return 1
+  }
   active_label="${label}"
-  sudo_cmd rm -rf -- "${host_client_pin}" "${host_grpc_pin}"
+  sudo_cmd rm -rf -- "${host_pin_root}"
+  sudo_cmd mkdir -p -- "${host_pin_root}"
   guest_cmd "${client_ip}" \
-    "sudo -n rm -rf -- ${guest_client_grpc_pin}
-     sudo -n mkdir -p ${guest_client_grpc_pin}
-     sudo -n /tmp/openstack_grpc_harness seed ${guest_client_grpc_pin}/grpc_policy_map
-     sudo -n /tmp/openstack_grpc_harness seed-response ${guest_client_grpc_pin}/grpc_response_cache '${grpc_payload}' SERVING 3600
-     printf '%s\n' 'grpc ${method} 3600 idempotent' 'grpc-cache ${method} ${grpc_payload} SERVING 3600' 'grpc-cache ${method} ${grpc_shift_payload} SERVING 3600' >/tmp/vnet-dynamic-grpc-client-policy.txt
-     for i in \$(seq 0 7); do printf 'grpc-cache ${method} key-%s SERVING 3600\n' \"\$i\" >>/tmp/vnet-dynamic-grpc-client-policy.txt; done
-     sudo -n /tmp/cachectl --policy-file /tmp/vnet-dynamic-grpc-client-policy.txt --grpc-map ${guest_client_grpc_pin}/grpc_policy_map --grpc-response-map ${guest_client_grpc_pin}/grpc_response_cache --replace
-     sudo -n bpftool map create ${guest_client_grpc_pin}/cache_runtime_control type array key 4 value 16 entries 1 name dyn_grpc_cli
-     setsid nohup sudo -n /tmp/grpc_fast_cache --grpc-map ${guest_client_grpc_pin}/grpc_policy_map --grpc-response-map ${guest_client_grpc_pin}/grpc_response_cache --runtime-control-map ${guest_client_grpc_pin}/cache_runtime_control --cache-role client --listen '${client_ip}':50053 --backend '${backend_ip}':50052 --method '${method}' --verbose >/tmp/vnet-dynamic-grpc-client.log 2>&1 </dev/null & echo \$! >/tmp/vnet-dynamic-grpc-client.pid"
+    "sudo -n rm -rf -- '${guest_client_grpc_pin}'
+     sudo -n mkdir -p '${guest_client_grpc_pin}'
+     sudo -n '${guest_grpc_harness}' seed '${guest_client_grpc_pin}/grpc_policy_map'
+     sudo -n '${guest_grpc_harness}' seed-response '${guest_client_grpc_pin}/grpc_response_cache' '${grpc_payload}' SERVING 3600
+     printf '%s\n' 'grpc ${method} 3600 idempotent' 'grpc-cache ${method} ${grpc_payload} SERVING 3600' 'grpc-cache ${method} ${grpc_shift_payload} SERVING 3600' >'${guest_client_grpc_policy}'
+     for i in \$(seq 0 7); do printf 'grpc-cache ${method} key-%s SERVING 3600\n' \"\$i\" >>'${guest_client_grpc_policy}'; done
+     sudo -n '${guest_cachectl}' --policy-file '${guest_client_grpc_policy}' --grpc-map '${guest_client_grpc_pin}/grpc_policy_map' --grpc-response-map '${guest_client_grpc_pin}/grpc_response_cache' --replace
+     sudo -n bpftool map create '${guest_client_grpc_pin}/cache_runtime_control' type array key 4 value 16 entries 1 name dyn_grpc_cli"
+  guest_start_tracked_process "${client_ip}" "${guest_grpc_client_pid}" \
+    "${guest_grpc_client_log}" \
+    "sudo -n '${guest_grpc_cache}' --grpc-map '${guest_client_grpc_pin}/grpc_policy_map' --grpc-response-map '${guest_client_grpc_pin}/grpc_response_cache' --runtime-control-map '${guest_client_grpc_pin}/cache_runtime_control' --cache-role client --listen '${client_ip}':50053 --backend '${backend_ip}':50052 --method '${method}' --verbose"
   guest_cmd "${backend_ip}" \
-    "sudo -n rm -rf -- ${guest_server_pin} ${guest_server_grpc_pin}
-     sudo -n mkdir -p ${guest_server_grpc_pin}
-     sudo -n /tmp/openstack_grpc_harness seed ${guest_server_grpc_pin}/grpc_policy_map
-     sudo -n /tmp/openstack_grpc_harness seed-response ${guest_server_grpc_pin}/grpc_response_cache '${grpc_payload}' SERVING 3600
-     printf '%s\n' 'grpc ${method} 3600 idempotent' 'grpc-cache ${method} ${grpc_payload} SERVING 3600' 'grpc-cache ${method} ${grpc_shift_payload} SERVING 3600' >/tmp/vnet-dynamic-grpc-server-policy.txt
-     for i in \$(seq 0 7); do printf 'grpc-cache ${method} key-%s SERVING 3600\n' \"\$i\" >>/tmp/vnet-dynamic-grpc-server-policy.txt; done
-     sudo -n /tmp/cachectl --policy-file /tmp/vnet-dynamic-grpc-server-policy.txt --grpc-map ${guest_server_grpc_pin}/grpc_policy_map --grpc-response-map ${guest_server_grpc_pin}/grpc_response_cache --replace
-     sudo -n bpftool map create ${guest_server_grpc_pin}/cache_runtime_control type array key 4 value 16 entries 1 name dyn_grpc_srv
-     setsid nohup sudo -n /tmp/grpc_fast_cache --grpc-map ${guest_server_grpc_pin}/grpc_policy_map --grpc-response-map ${guest_server_grpc_pin}/grpc_response_cache --runtime-control-map ${guest_server_grpc_pin}/cache_runtime_control --cache-role server --listen '${backend_ip}':50052 --backend '${backend_ip}':50051 --method '${method}' --verbose >/tmp/vnet-dynamic-grpc-server.log 2>&1 </dev/null & echo \$! >/tmp/vnet-dynamic-grpc-server.pid
-     setsid nohup sudo -n /tmp/dns_monitor --dev ens3 --hook xdp --role server --xdp-mode generic --bpf-object /tmp/dns_xdp_monitor.bpf.o --cache-file /tmp/vnet-dynamic-server-cache.txt --pin-dir ${guest_server_pin} > /tmp/vnet-dynamic-dns-monitor.log 2>&1 </dev/null & echo \$! >/tmp/vnet-dynamic-dns-monitor.pid"
+    "sudo -n rm -rf -- '${guest_server_pin}' '${guest_server_grpc_pin}'
+     sudo -n mkdir -p '${guest_server_grpc_pin}'
+     sudo -n '${guest_grpc_harness}' seed '${guest_server_grpc_pin}/grpc_policy_map'
+     sudo -n '${guest_grpc_harness}' seed-response '${guest_server_grpc_pin}/grpc_response_cache' '${grpc_payload}' SERVING 3600
+     printf '%s\n' 'grpc ${method} 3600 idempotent' 'grpc-cache ${method} ${grpc_payload} SERVING 3600' 'grpc-cache ${method} ${grpc_shift_payload} SERVING 3600' >'${guest_server_grpc_policy}'
+     for i in \$(seq 0 7); do printf 'grpc-cache ${method} key-%s SERVING 3600\n' \"\$i\" >>'${guest_server_grpc_policy}'; done
+     sudo -n '${guest_cachectl}' --policy-file '${guest_server_grpc_policy}' --grpc-map '${guest_server_grpc_pin}/grpc_policy_map' --grpc-response-map '${guest_server_grpc_pin}/grpc_response_cache' --replace
+     sudo -n bpftool map create '${guest_server_grpc_pin}/cache_runtime_control' type array key 4 value 16 entries 1 name dyn_grpc_srv"
+  guest_start_tracked_process "${backend_ip}" "${guest_grpc_server_pid}" \
+    "${guest_grpc_server_log}" \
+    "sudo -n '${guest_grpc_cache}' --grpc-map '${guest_server_grpc_pin}/grpc_policy_map' --grpc-response-map '${guest_server_grpc_pin}/grpc_response_cache' --runtime-control-map '${guest_server_grpc_pin}/cache_runtime_control' --cache-role server --listen '${backend_ip}':50052 --backend '${backend_ip}':50051 --method '${method}' --verbose"
+  guest_start_tracked_process "${backend_ip}" "${guest_dns_monitor_pid}" \
+    "${guest_dns_monitor_log}" \
+    "sudo -n '${guest_dns_monitor}' --dev ens3 --hook xdp --role server --xdp-mode generic --bpf-object '${guest_dns_server_bpf}' --cache-file '${guest_server_cache}' --pin-dir '${guest_server_pin}'"
   dns_client_pid="$(sudo_cmd bash -c \
     "setsid '${dns_monitor}' --dev '${client_tap}' --hook xdp --role client --xdp-mode generic --bpf-object '${dns_client_bpf}' --trusted-dns '${backend_ip}' --pin-dir '${host_client_pin}' >'${out_dir}/monitors/${label}.dns-client.log' 2>&1 </dev/null & echo \$!")"
+  dns_client_start_time="$(host_process_start_time "${dns_client_pid}")" || {
+    echo "failed to record DNS host monitor identity" >&2
+    return 1
+  }
   grpc_monitor_pid="$(sudo_cmd bash -c \
     "setsid '${grpc_monitor}' --dev '${client_tap}' --bpf-object '${grpc_bpf}' --port 50052 --pin-dir '${host_grpc_pin}' >'${out_dir}/monitors/${label}.grpc.log' 2>&1 </dev/null & echo \$!")"
+  grpc_monitor_start_time="$(host_process_start_time "${grpc_monitor_pid}")" || {
+    echo "failed to record gRPC host monitor identity" >&2
+    return 1
+  }
   for _ in {1..80}; do
     if sudo_cmd test -e "${host_client_pin}/cache_runtime_control" &&
        guest_cmd "${client_ip}" \
@@ -549,10 +764,10 @@ apply_mode() {
        --initial-mode "${mode}" --initial-epoch "${epoch}" </dev/null \
        >"${out_dir}/decisions/${label}.host-publish.log" 2>&1 &&
      guest_cmd "${client_ip}" \
-       "sudo -n /tmp/dynamic_cache_controller --control-map ${guest_client_grpc_pin}/cache_runtime_control --initial-mode '${mode}' --initial-epoch '${epoch}' </dev/null" \
+       "sudo -n '${guest_controller}' --control-map '${guest_client_grpc_pin}/cache_runtime_control' --initial-mode '${mode}' --initial-epoch '${epoch}' </dev/null" \
        >"${out_dir}/decisions/${label}.client-publish.log" 2>&1 &&
      guest_cmd "${backend_ip}" \
-       "sudo -n /tmp/dynamic_cache_controller --control-map ${guest_server_pin}/cache_runtime_control --control-map ${guest_server_grpc_pin}/cache_runtime_control --initial-mode '${mode}' --initial-epoch '${epoch}' </dev/null" \
+       "sudo -n '${guest_controller}' --control-map '${guest_server_pin}/cache_runtime_control' --control-map '${guest_server_grpc_pin}/cache_runtime_control' --initial-mode '${mode}' --initial-epoch '${epoch}' </dev/null" \
        >"${out_dir}/decisions/${label}.server-publish.log" 2>&1; then
     return 0
   fi
@@ -564,10 +779,10 @@ apply_mode() {
       --initial-mode "${previous_mode}" --initial-epoch "${previous_epoch}" \
       </dev/null >"${out_dir}/decisions/${label}.host-rollback.log" 2>&1 || true
     guest_cmd "${client_ip}" \
-      "sudo -n /tmp/dynamic_cache_controller --control-map ${guest_client_grpc_pin}/cache_runtime_control --initial-mode '${previous_mode}' --initial-epoch '${previous_epoch}' </dev/null" \
+      "sudo -n '${guest_controller}' --control-map '${guest_client_grpc_pin}/cache_runtime_control' --initial-mode '${previous_mode}' --initial-epoch '${previous_epoch}' </dev/null" \
       >"${out_dir}/decisions/${label}.client-rollback.log" 2>&1 || true
     guest_cmd "${backend_ip}" \
-      "sudo -n /tmp/dynamic_cache_controller --control-map ${guest_server_pin}/cache_runtime_control --control-map ${guest_server_grpc_pin}/cache_runtime_control --initial-mode '${previous_mode}' --initial-epoch '${previous_epoch}' </dev/null" \
+      "sudo -n '${guest_controller}' --control-map '${guest_server_pin}/cache_runtime_control' --control-map '${guest_server_grpc_pin}/cache_runtime_control' --initial-mode '${previous_mode}' --initial-epoch '${previous_epoch}' </dev/null" \
       >"${out_dir}/decisions/${label}.server-rollback.log" 2>&1 || true
   fi
   return 1
@@ -579,22 +794,22 @@ host_dns_stats() {
 
 guest_dns_stats() {
   guest_cmd "${backend_ip}" \
-    "sudo -n /tmp/dns_cache_stats_reader ${guest_server_pin}/dns_cache_stats"
+    "sudo -n '${guest_stats_reader}' '${guest_server_pin}/dns_cache_stats'"
 }
 
 client_grpc_stats() {
   guest_cmd "${client_ip}" \
-    "grep 'grpc_fast_cache listen=' /tmp/vnet-dynamic-grpc-client.log | tail -n 1"
+    "grep 'grpc_fast_cache listen=' '${guest_grpc_client_log}' | tail -n 1"
 }
 
 server_grpc_stats() {
   guest_cmd "${backend_ip}" \
-    "grep 'grpc_fast_cache listen=' /tmp/vnet-dynamic-grpc-server.log | tail -n 1"
+    "grep 'grpc_fast_cache listen=' '${guest_grpc_server_log}' | tail -n 1"
 }
 
 backend_count() {
   guest_cmd "${backend_ip}" \
-    "tail -n 1 ${guest_backend_count} | tr -d '[:space:]'"
+    "tail -n 1 '${guest_backend_count}' | tr -d '[:space:]'"
 }
 
 aggregate_output() {
@@ -625,23 +840,24 @@ run_dns_load() {
   local output="$2"
   local window="$3"
   local shifting_domain
+  local state_file="${guest_run_dir}/dns-load-${active_label}-w${window}.pid"
   case "${workload}" in
     stable)
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_dns_harness client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' stable 8" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_dns_harness}' client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' stable 8" >"${output}"
       ;;
     burst)
-      guest_cmd "${client_ip}" \
-        "rm -f /tmp/vnet-dynamic-dns-burst-*.out
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "rm -f -- ${guest_run_dir}/dns-burst-*.out
          for i in \$(seq 1 '${burst_clients}'); do
-           /tmp/openstack_dns_harness client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' hot 1 >/tmp/vnet-dynamic-dns-burst-\$i.out &
+           '${guest_dns_harness}' client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' hot 1 >${guest_run_dir}/dns-burst-\$i.out &
          done
          wait
-         cat /tmp/vnet-dynamic-dns-burst-*.out" >"${output}"
+         cat ${guest_run_dir}/dns-burst-*.out" >"${output}"
       ;;
     hot-key)
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_dns_harness client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' hot 1" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_dns_harness}' client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' hot 1" >"${output}"
       ;;
     shifting-hot-key)
       if (( window <= windows / 2 )); then
@@ -649,12 +865,12 @@ run_dns_load() {
       else
         shifting_domain="shift-b.${domain}"
       fi
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_dns_harness client-workload '${backend_ip}' 53 '${shifting_domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' fixed 1" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_dns_harness}' client-workload '${backend_ip}' 53 '${shifting_domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' fixed 1" >"${output}"
       ;;
     low-hit-rate)
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_dns_harness client-workload '${backend_ip}' 53 'w${window}.${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' low-hit-rate '${requests_per_window}'" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_dns_harness}' client-workload '${backend_ip}' 53 'w${window}.${domain}' '${answer_ip}' '${requests_per_window}' '${warmup}' low-hit-rate '${requests_per_window}'" >"${output}"
       ;;
     *)
       echo "unknown workload: ${workload}" >&2
@@ -668,23 +884,24 @@ run_grpc_load() {
   local output="$2"
   local window="$3"
   local shifting_payload
+  local state_file="${guest_run_dir}/grpc-load-${active_label}-w${window}.pid"
   case "${workload}" in
     stable)
-      guest_cmd "${client_ip}" \
-        "rm -f /tmp/vnet-dynamic-grpc-stable-*.out
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "rm -f -- ${guest_run_dir}/grpc-stable-*.out
          for i in \$(seq 0 7); do
-           /tmp/openstack_grpc_harness client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"key-\$i\" >/tmp/vnet-dynamic-grpc-stable-\$i.out
+           '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"key-\$i\" >${guest_run_dir}/grpc-stable-\$i.out
          done
-         cat /tmp/vnet-dynamic-grpc-stable-*.out" >"${output}"
+         cat ${guest_run_dir}/grpc-stable-*.out" >"${output}"
       ;;
     burst)
-      guest_cmd "${client_ip}" \
-        "rm -f /tmp/vnet-dynamic-grpc-burst-*.out
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "rm -f -- ${guest_run_dir}/grpc-burst-*.out
          for i in \$(seq 1 '${burst_clients}'); do
-            /tmp/openstack_grpc_harness client '${client_ip}' 50053 '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' '${grpc_payload}' >/tmp/vnet-dynamic-grpc-burst-\$i.out &
+            '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' '${grpc_payload}' >${guest_run_dir}/grpc-burst-\$i.out &
          done
          wait
-         cat /tmp/vnet-dynamic-grpc-burst-*.out" >"${output}"
+         cat ${guest_run_dir}/grpc-burst-*.out" >"${output}"
       ;;
     shifting-hot-key)
       if (( window <= windows / 2 )); then
@@ -692,21 +909,21 @@ run_grpc_load() {
       else
         shifting_payload="${grpc_shift_payload}"
       fi
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_grpc_harness client '${client_ip}' 50053 '${requests_per_window}' '${warmup}' '${shifting_payload}'" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_grpc_harness}' client '${client_ip}' 50053 '${requests_per_window}' '${warmup}' '${shifting_payload}'" >"${output}"
       ;;
     low-hit-rate)
-      guest_cmd "${client_ip}" \
-        "rm -f /tmp/vnet-dynamic-grpc-low-*.out
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "rm -f -- ${guest_run_dir}/grpc-low-*.out
          for i in \$(seq 1 8); do
-            /tmp/openstack_grpc_harness client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"unique-\$i\" >/tmp/vnet-dynamic-grpc-low-\$i.out &
+            '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"unique-\$i\" >${guest_run_dir}/grpc-low-\$i.out &
          done
          wait
-         cat /tmp/vnet-dynamic-grpc-low-*.out" >"${output}"
+         cat ${guest_run_dir}/grpc-low-*.out" >"${output}"
       ;;
     *)
-      guest_cmd "${client_ip}" \
-        "/tmp/openstack_grpc_harness client '${client_ip}' 50053 '${requests_per_window}' '${warmup}' '${grpc_payload}'" >"${output}"
+      guest_run_tracked_process "${client_ip}" "${state_file}" \
+        "'${guest_grpc_harness}' client '${client_ip}' 50053 '${requests_per_window}' '${warmup}' '${grpc_payload}'" >"${output}"
       ;;
   esac
 }
@@ -923,7 +1140,10 @@ for policy in "${policies[@]}"; do
       if [[ "${policy}" == dynamic ]]; then
         stop_dynamic_controller
       fi
-      stop_monitors
+      stop_monitors || {
+        echo "monitor lifecycle cleanup failed for ${label}" >&2
+        exit 1
+      }
     done
   done
 done

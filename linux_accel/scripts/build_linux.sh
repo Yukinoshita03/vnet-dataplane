@@ -125,6 +125,7 @@ cc -O2 -g \
 bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 bash -n "${ROOT_DIR}/tests/hook_ownership_regression_test.sh"
 bash -n "${ROOT_DIR}/tests/grpc_stream_correlation_test.sh"
+bash "${ROOT_DIR}/tests/openstack_campaign_lifecycle_test.sh"
 python3 -m py_compile "${ROOT_DIR}/tests/grpc_h2_stream_replay.py"
 (cd "${ROOT_DIR}" &&
   python3 -m unittest tests.test_openstack_dataplane_agent)
@@ -148,5 +149,6 @@ echo "Passed ${BUILD_DIR}/cache_runtime_control_test"
 echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 echo "Checked ${ROOT_DIR}/tests/hook_ownership_regression_test.sh"
 echo "Checked ${ROOT_DIR}/tests/grpc_stream_correlation_test.sh"
+echo "Passed ${ROOT_DIR}/tests/openstack_campaign_lifecycle_test.sh"
 echo "Checked ${ROOT_DIR}/tests/grpc_h2_stream_replay.py"
 echo "Passed ${ROOT_DIR}/tests/test_openstack_dataplane_agent.py"
