@@ -87,6 +87,8 @@ GRPC_CACHE="$PWD/build/grpc_fast_cache" \
 CACHECTL="$PWD/build/cachectl" \
 OPENSTACK_OPENRC=/opt/stack/devstack/openrc \
 OPENSTACK_OPENRC_USER=admin OPENSTACK_OPENRC_PROJECT=admin \
+MANAGE_GRPC_SECURITY_GROUP_RULE=1 \
+OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID=<backend-port-security-group-id> \
 ROUNDS=1 WINDOWS=3 REQUESTS_PER_WINDOW=40 WARMUP=8 \
 POLICIES=dynamic WORKLOADS=hot-key REQUIRE_NETMIG_TC=0 \
 ./bench/openstack_dynamic_cache_campaign.sh
@@ -107,6 +109,8 @@ GRPC_CACHE="$PWD/build/grpc_fast_cache" \
 CACHECTL="$PWD/build/cachectl" \
 OPENSTACK_OPENRC=/opt/stack/devstack/openrc \
 OPENSTACK_OPENRC_USER=admin OPENSTACK_OPENRC_PROJECT=admin \
+MANAGE_GRPC_SECURITY_GROUP_RULE=1 \
+OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID=<backend-port-security-group-id> \
 ROUNDS=5 WINDOWS=5 REQUESTS_PER_WINDOW=200 WARMUP=20 \
 POLICIES="bypass server client dual dynamic" \
 WORKLOADS="stable burst hot-key shifting-hot-key low-hit-rate" \
@@ -122,6 +126,17 @@ handle `0x65` 之前，egress observer 位于 `0x66` 之前。
 负载前终止；只有明确运行非 OpenStack 调试时才可设置
 `REQUIRE_OPENSTACK_EVIDENCE=0`。
 
+现有测试实例若只放通 SSH 与 DNS，客户端 VM 到后端 gRPC proxy 的 `TCP/50052`
+会被 Neutron 安全组静默丢弃。为让实验自包含，可显式设置
+`MANAGE_GRPC_SECURITY_GROUP_RULE=1` 和后端端口所属的
+`OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID`。脚本会仅为当前 `CLIENT_IP/32`
+创建一条 `TCP/50052` 入站规则，将规则 ID 写入
+`grpc-security-group-rule.txt`，并在所有成功或失败退出路径中按该精确 ID
+删除并复查。默认值为 `0`，不会修改任何安全组；未启用时，操作者必须自行保证
+后端端口的 `TCP/50052` 已对客户端 IP 放通。删除后的 `show` 只有明确的
+NotFound/404 才计为已清理；认证、API 或网络错误会让 campaign 以清理失败退出，
+并保留规则 ID 与诊断输出。
+
 ## 证据与清理
 
 每次运行保留：
@@ -131,9 +146,12 @@ handle `0x65` 之前，egress observer 位于 `0x66` 之前。
 - `runs.csv`：逐轮汇总。
 - `summary.csv`、`summary.md`：按策略和负载计算的中位数。
 - `raw/`：每个 harness 的原始输出。
+- `raw/*.status`：每个窗口的 DNS/gRPC 子任务退出码；子任务失败时仍保留原始输出，
+  然后以明确错误退出，不把该窗口喂给动态控制器。
 - `decisions/`：动态决策、epoch 发布和回滚日志。
 - `monitors/`：DNS、gRPC、TC 顺序及两级 gRPC 缓存日志。
 - `cleanup-audit.txt`、`cleanup-status.txt`：进程、pin 和 TC 残留检查。
+- `grpc-security-group-rule.txt`：仅启用受管 gRPC 安全组规则时的创建、查询和删除证据。
 
 只要 campaign 自己的 pin、进程或 TC handle `0x1/0x2` 有残留，清理状态就
 会失败。NetMig 的 `0x65/0x66` 不属于 campaign，脚本不会删除。

@@ -22,6 +22,8 @@ require_openstack_evidence="${REQUIRE_OPENSTACK_EVIDENCE:-1}"
 openstack_openrc="${OPENSTACK_OPENRC:-}"
 openstack_openrc_user="${OPENSTACK_OPENRC_USER:-admin}"
 openstack_openrc_project="${OPENSTACK_OPENRC_PROJECT:-admin}"
+manage_grpc_security_group_rule="${MANAGE_GRPC_SECURITY_GROUP_RULE:-0}"
+openstack_grpc_backend_security_group_id="${OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID:-}"
 source_revision="${SOURCE_REVISION:-unknown}"
 domain="${DOMAIN:-dynamic.test}"
 answer_ip="${ANSWER_IP:-10.0.0.123}"
@@ -84,6 +86,7 @@ sudo_askpass="${out_dir}/.sudo-askpass-${run_token}"
 lock_key="$(printf '%s' "${client_tap}" | tr -c 'A-Za-z0-9_-' '_')"
 campaign_lock_path="/tmp/vnet-dynamic-${lock_key}.lock"
 campaign_lock_fd=""
+grpc_security_group_rule_id=""
 
 dns_client_pid=""
 dns_client_start_time=""
@@ -152,6 +155,85 @@ capture_openstack_evidence() {
   fi
 }
 
+ensure_grpc_security_group_rule() {
+  local rule_id
+
+  [[ "${manage_grpc_security_group_rule}" == 1 ]] || return 0
+  [[ -n "${openstack_openrc}" ]] || {
+    echo "MANAGE_GRPC_SECURITY_GROUP_RULE=1 requires OPENSTACK_OPENRC" >&2
+    return 1
+  }
+  [[ -n "${openstack_grpc_backend_security_group_id}" ]] || {
+    echo "MANAGE_GRPC_SECURITY_GROUP_RULE=1 requires OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID" >&2
+    return 1
+  }
+  command -v openstack >/dev/null 2>&1 || {
+    echo "openstack CLI is required to manage the gRPC security-group rule" >&2
+    return 1
+  }
+
+  rule_id="$(openstack security group rule create \
+    --ingress --protocol tcp --dst-port 50052 \
+    --remote-ip "${client_ip}/32" \
+    "${openstack_grpc_backend_security_group_id}" -f value -c id)" || return 1
+  grpc_security_group_rule_id="${rule_id}"
+  [[ "${rule_id}" =~ ^[0-9a-fA-F-]+$ ]] || {
+    echo "invalid managed gRPC security-group rule id: ${rule_id}" >&2
+    return 1
+  }
+  {
+    echo "managed_grpc_security_group_rule_id=${grpc_security_group_rule_id}"
+    echo "managed_grpc_security_group_id=${openstack_grpc_backend_security_group_id}"
+    echo "managed_grpc_security_group_source=${client_ip}/32"
+    openstack security group rule show "${grpc_security_group_rule_id}" -f json
+  } >"${out_dir}/grpc-security-group-rule.txt" || return 1
+}
+
+cleanup_grpc_security_group_rule() {
+  local rule_id="${grpc_security_group_rule_id}"
+  local delete_output delete_status show_output show_status
+
+  [[ -n "${rule_id}" ]] || return 0
+  if delete_output="$(openstack security group rule delete "${rule_id}" 2>&1)"; then
+    printf 'managed_grpc_security_group_rule_delete=ok id=%s\n' "${rule_id}" \
+      >>"${out_dir}/grpc-security-group-rule.txt"
+  else
+    delete_status=$?
+    {
+      printf 'managed_grpc_security_group_rule_delete=failed id=%s status=%s\n' \
+        "${rule_id}" "${delete_status}"
+      printf '%s\n' "${delete_output}"
+    } >>"${out_dir}/grpc-security-group-rule.txt"
+    return 1
+  fi
+  if show_output="$(openstack security group rule show "${rule_id}" 2>&1)"; then
+    echo "managed gRPC security-group rule still exists: ${rule_id}" >&2
+    {
+      printf 'managed_grpc_security_group_rule_verify=present id=%s status=0\n' \
+        "${rule_id}"
+      printf '%s\n' "${show_output}"
+    } >>"${out_dir}/grpc-security-group-rule.txt"
+    return 1
+  else
+    show_status=$?
+  fi
+  if ! grep -Eqi '(^|[^0-9])404([^0-9]|$)|[Nn]ot[[:space:]-]*[Ff]ound|[Nn]o[[:space:]].*[[:space:]][Ff]ound' \
+      <<<"${show_output}"; then
+    echo "unable to verify managed gRPC security-group rule deletion: ${rule_id}" >&2
+    {
+      printf 'managed_grpc_security_group_rule_verify=error id=%s status=%s\n' \
+        "${rule_id}" "${show_status}"
+      printf '%s\n' "${show_output}"
+    } >>"${out_dir}/grpc-security-group-rule.txt"
+    return 1
+  fi
+  printf 'managed_grpc_security_group_rule_verify=not_found id=%s status=%s\n' \
+    "${rule_id}" "${show_status}" >>"${out_dir}/grpc-security-group-rule.txt"
+  printf 'managed_grpc_security_group_rule_deleted=%s\n' "${rule_id}" \
+    >>"${out_dir}/grpc-security-group-rule.txt"
+  grpc_security_group_rule_id=""
+}
+
 ssh_opts=(
   -i "${guest_key}"
   -o BatchMode=yes
@@ -164,10 +246,16 @@ ssh_opts=(
 guest_cmd() {
   local ip="$1"
   local command="$2"
-  local encoded
+  local encoded status
   encoded="$(printf '%s' "${command}" | base64 | tr -d '\n')"
-  sudo_cmd ip netns exec "${netns}" ssh "${ssh_opts[@]}" \
-    "${guest_user}@${ip}" "echo ${encoded} | base64 -d | bash"
+  if sudo_cmd ip netns exec "${netns}" ssh "${ssh_opts[@]}" \
+      "${guest_user}@${ip}" "echo ${encoded} | base64 -d | bash"; then
+    return 0
+  else
+    status=$?
+  fi
+  printf 'guest_command_failed ip=%s status=%s\n' "${ip}" "${status}" >&2
+  return "${status}"
 }
 
 copy_guest() {
@@ -252,16 +340,42 @@ guest_run_tracked_process() {
   local ip="$1"
   local state_file="$2"
   local command="$3"
-  local encoded
+  local encoded runner runner_encoded gate_file
 
   encoded="$(printf '%s' "${command}" | base64 | tr -d '\n')"
+  gate_file="${state_file}.ready"
+  runner="while [ ! -e '${gate_file}' ]; do sleep 0.01; done
+rm -f -- '${gate_file}'
+echo ${encoded} | base64 -d | bash
+command_status=\$?
+if [ \"\$command_status\" -ne 0 ]; then
+  printf 'guest_workload_command_status=%s state=%s\n' \"\$command_status\" '${state_file}' >&2
+fi
+exit \"\$command_status\""
+  runner_encoded="$(printf '%s' "${runner}" | base64 | tr -d '\n')"
   guest_cmd "${ip}" "$(guest_process_helpers)
-setsid bash -c 'echo ${encoded} | base64 -d | bash' </dev/null &
+rm -f -- '${state_file}' '${gate_file}'
+setsid bash -c 'echo ${runner_encoded} | base64 -d | bash' </dev/null &
 pid=\$!
-record_owned_process '${state_file}' \"\$pid\" || exit 1
+if ! record_owned_process '${state_file}' \"\$pid\"; then
+  printf 'failed_to_record_guest_workload state=%s pid=%s\n' '${state_file}' \"\$pid\" >&2
+  kill -TERM \"\$pid\" 2>/dev/null || true
+  wait \"\$pid\" >/dev/null 2>&1 || true
+  rm -f -- '${state_file}' '${gate_file}'
+  exit 1
+fi
+: > '${gate_file}' || {
+  printf 'failed_to_release_guest_workload state=%s pid=%s\n' '${state_file}' \"\$pid\" >&2
+  stop_owned_process '${state_file}' || true
+  rm -f -- '${state_file}' '${gate_file}'
+  exit 1
+}
 wait \"\$pid\"
 status=\$?
-rm -f -- '${state_file}'
+if [ \"\$status\" -ne 0 ]; then
+  printf 'guest_workload_wait_status=%s state=%s\n' \"\$status\" '${state_file}' >&2
+fi
+rm -f -- '${state_file}' '${gate_file}'
 exit \"\$status\""
 }
 
@@ -425,6 +539,7 @@ cleanup() {
   stop_monitors || cleanup_failed=1
   stop_all_guest_owned_processes "${client_ip}" || cleanup_failed=1
   stop_all_guest_owned_processes "${backend_ip}" || cleanup_failed=1
+  cleanup_grpc_security_group_rule || cleanup_failed=1
   guest_cmd "${backend_ip}" \
     'echo "--- dns backend ---"
      cat '"${guest_dns_backend_log}"' 2>/dev/null || true
@@ -526,6 +641,18 @@ done
   echo "REQUIRE_OPENSTACK_EVIDENCE must be 0 or 1" >&2
   exit 2
 }
+[[ "${manage_grpc_security_group_rule}" == 0 ||
+   "${manage_grpc_security_group_rule}" == 1 ]] || {
+  echo "MANAGE_GRPC_SECURITY_GROUP_RULE must be 0 or 1" >&2
+  exit 2
+}
+if [[ "${manage_grpc_security_group_rule}" == 1 ]]; then
+  [[ -n "${openstack_openrc}" &&
+     -n "${openstack_grpc_backend_security_group_id}" ]] || {
+    echo "managed gRPC security-group rule requires OPENSTACK_OPENRC and OPENSTACK_GRPC_BACKEND_SECURITY_GROUP_ID" >&2
+    exit 2
+  }
+fi
 if (( requests_per_window < burst_clients || requests_per_window < 8 )); then
   echo "REQUESTS_PER_WINDOW must be at least BURST_CLIENTS and 8" >&2
   exit 2
@@ -594,9 +721,12 @@ flock -n "${campaign_lock_fd}" || {
   echo "campaign_lock=${campaign_lock_path}"
   echo "require_netmig_tc=${require_netmig_tc}"
   echo "require_openstack_evidence=${require_openstack_evidence}"
+  echo "manage_grpc_security_group_rule=${manage_grpc_security_group_rule}"
+  echo "openstack_grpc_backend_security_group_id=${openstack_grpc_backend_security_group_id:-none}"
   echo "source_revision=${source_revision}"
 } >"${out_dir}/environment.txt"
 capture_openstack_evidence
+ensure_grpc_security_group_rule
 sudo_cmd ovs-vsctl show >"${out_dir}/ovs-topology.txt" 2>&1 || true
 sudo_cmd ip -details link show "${client_tap}" \
   >"${out_dir}/client-interface.txt" 2>&1
@@ -849,11 +979,17 @@ run_dns_load() {
     burst)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
         "rm -f -- ${guest_run_dir}/dns-burst-*.out
+         pids=()
          for i in \$(seq 1 '${burst_clients}'); do
-           '${guest_dns_harness}' client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' hot 1 >${guest_run_dir}/dns-burst-\$i.out &
+            '${guest_dns_harness}' client-workload '${backend_ip}' 53 '${domain}' '${answer_ip}' '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' hot 1 >${guest_run_dir}/dns-burst-\$i.out &
+            pids+=(\"\$!\")
          done
-         wait
-         cat ${guest_run_dir}/dns-burst-*.out" >"${output}"
+         status=0
+         for pid in \"\${pids[@]}\"; do
+           wait \"\$pid\" || status=1
+         done
+         cat ${guest_run_dir}/dns-burst-*.out || status=1
+         exit \"\$status\"" >"${output}"
       ;;
     hot-key)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
@@ -889,19 +1025,27 @@ run_grpc_load() {
     stable)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
         "rm -f -- ${guest_run_dir}/grpc-stable-*.out
+         status=0
          for i in \$(seq 0 7); do
-           '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"key-\$i\" >${guest_run_dir}/grpc-stable-\$i.out
+            '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"key-\$i\" >${guest_run_dir}/grpc-stable-\$i.out || status=1
          done
-         cat ${guest_run_dir}/grpc-stable-*.out" >"${output}"
+         cat ${guest_run_dir}/grpc-stable-*.out || status=1
+         exit \"\$status\"" >"${output}"
       ;;
     burst)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
         "rm -f -- ${guest_run_dir}/grpc-burst-*.out
+         pids=()
          for i in \$(seq 1 '${burst_clients}'); do
             '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / burst_clients))' '$((warmup / burst_clients))' '${grpc_payload}' >${guest_run_dir}/grpc-burst-\$i.out &
+            pids+=(\"\$!\")
          done
-         wait
-         cat ${guest_run_dir}/grpc-burst-*.out" >"${output}"
+         status=0
+         for pid in \"\${pids[@]}\"; do
+           wait \"\$pid\" || status=1
+         done
+         cat ${guest_run_dir}/grpc-burst-*.out || status=1
+         exit \"\$status\"" >"${output}"
       ;;
     shifting-hot-key)
       if (( window <= windows / 2 )); then
@@ -915,11 +1059,17 @@ run_grpc_load() {
     low-hit-rate)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
         "rm -f -- ${guest_run_dir}/grpc-low-*.out
+         pids=()
          for i in \$(seq 1 8); do
             '${guest_grpc_harness}' client '${client_ip}' 50053 '$((requests_per_window / 8))' '$((warmup / 8))' \"unique-\$i\" >${guest_run_dir}/grpc-low-\$i.out &
+            pids+=(\"\$!\")
          done
-         wait
-         cat ${guest_run_dir}/grpc-low-*.out" >"${output}"
+         status=0
+         for pid in \"\${pids[@]}\"; do
+           wait \"\$pid\" || status=1
+         done
+         cat ${guest_run_dir}/grpc-low-*.out || status=1
+         exit \"\$status\"" >"${output}"
       ;;
     *)
       guest_run_tracked_process "${client_ip}" "${state_file}" \
@@ -1004,8 +1154,12 @@ for policy in "${policies[@]}"; do
         dns_job=$!
         run_grpc_load "${workload}" "${raw_prefix}.grpc" "${window}" &
         grpc_job=$!
+        set +e
         wait "${dns_job}"
+        dns_load_rc=$?
         wait "${grpc_job}"
+        grpc_load_rc=$?
+        set -e
         window_finished="$(date +%s%N)"
         backend_after="$(backend_count)"
         [[ "${backend_before}" =~ ^[0-9]+$ &&
@@ -1020,12 +1174,22 @@ for policy in "${policies[@]}"; do
 
         dns_result="$(aggregate_output "${raw_prefix}.dns" success)"
         grpc_result="$(aggregate_output "${raw_prefix}.grpc" count)"
+        printf 'dns_load_rc=%s\ngrpc_load_rc=%s\n' \
+          "${dns_load_rc}" "${grpc_load_rc}" >"${raw_prefix}.status"
+        [[ -s "${raw_prefix}.dns" && -s "${raw_prefix}.grpc" ]] || {
+          echo "load output missing for ${label} window ${window}" >&2
+          exit 1
+        }
         dns_success="$(field "${dns_result}" success)"
         dns_failed="$(field "${dns_result}" failed)"
         dns_p95="$(field "${dns_result}" p95_us)"
         grpc_success="$(field "${grpc_result}" success)"
         grpc_failed="$(field "${grpc_result}" failed)"
         grpc_p95="$(field "${grpc_result}" p95_us)"
+        if (( dns_load_rc != 0 || grpc_load_rc != 0 )); then
+          echo "load task failed for ${label} window ${window}: dns_rc=${dns_load_rc} grpc_rc=${grpc_load_rc}; raw outputs retained" >&2
+          exit 1
+        fi
         elapsed_ns=$((window_finished - window_started))
         dns_qps="$(awk -v count="${dns_success}" -v ns="${elapsed_ns}" \
           'BEGIN {printf "%.2f", count * 1000000000 / ns}')"
