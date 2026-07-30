@@ -138,5 +138,16 @@ handle `0x65` 之前，egress observer 位于 `0x66` 之前。
 只要 campaign 自己的 pin、进程或 TC handle `0x1/0x2` 有残留，清理状态就
 会失败。NetMig 的 `0x65/0x66` 不属于 campaign，脚本不会删除。
 
+对 TC/XDP monitor hook，当前脚本只通过结束自己启动的 monitor 触发清理；不会使用
+固定 handle 的 `tc filter del` 或 `xdp off` 作为兜底。monitor 会先核对程序 ID；
+所有权丢失时保留 hook 并让 cleanup audit 失败，而不是删除未知程序。guest 侧的
+DNS/gRPC harness helper 仍以共享进程名执行 `killall` 作为旧实验启动/收尾逻辑，
+因此同一对 guest 不应并发运行 campaign；P1 会把这些 helper 也改为 PID 级生命周期。
+
+`dynamic_cache_controller --dry-run` 只给出候选模式和 epoch；该 campaign 再以
+host、client、server 的串行方式发布 map。它是可审计的实验编排，不是跨主机原子
+事务。P1 的 prepare/readback/commit 与失败强制 `BYPASS` 完成前，不应将这批数据
+描述为“分布式原子发布”。
+
 2026-07-30 的正式五轮结果见
 `docs/openstack-dynamic-cache-results-20260730.md`。

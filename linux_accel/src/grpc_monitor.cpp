@@ -341,19 +341,73 @@ void print_metrics(ReaderState *state)
     state->current = WindowMetrics{};
 }
 
-void cleanup_tc(bpf_tc_hook *hook, bpf_tc_opts *ingress_opts,
-                bpf_tc_opts *egress_opts, bool destroy_clsact)
+bool read_program_id(int program_fd, __u32 *program_id, const char *label)
 {
-    hook->attach_point = BPF_TC_INGRESS;
-    bpf_tc_detach(hook, ingress_opts);
-    hook->attach_point = BPF_TC_EGRESS;
-    bpf_tc_detach(hook, egress_opts);
-
-    if (destroy_clsact) {
-        hook->attach_point =
-            static_cast<decltype(hook->attach_point)>(BPF_TC_INGRESS | BPF_TC_EGRESS);
-        bpf_tc_hook_destroy(hook);
+    bpf_prog_info info = {};
+    __u32 info_len = sizeof(info);
+    if (bpf_prog_get_info_by_fd(program_fd, &info, &info_len) != 0) {
+        std::cerr << "Failed to read " << label << " program ID: "
+                  << strerror(errno) << "\n";
+        return false;
     }
+    if (info.id == 0) {
+        std::cerr << "Failed to read a non-zero " << label << " program ID\n";
+        return false;
+    }
+    *program_id = info.id;
+    return true;
+}
+
+void detach_tc_filter_if_owned(bpf_tc_hook *hook,
+                               enum bpf_tc_attach_point attach_point,
+                               bpf_tc_opts *opts, bool attached,
+                               __u32 expected_program_id)
+{
+    if (!attached)
+        return;
+
+    hook->attach_point = attach_point;
+    bpf_tc_opts query = {};
+    query.sz = sizeof(query);
+    query.handle = opts->handle;
+    query.priority = opts->priority;
+    const int err = bpf_tc_query(hook, &query);
+    const char *direction = attach_point == BPF_TC_INGRESS ? "ingress" : "egress";
+    if (err == -ENOENT)
+        return;
+    if (err) {
+        std::cerr << "Refusing to detach " << direction
+                  << " tc program because ownership cannot be queried: "
+                  << strerror(-err) << "\n";
+        return;
+    }
+    if (expected_program_id == 0 || query.prog_id != expected_program_id) {
+        std::cerr << "Refusing to detach " << direction
+                  << " tc program because ownership changed (expected id "
+                  << expected_program_id << ", found id " << query.prog_id << ")\n";
+        return;
+    }
+
+    bpf_tc_opts detach = {};
+    detach.sz = sizeof(detach);
+    detach.handle = opts->handle;
+    detach.priority = opts->priority;
+    const int detach_err = bpf_tc_detach(hook, &detach);
+    if (detach_err) {
+        std::cerr << "Failed to detach owned " << direction
+                  << " tc program: " << strerror(-detach_err) << "\n";
+    }
+}
+
+void cleanup_tc(bpf_tc_hook *hook, bpf_tc_opts *ingress_opts,
+                bool ingress_attached, bpf_tc_opts *egress_opts,
+                bool egress_attached, __u32 ingress_program_id,
+                __u32 egress_program_id)
+{
+    detach_tc_filter_if_owned(hook, BPF_TC_INGRESS, ingress_opts,
+                              ingress_attached, ingress_program_id);
+    detach_tc_filter_if_owned(hook, BPF_TC_EGRESS, egress_opts,
+                              egress_attached, egress_program_id);
 }
 
 bool configure_port(bpf_object *obj, int port)
@@ -476,10 +530,21 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    __u32 ingress_program_id = 0;
+    __u32 egress_program_id = 0;
+    if (!read_program_id(bpf_program__fd(ingress_prog), &ingress_program_id,
+                         "ingress tc") ||
+        !read_program_id(bpf_program__fd(egress_prog), &egress_program_id,
+                         "egress tc")) {
+        bpf_object__close(obj);
+        return 1;
+    }
+
     bpf_tc_hook hook = {};
     bpf_tc_opts ingress_opts = {};
     bpf_tc_opts egress_opts = {};
-    bool destroy_clsact = false;
+    bool ingress_attached = false;
+    bool egress_attached = false;
 
     hook.sz = sizeof(hook);
     hook.ifindex = static_cast<int>(ifindex);
@@ -487,7 +552,6 @@ int main(int argc, char **argv)
         static_cast<decltype(hook.attach_point)>(BPF_TC_INGRESS | BPF_TC_EGRESS);
 
     err = bpf_tc_hook_create(&hook);
-    destroy_clsact = err == 0;
     if (err && err != -EEXIST) {
         std::cerr << "Failed to create clsact qdisc: " << strerror(-err) << "\n";
         bpf_object__close(obj);
@@ -507,30 +571,33 @@ int main(int argc, char **argv)
     egress_opts.priority = tc_plan.egress_priority;
 
     hook.attach_point = BPF_TC_INGRESS;
-    bpf_tc_detach(&hook, &ingress_opts);
     err = bpf_tc_attach(&hook, &ingress_opts);
     if (err) {
         std::cerr << "Failed to attach ingress program: " << strerror(-err) << "\n";
-        cleanup_tc(&hook, &ingress_opts, &egress_opts, destroy_clsact);
+        cleanup_tc(&hook, &ingress_opts, ingress_attached, &egress_opts,
+                   egress_attached, ingress_program_id, egress_program_id);
         bpf_object__close(obj);
         return 1;
     }
+    ingress_attached = true;
 
     hook.attach_point = BPF_TC_EGRESS;
-    bpf_tc_detach(&hook, &egress_opts);
     err = bpf_tc_attach(&hook, &egress_opts);
     if (err) {
         std::cerr << "Failed to attach egress program: " << strerror(-err) << "\n";
-        cleanup_tc(&hook, &ingress_opts, &egress_opts, destroy_clsact);
+        cleanup_tc(&hook, &ingress_opts, ingress_attached, &egress_opts,
+                   egress_attached, ingress_program_id, egress_program_id);
         bpf_object__close(obj);
         return 1;
     }
+    egress_attached = true;
 
     bpf_map *events_map = bpf_object__find_map_by_name(obj, "grpc_events");
     bpf_map *dropped_map = bpf_object__find_map_by_name(obj, "grpc_dropped_events");
     if (!events_map || !dropped_map) {
         std::cerr << "Failed to find grpc_events or grpc_dropped_events map\n";
-        cleanup_tc(&hook, &ingress_opts, &egress_opts, destroy_clsact);
+        cleanup_tc(&hook, &ingress_opts, ingress_attached, &egress_opts,
+                   egress_attached, ingress_program_id, egress_program_id);
         bpf_object__close(obj);
         return 1;
     }
@@ -544,7 +611,8 @@ int main(int argc, char **argv)
         ring_buffer__new(bpf_map__fd(events_map), handle_grpc_event, &state, nullptr);
     if (!ring) {
         std::cerr << "Failed to create ring buffer\n";
-        cleanup_tc(&hook, &ingress_opts, &egress_opts, destroy_clsact);
+        cleanup_tc(&hook, &ingress_opts, ingress_attached, &egress_opts,
+                   egress_attached, ingress_program_id, egress_program_id);
         bpf_object__close(obj);
         return 1;
     }
@@ -571,7 +639,8 @@ int main(int argc, char **argv)
 
     print_metrics(&state);
     ring_buffer__free(ring);
-    cleanup_tc(&hook, &ingress_opts, &egress_opts, destroy_clsact);
+    cleanup_tc(&hook, &ingress_opts, ingress_attached, &egress_opts,
+               egress_attached, ingress_program_id, egress_program_id);
     bpf_object__close(obj);
     return 0;
 }

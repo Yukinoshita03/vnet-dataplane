@@ -1,11 +1,17 @@
 import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from agent.openstack_dataplane_agent import (
+    AttachmentConfig,
     AgentError,
     Binding,
     OpenStackOvsResolver,
+    ProcessAttachmentDriver,
     Reconciler,
+    _ManagedAttachment,
 )
 
 
@@ -42,6 +48,11 @@ class FakeDriver:
 
     def snapshot(self):
         return {}
+
+
+class FakeProcess:
+    def __init__(self, name):
+        self.name = name
 
 
 def binding(ifindex=14, interface="tapport"):
@@ -220,6 +231,48 @@ class ReconcilerTest(unittest.TestCase):
 
         self.assertEqual([event.reason for event in events],
                          ["monitor_unhealthy", "binding_local"])
+
+
+class ProcessAttachmentDriverTest(unittest.TestCase):
+    def test_detach_never_executes_slot_based_hook_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dns_monitor = root / "dns_monitor"
+            dns_bpf = root / "dns.bpf.o"
+            grpc_monitor = root / "grpc_monitor"
+            grpc_bpf = root / "grpc.bpf.o"
+            for path in (dns_monitor, dns_bpf, grpc_monitor, grpc_bpf):
+                path.touch()
+            config = AttachmentConfig(
+                dns_monitor=dns_monitor,
+                dns_bpf=dns_bpf,
+                grpc_monitor=grpc_monitor,
+                grpc_bpf=grpc_bpf,
+                trusted_dns="10.0.0.53",
+                grpc_port=50052,
+                pin_root=root / "bpffs" / "agent",
+                log_root=root / "logs",
+            )
+            driver = ProcessAttachmentDriver(config)
+            current = binding()
+            port_pin = driver._port_path(config.pin_root, current.port_id)
+            port_pin.mkdir(parents=True)
+            dns_process = FakeProcess("dns")
+            grpc_process = FakeProcess("grpc")
+            driver._managed[current.port_id] = _ManagedAttachment(
+                binding=current,
+                dns_process=dns_process,
+                grpc_process=grpc_process,
+            )
+            stopped = []
+            driver._stop = lambda process: stopped.append(process.name)
+
+            with patch("agent.openstack_dataplane_agent.subprocess.run") as run:
+                driver.detach(current)
+
+            self.assertEqual(stopped, ["grpc", "dns"])
+            run.assert_not_called()
+            self.assertFalse(port_pin.exists())
 
 
 if __name__ == "__main__":

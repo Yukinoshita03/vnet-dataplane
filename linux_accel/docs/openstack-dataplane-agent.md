@@ -9,7 +9,8 @@
 Agent 只暴露两个命令：
 
 - `discover`：只读输出 `server -> port -> host -> interface -> ifindex` JSON。
-- `watch`：周期执行 reconcile，拥有 monitor 进程并在退出时清理自己的 hook。
+- `watch`：周期执行 reconcile，拥有 monitor 进程，并由 monitor 按程序 ID 清理自己的
+  hook。
 
 实现内部使用三层信息，不根据 UUID 前缀猜 tap 名称：
 
@@ -44,8 +45,16 @@ binding 迁入本机且接口就绪
 看到端口离开后卸载，目标端 Agent 看到端口和 OVS 接口出现后重挂载。接口名称
 相同但 ifindex 变化也会触发重挂载。
 
-Agent 只删除自己使用的 TC pref 1 handle `0x1/0x2` 和自己的 XDP/pin 路径，
-不会删除 clsact，也不会删除 NetMig 的 `0x65/0x66`。
+Agent 不会按固定 TC slot 执行 `tc filter del`，也不会执行 `ip link ... xdp off`。
+它先结束自己启动的 monitor；monitor 在退出前查询当前 TC/XDP 程序 ID，仅在 ID
+仍与本次 attach 一致时才卸载。ID 不匹配或查询失败时保留现状并记录错误。Agent
+从不销毁 `clsact`，也不会删除 NetMig 的 `0x65/0x66`。
+
+DNS XDP 退出使用内核的 `old_prog_fd` 条件校验，避免查询后再卸载的替换窗口。当前
+legacy `bpf_tc_*` API 的 detach 只能按 `priority + handle` 删除，无法把 program ID
+作为内核原子前置条件；现有 readback guard 会在普通所有权变化时 fail-closed，但不能
+把非协作外部控制器的极小并发替换窗口描述为原子安全。P1 将在支持的内核上引入 TCX
+BPF link 生命周期，或在无法安全恢复时显式进入 `BYPASS`。
 
 ## 只读发现
 
@@ -64,7 +73,9 @@ python3 agent/openstack_dataplane_agent.py discover \
   --local-host "$(hostname -s)"
 ```
 
-2026-07-30 的 Shuka1 只读验证得到：
+下列是 2026-07-30 较早时点的历史只读验证；ifindex 随迁移、重挂载和设备重建变化，
+不应作为当前值使用。P0 发布时点的 `tap2200c160-c0` 为 ifindex `29`，见
+`docs/v0.3-openstack-e2e-release-manifest.md`：
 
 ```text
 server 5d983776-e49c-4320-b038-f720df01ace6
@@ -92,8 +103,9 @@ python3 agent/openstack_dataplane_agent.py watch \
 `/sys/fs/bpf/vnet-dataplane-agent`。状态文件使用临时文件加 `os.replace`
 原子更新。审计日志记录 attach、detach、等待、失败和原因。
 
-`SIGINT` 或 `SIGTERM` 会触发严格清理。monitor 异常退出时，下一个 reconcile
-周期会先清理旧 hook，再启动新进程。
+`SIGINT` 或 `SIGTERM` 会请求 monitor 进行严格的所有权校验清理。monitor 异常退出
+时，下一个 reconcile 周期不会盲删旧 slot，而是重新启动并让新的 attach 失败关闭；
+P1 将把这类残留转为显式 `BYPASS` 和可恢复状态。
 
 ## 验证
 
@@ -162,4 +174,8 @@ master: tap2200c160-c0 / ifindex 29
 迁移结束时实例和 Neutron 端口均为 `ACTIVE`。停止两端 Agent 后再次验收：
 Agent/monitor 进程、Agent pin、XDP 和 TC `0x1/0x2` 均无残留，
 NetMig `0x65/0x66` 保留。因此 `master -> compute2 -> master` 往返迁移、
-重挂载与双端清理已经完成。
+重挂载与双端清理有历史手工执行证据。
+
+这不等同于 P1 的自动闭环验收：当前版本尚无 systemd 部署、多 Neutron 端口健康 API、
+双端健康后 epoch 发布、迁移冻结/恢复及异常残留的 `BYPASS` 收敛。这些条件完成前，
+不得把上述历史记录写成无人干预的持续控制成功。

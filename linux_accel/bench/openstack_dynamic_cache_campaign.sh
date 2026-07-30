@@ -196,7 +196,6 @@ stop_monitors() {
        done
        sudo -n kill -KILL "$pid" 2>/dev/null || true
      done
-     sudo -n ip link set dev ens3 xdp off 2>/dev/null || true
      rm -f /tmp/vnet-dynamic-grpc-server.pid
      rm -f /tmp/vnet-dynamic-dns-monitor.pid' >/dev/null 2>&1 || true
   if [[ -n "${active_label}" ]]; then
@@ -210,15 +209,6 @@ stop_monitors() {
       'cat /tmp/vnet-dynamic-dns-monitor.log 2>/dev/null || true' \
       >"${out_dir}/monitors/${active_label}.dns-server.log" 2>&1 || true
   fi
-  sudo_cmd ip link set dev "${client_tap}" xdp off >/dev/null 2>&1 || true
-  sudo_cmd tc filter del dev "${client_tap}" ingress pref 1 handle 1 bpf \
-    >/dev/null 2>&1 || true
-  sudo_cmd tc filter del dev "${client_tap}" egress pref 1 handle 1 bpf \
-    >/dev/null 2>&1 || true
-  sudo_cmd tc filter del dev "${client_tap}" ingress pref 1 handle 2 bpf \
-    >/dev/null 2>&1 || true
-  sudo_cmd tc filter del dev "${client_tap}" egress pref 1 handle 2 bpf \
-    >/dev/null 2>&1 || true
   active_label=""
 }
 
@@ -263,7 +253,6 @@ cleanup() {
      rm -f /tmp/vnet-dynamic-*.pid'
   guest_cmd "${backend_ip}" \
     'sudo -n killall -q openstack_dns_harness openstack_grpc_harness grpc_fast_cache dns_monitor 2>/dev/null || true
-     sudo -n ip link set dev ens3 xdp off 2>/dev/null || true
      sudo -n rm -rf -- /sys/fs/bpf/vnet-dynamic-server /sys/fs/bpf/vnet-dynamic-grpc-server
      rm -f /tmp/openstack_dns_harness /tmp/openstack_grpc_harness
      rm -f /tmp/grpc_fast_cache /tmp/cachectl /tmp/dns_monitor

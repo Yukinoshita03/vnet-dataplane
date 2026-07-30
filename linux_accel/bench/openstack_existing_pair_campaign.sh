@@ -91,15 +91,6 @@ stop_monitors() {
         grpc_pid=
     fi
     sleep 1
-    sudo_cmd tc filter del dev "$client_tap" ingress pref 1 handle 1 bpf \
-        >/dev/null 2>&1 || true
-    sudo_cmd tc filter del dev "$client_tap" egress pref 1 handle 1 bpf \
-        >/dev/null 2>&1 || true
-    sudo_cmd tc filter del dev "$client_tap" ingress pref 1 handle 2 bpf \
-        >/dev/null 2>&1 || true
-    sudo_cmd tc filter del dev "$client_tap" egress pref 1 handle 2 bpf \
-        >/dev/null 2>&1 || true
-    sudo_cmd ip link set dev "$client_tap" xdp off >/dev/null 2>&1 || true
 }
 
 cleanup() {

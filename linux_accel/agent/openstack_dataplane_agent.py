@@ -223,7 +223,6 @@ class ProcessAttachmentDriver:
             )
         except Exception:
             self._stop(dns_process)
-            self._cleanup_hooks(binding)
             self._remove_pin_tree(port_pin)
             self._remove_empty_pin_root()
             raise
@@ -232,7 +231,6 @@ class ProcessAttachmentDriver:
         if dns_process.poll() is not None or grpc_process.poll() is not None:
             self._stop(grpc_process)
             self._stop(dns_process)
-            self._cleanup_hooks(binding)
             self._remove_pin_tree(port_pin)
             self._remove_empty_pin_root()
             raise AgentError(
@@ -249,7 +247,6 @@ class ProcessAttachmentDriver:
         if managed is not None:
             self._stop(managed.grpc_process)
             self._stop(managed.dns_process)
-        self._cleanup_hooks(binding)
         self._remove_pin_tree(
             self._port_path(self._config.pin_root, binding.port_id)
         )
@@ -375,50 +372,6 @@ class ProcessAttachmentDriver:
             pass
         except OSError:
             pass
-
-    @staticmethod
-    def _cleanup_hooks(binding: Binding) -> None:
-        for direction in ("ingress", "egress"):
-            for handle in ("1", "2"):
-                subprocess.run(
-                    [
-                        "tc",
-                        "filter",
-                        "del",
-                        "dev",
-                        binding.interface,
-                        direction,
-                        "pref",
-                        "1",
-                        "handle",
-                        handle,
-                        "bpf",
-                    ],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-        subprocess.run(
-            ["ip", "link", "set", "dev", binding.interface, "xdp", "off"],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        for direction in ("ingress", "egress"):
-            result = subprocess.run(
-                ["tc", "filter", "show", "dev", binding.interface, direction],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                continue
-            if "handle 0x1 " in result.stdout or "handle 0x2 " in result.stdout:
-                raise AgentError(
-                    f"owned TC filters remain on "
-                    f"{binding.interface}/{direction}"
-                )
-
 
 @dataclass
 class ReconcileEvent:

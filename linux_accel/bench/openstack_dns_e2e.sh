@@ -182,18 +182,64 @@ backend_count() {
     guest_cmd "$backend_ssh_ip" "test -s /tmp/dns-backend-count && tail -n 1 /tmp/dns-backend-count | tr -d '[:space:]' || printf 0"
 }
 
+stop_host_monitor() {
+    local pid=$1
+    [[ -n "$pid" ]] || return 0
+    [[ "$pid" =~ ^[0-9]+$ ]] || {
+        echo "invalid monitor pid: $pid" >&2
+        return 1
+    }
+    # Monitors are started under setsid, so stop their private process group
+    # before falling back to the wrapper PID.
+    sudo_cmd kill -TERM -- "-$pid" >/dev/null 2>&1 || \
+        sudo_cmd kill -TERM "$pid" >/dev/null 2>&1 || true
+    for _ in $(seq 1 50); do
+        sudo_cmd kill -0 "$pid" >/dev/null 2>&1 || return 0
+        sleep 0.1
+    done
+    echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
+    sudo_cmd kill -KILL -- "-$pid" >/dev/null 2>&1 || \
+        sudo_cmd kill -KILL "$pid" >/dev/null 2>&1 || true
+}
+
 stop_guest_processes() {
     if [[ -n "$client_host_monitor_pid" ]]; then
-        sudo_cmd kill -TERM "$client_host_monitor_pid" >/dev/null 2>&1 || true
-        sleep 1
-        sudo_cmd kill -KILL "$client_host_monitor_pid" >/dev/null 2>&1 || true
+        stop_host_monitor "$client_host_monitor_pid"
         client_host_monitor_pid=
     fi
-    if [[ -n "$client_tap_if" ]]; then
-        host_root_cmd "tc filter del dev '$client_tap_if' ingress pref 1 handle 1 bpf 2>/dev/null || true; tc filter del dev '$client_tap_if' egress pref 1 handle 1 bpf 2>/dev/null || true" || true
+    guest_root_cmd "$backend_ssh_ip" 'stop_pid_file() {
+        [ -s "$1" ] || return 0
+        pid="$(cat "$1")"
+        case "$pid" in
+            *[!0-9]*|"") echo "invalid monitor pid: $pid" >&2; return 1 ;;
+        esac
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for i in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    }
+    stop_pid_file /tmp/dns-backend.pid
+    stop_pid_file /tmp/dns-server-monitor.pid
+    rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count' || true
+    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then
+        pid="$(cat /tmp/dns-client-monitor.pid)"
+        case "$pid" in
+            *[!0-9]*|"") echo "invalid monitor pid: $pid" >&2; return 1 ;;
+        esac
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for i in $(seq 1 50); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "monitor pid $pid did not stop gracefully; refusing blind hook cleanup" >&2
+            kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        fi
     fi
-    guest_root_cmd "$backend_ssh_ip" 'for f in /tmp/dns-backend.pid /tmp/dns-server-monitor.pid; do if [ -s "$f" ]; then kill -TERM "$(cat "$f")" 2>/dev/null || true; fi; done; fuser -k -TERM 53/udp 2>/dev/null || true; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; fuser -k -KILL 53/udp 2>/dev/null || true; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-backend.pid /tmp/dns-server-monitor.pid /tmp/dns-backend-count; true' || true
-    guest_root_cmd "$client_ssh_ip" 'if [ -s /tmp/dns-client-monitor.pid ]; then kill -TERM "$(cat /tmp/dns-client-monitor.pid)" 2>/dev/null || true; fi; pkill -TERM -x dns_monitor 2>/dev/null || true; sleep 1; pkill -KILL -x dns_monitor 2>/dev/null || true; ip link set dev ens3 xdp off 2>/dev/null || true; tc qdisc del dev ens3 clsact 2>/dev/null || true; rm -f /tmp/dns-client-monitor.pid; true' || true
+    rm -f /tmp/dns-client-monitor.pid' || true
 }
 
 cleanup() {
@@ -526,8 +572,8 @@ run_safety_checks() {
 }
 
 printf '# OpenStack DNS Dual-End Cache E2E\n\n' > "$out_dir/summary.md"
-printf 'mode=guest-ebpf\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
-    "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
+printf 'mode=%s\nguest_bpf_requested=%s\nnetns=%s\nimage=%s\nflavor=%s\nnetwork=%s\nrequests=%s\nwarmup=%s\nrepeat=%s\n' \
+    "$client_cache_mode" "$guest_bpf" "${netns:-none}" "$image" "$flavor" "$network" "$requests" "$warmup" "$repeat" > "$out_dir/environment.md"
 printf 'backend_interface=%s\nclient_interface=%s\nclient_tap=%s\nclient_cache_mode=%s\n' \
     "$backend_dev" "$client_dev" "$client_tap_if" "$client_cache_mode" >> "$out_dir/environment.md"
 

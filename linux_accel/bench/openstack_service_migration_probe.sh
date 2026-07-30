@@ -96,7 +96,7 @@ collect_probe_logs() {
 cleanup_guests() {
     stop_probes
     guest_cmd "$backend_ip" \
-        'sudo -n killall -q dns_monitor openstack_grpc_harness grpc_fast_cache 2>/dev/null || true; sudo -n ip link set dev ens3 xdp off 2>/dev/null || true; sudo -n rm -rf /sys/fs/bpf/vnet-migration-grpc; rm -f /tmp/dns_monitor /tmp/dns_xdp_monitor.bpf.o /tmp/openstack_grpc_harness /tmp/grpc_fast_cache /tmp/cachectl /tmp/vnet-migration-policy.txt'
+        'sudo -n killall -q dns_monitor openstack_grpc_harness grpc_fast_cache 2>/dev/null || true; sudo -n rm -rf /sys/fs/bpf/vnet-migration-grpc; rm -f /tmp/dns_monitor /tmp/dns_xdp_monitor.bpf.o /tmp/openstack_grpc_harness /tmp/grpc_fast_cache /tmp/cachectl /tmp/vnet-migration-policy.txt'
     guest_cmd "$client_ip" \
         'rm -f /tmp/openstack_dns_harness /tmp/openstack_grpc_harness /tmp/vnet-mig-dns.pid /tmp/vnet-mig-grpc.pid /tmp/vnet-mig-dns.log /tmp/vnet-mig-grpc.log'
 }
@@ -146,7 +146,6 @@ copy_guest "$backend_ip" "$cachectl" /tmp/cachectl
 
 guest_cmd "$backend_ip" \
     "sudo -n killall -q dns_monitor openstack_grpc_harness grpc_fast_cache 2>/dev/null || true
-sudo -n ip link set dev ens3 xdp off 2>/dev/null || true
 sudo -n mkdir -p /sys/fs/bpf
 mountpoint -q /sys/fs/bpf || sudo -n mount -t bpf bpf /sys/fs/bpf
 sudo -n rm -rf $pin_dir

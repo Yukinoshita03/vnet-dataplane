@@ -108,3 +108,10 @@ summary，结尾清理文件为 `cleanup_status=0`，后台进程退出；本结
 本次原始 `windows.csv` 的 `mode/epoch` 是窗口结束后决策发布的状态。正式结果
 根据决策流还原了产生窗口数据的实际模式。脚本现已拆分为
 `applied_mode/epoch` 和 `next_mode/epoch`，后续运行不再存在该标签歧义。
+
+## 发布边界
+
+本批 `ae5be57` 证据记录的是 controller `--dry-run` 决策后，由 campaign 顺序写入
+三个位置的 map；它证明五类负载的性能和各次串行发布日志，不证明跨主机原子提交。
+P1 的多端健康门禁、prepare/readback/commit、迁移冻结和失败 `BYPASS` 尚未由本批
+结果覆盖。
