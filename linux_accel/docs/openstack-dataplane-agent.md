@@ -226,6 +226,13 @@ commit 后和 committed 回读后重新检查拓扑；commit 中途拓扑变化�
 `force-bypass`。本地 publisher 优先执行，SSH publisher 同阶段并发执行，因此多个
 失联主机的 timeout 不会按主机数串行累加；记录仍按配置顺序输出。
 
+同一个 compute actor 可以为 `master`、`compute2` 等候选宿主分别配置 publisher。
+加速模式只选择与健康 Neutron binding 主机一致的唯一 compute publisher；Guest
+publisher 始终参与。`read-current` 与故障 `force-bypass` 仍覆盖全部候选，防止旧宿主
+残留 epoch。publisher 计划固定后，协调器在 map 初始回读、stage、commit、最终回读后
+重复比较 `server + port + host + interface + ifindex` 拓扑指纹；指纹变化不得走
+`policy_unchanged` 或成功发布路径，而是发布或尝试恢复 `BYPASS`。
+
 `desired-policy.json` 是当前策略输入边界。静态部署可以直接写四态模式；动态部署由
 metrics bridge 原子替换该文件，不能绕过 coordinator 直接写远端 map。
 
@@ -372,8 +379,12 @@ Agent/monitor 进程、Agent pin、XDP 和 TC `0x1/0x2` 均无残留，
 NetMig `0x65/0x66` 保留。因此 `master -> compute2 -> master` 往返迁移、
 重挂载与双端清理有历史手工执行证据。
 
-当前工作树已经完成一次固定在 `master` 的真实 systemd DNS/gRPC 自动闭环 smoke：
-两个 Neutron 端口同时健康、动态策略发布 `BYPASS -> SERVER_CACHE -> BYPASS`，
-DNS guest XDP 与 gRPC guest userspace fast-cache 各命中 50 次，最终清理和 NetMig
-共存检查通过。该结果仍不等同于无人干预的迁移闭环；`master -> compute2 -> master`
-期间的 freeze、目标端重挂载、恢复发布、故障注入和请求连续性仍需真实验收。
+当前工作树还在 `master`、`compute2` 同时部署相同端点配置，完成了固定在 `master`
+的多宿主 systemd 补充验收。master 为 client DNS、client gRPC 和 backend gRPC
+observer 建立三个互不相同的 runtime map；compute2 发布 schema 3、一致且无 attachment
+的 idle 快照。真实 `systemctl stop` 后，两端 Agent 自有 pin、quiesce、进程和 hook 均
+消失，NetMig `0x65/0x66` 身份不变。随后动态策略发布
+`BYPASS -> SERVER_CACHE -> BYPASS`，DNS guest XDP 与 gRPC guest userspace fast-cache
+各命中 50 次并再次完整清理。该结果仍不等同于无人干预的迁移闭环；
+`master -> compute2 -> master` 期间的 freeze、目标端重挂载、恢复发布、故障注入和
+请求连续性仍需真实验收。

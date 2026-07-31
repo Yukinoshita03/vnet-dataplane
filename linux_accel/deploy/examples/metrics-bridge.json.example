@@ -94,6 +94,42 @@
       ]
     },
     {
+      "name": "master-grpc-observer-monitor",
+      "kind": "grpc_metrics",
+      "role": "server",
+      "error_authoritative": false,
+      "path": "/var/log/vnet-dataplane-agent/REPLACE_SERVER_PORT/grpc-REPLACE_MASTER_BACKEND_TAP.log"
+    },
+    {
+      "name": "compute2-grpc-observer-monitor",
+      "kind": "grpc_metrics",
+      "role": "server",
+      "error_authoritative": false,
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "-o",
+        "ConnectTimeout=3",
+        "REPLACE_COMPUTE2_HOST",
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/python3",
+        "/opt/vnet-dataplane/linux_accel/agent/openstack_metrics_bridge.py",
+        "snapshot-log",
+        "--path",
+        "/var/log/vnet-dataplane-agent/REPLACE_SERVER_PORT/grpc-REPLACE_COMPUTE2_BACKEND_TAP.log",
+        "--max-bytes",
+        "262144"
+      ]
+    },
+    {
       "name": "server-guest-dns-cache",
       "kind": "dns_metrics",
       "role": "server",

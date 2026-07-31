@@ -704,7 +704,7 @@ class ConfigAndSnapshotTests(unittest.TestCase):
         text = example.read_text(encoding="utf-8")
         self.assertNotIn("password", text.lower())
         loaded = bridge.load_config(example)
-        self.assertEqual(len(loaded.sources), 7)
+        self.assertEqual(len(loaded.sources), 9)
         self.assertIn("master", text)
         self.assertIn("compute2", text)
         self.assertIn("CLIENT_GUEST", text)
@@ -720,7 +720,7 @@ class ConfigAndSnapshotTests(unittest.TestCase):
             loaded.controller_mode_file, loaded.desired_mode_file
         )
         remote_sources = [source for source in loaded.sources if source.command]
-        self.assertEqual(len(remote_sources), 5)
+        self.assertEqual(len(remote_sources), 6)
         grpc_observers = [
             source
             for source in loaded.sources

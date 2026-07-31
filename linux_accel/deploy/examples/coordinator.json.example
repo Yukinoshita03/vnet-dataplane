@@ -182,6 +182,64 @@
       ]
     },
     {
+      "name": "master-grpc-observer",
+      "host": "master",
+      "server_id": "REPLACE_BACKEND_SERVER_UUID",
+      "port_id": "REPLACE_BACKEND_PORT_UUID",
+      "actor_id": "grpc-backend-observer",
+      "target_kind": "compute_port",
+      "cache_role": "server",
+      "services": [
+        "grpc"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-agent/REPLACE_BACKEND_PORT_UUID/grpc/cache_runtime_control"
+      ]
+    },
+    {
+      "name": "compute2-grpc-observer",
+      "host": "compute2",
+      "server_id": "REPLACE_BACKEND_SERVER_UUID",
+      "port_id": "REPLACE_BACKEND_PORT_UUID",
+      "actor_id": "grpc-backend-observer",
+      "target_kind": "compute_port",
+      "cache_role": "server",
+      "services": [
+        "grpc"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "compute2",
+        "/usr/bin/sudo",
+        "-n",
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-agent/REPLACE_BACKEND_PORT_UUID/grpc/cache_runtime_control"
+      ]
+    },
+    {
       "name": "backend-guest-caches",
       "host": "REPLACE_BACKEND_GUEST_SSH_HOST",
       "server_id": "REPLACE_BACKEND_SERVER_UUID",

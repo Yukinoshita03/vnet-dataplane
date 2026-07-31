@@ -328,6 +328,23 @@ class EpochCoordinator:
         observed = self._read_current_all(gate)
         publications.extend(observed.records)
         map_readbacks = observed.readbacks
+        if gate.action is GateAction.PUBLISH:
+            post_readback_gate = self._read_gate(now_ms)
+            if (
+                post_readback_gate.action is GateAction.PUBLISH
+                and self._topology_fingerprint(post_readback_gate)
+                == self._topology_fingerprint(gate)
+            ):
+                gate = post_readback_gate
+            else:
+                if post_readback_gate.action is GateAction.PUBLISH:
+                    gate = bypass_decision(
+                        self._config.required_endpoints,
+                        "topology_changed_during_map_readback",
+                    )
+                else:
+                    gate = post_readback_gate
+                force_bypass_epoch = True
         previous = observed.state
         if not previous.known:
             previous = RuntimeState(
@@ -495,6 +512,15 @@ class EpochCoordinator:
         confirmed = self._read_current_all(gate)
         publications.extend(confirmed.records)
         map_readbacks = confirmed.readbacks
+        if transaction_gate_valid and effective != "bypass":
+            confirmation_gate = self._read_gate(now_ms)
+            if (
+                confirmation_gate.action is not GateAction.PUBLISH
+                or self._topology_fingerprint(confirmation_gate)
+                != self._topology_fingerprint(gate)
+            ):
+                transaction_gate_valid = False
+            gate = confirmation_gate
         if transaction_gate_valid and _all_succeeded(attempted) and _is_confirmed(
             confirmed, effective, exact_epoch=next_epoch
         ):
@@ -718,35 +744,117 @@ class EpochCoordinator:
         now_ms: int | None,
     ) -> tuple[list[PublishRecord], GateDecision, bool]:
         records: list[PublishRecord] = []
+        publishers: Sequence[PublisherEndpoint] = self._config.publishers
+        topology_fingerprint: tuple[tuple[str, str, str, str, int], ...] = ()
+        if mode != "bypass":
+            try:
+                publishers = self._acceleration_publishers(gate)
+                topology_fingerprint = self._topology_fingerprint(gate)
+            except CoordinatorError as error:
+                return (
+                    records,
+                    bypass_decision(
+                        self._config.required_endpoints,
+                        f"publisher_plan_error:{error}",
+                    ),
+                    False,
+                )
         for operation in ("stage", "verify-staged"):
-            phase = self._invoke_all(operation, mode, epoch)
+            phase = self._invoke_all(operation, mode, epoch, publishers)
             records.extend(phase)
             if not _all_succeeded(phase):
                 return records, gate, True
 
         if mode != "bypass":
             gate = self._read_gate(now_ms)
-            if gate.action is not GateAction.PUBLISH:
+            if (
+                gate.action is not GateAction.PUBLISH
+                or self._topology_fingerprint(gate) != topology_fingerprint
+            ):
                 return records, gate, False
 
-        phase = self._invoke_all("commit", mode, epoch)
+        phase = self._invoke_all("commit", mode, epoch, publishers)
         records.extend(phase)
         if not _all_succeeded(phase):
             return records, gate, True
         if mode != "bypass":
             gate = self._read_gate(now_ms)
-            if gate.action is not GateAction.PUBLISH:
+            if (
+                gate.action is not GateAction.PUBLISH
+                or self._topology_fingerprint(gate) != topology_fingerprint
+            ):
                 return records, gate, False
 
-        phase = self._invoke_all("verify-committed", mode, epoch)
+        phase = self._invoke_all(
+            "verify-committed", mode, epoch, publishers
+        )
         records.extend(phase)
         if not _all_succeeded(phase):
             return records, gate, True
         if mode != "bypass":
             gate = self._read_gate(now_ms)
-            if gate.action is not GateAction.PUBLISH:
+            if (
+                gate.action is not GateAction.PUBLISH
+                or self._topology_fingerprint(gate) != topology_fingerprint
+            ):
                 return records, gate, False
         return records, gate, True
+
+    @staticmethod
+    def _topology_fingerprint(
+        gate: GateDecision,
+    ) -> tuple[tuple[str, str, str, str, int], ...]:
+        return tuple(
+            sorted(
+                (
+                    item.server_id,
+                    item.port_id,
+                    _short_host(item.local_host),
+                    item.interface,
+                    item.ifindex,
+                )
+                for item in gate.healthy_observations
+            )
+        )
+
+    def _acceleration_publishers(
+        self, gate: GateDecision
+    ) -> tuple[PublisherEndpoint, ...]:
+        if gate.action is not GateAction.PUBLISH:
+            raise CoordinatorError("accelerated publication requires a healthy gate")
+        healthy_hosts = {
+            (item.server_id, item.port_id): _short_host(item.local_host)
+            for item in gate.healthy_observations
+        }
+        by_actor: dict[str, list[PublisherEndpoint]] = {}
+        for publisher in self._config.publishers:
+            by_actor.setdefault(publisher.actor_id, []).append(publisher)
+
+        selected_names: set[str] = set()
+        for actor_id, candidates in by_actor.items():
+            contract = candidates[0]
+            if contract.target_kind == "guest_endpoint":
+                selected_names.update(item.name for item in candidates)
+                continue
+            expected_host = healthy_hosts.get(
+                (contract.server_id, contract.port_id)
+            )
+            matching = [
+                item
+                for item in candidates
+                if _short_host(item.host) == expected_host
+            ]
+            if expected_host is None or len(matching) != 1:
+                raise CoordinatorError(
+                    f"compute actor has no unique publisher for healthy host: "
+                    f"{actor_id}:{expected_host}:{len(matching)}"
+                )
+            selected_names.add(matching[0].name)
+        return tuple(
+            item
+            for item in self._config.publishers
+            if item.name in selected_names
+        )
 
     def _force_bypass_all(self, epoch: int) -> list[PublishRecord]:
         return self._invoke_all("force-bypass", "bypass", epoch)
@@ -760,11 +868,15 @@ class EpochCoordinator:
         return observed, records
 
     def _invoke_all(
-        self, operation: str, mode: str, epoch: int
+        self,
+        operation: str,
+        mode: str,
+        epoch: int,
+        publishers: Sequence[PublisherEndpoint] | None = None,
     ) -> list[PublishRecord]:
         records: list[PublishRecord] = []
         for endpoint, result in self._run_publisher_commands(
-            operation, mode, epoch
+            operation, mode, epoch, publishers
         ):
             if isinstance(result, (OSError, subprocess.TimeoutExpired)):
                 records.append(
@@ -965,7 +1077,11 @@ class EpochCoordinator:
         )
 
     def _run_publisher_commands(
-        self, operation: str, mode: str, epoch: int
+        self,
+        operation: str,
+        mode: str,
+        epoch: int,
+        publishers: Sequence[PublisherEndpoint] | None = None,
     ) -> list[
         tuple[
             PublisherEndpoint,
@@ -991,11 +1107,14 @@ class EpochCoordinator:
             except (OSError, subprocess.TimeoutExpired) as error:
                 return error
 
+        selected = tuple(
+            self._config.publishers if publishers is None else publishers
+        )
         results: list[
             CommandResult | OSError | subprocess.TimeoutExpired | None
-        ] = [None] * len(self._config.publishers)
+        ] = [None] * len(selected)
         remote_indexes: list[int] = []
-        for index, endpoint in enumerate(self._config.publishers):
+        for index, endpoint in enumerate(selected):
             if (
                 endpoint.command
                 and PurePosixPath(endpoint.command[0]).name.lower() == "ssh"
@@ -1007,9 +1126,7 @@ class EpochCoordinator:
         if remote_indexes:
             with ThreadPoolExecutor(max_workers=len(remote_indexes)) as executor:
                 futures = {
-                    index: executor.submit(
-                        invoke, self._config.publishers[index]
-                    )
+                    index: executor.submit(invoke, selected[index])
                     for index in remote_indexes
                 }
                 for index in remote_indexes:
@@ -1021,7 +1138,7 @@ class EpochCoordinator:
                 CommandResult | OSError | subprocess.TimeoutExpired,
             ]
         ] = []
-        for endpoint, result in zip(self._config.publishers, results):
+        for endpoint, result in zip(selected, results):
             if result is None:
                 raise AssertionError("publisher command result is missing")
             ordered.append((endpoint, result))
@@ -1198,13 +1315,14 @@ def load_config(path: Path) -> CoordinatorConfig:
             )
         required_endpoint = required_by_key[(server_id, port_id)]
         if target_kind == "compute_port":
-            if (
-                required_endpoint.compute_role != "client"
-                or cache_role != "client"
-            ):
+            expected_cache_role = {
+                "client": "client",
+                "observer": "server",
+            }.get(required_endpoint.compute_role)
+            if cache_role != expected_cache_role:
                 raise CoordinatorError(
-                    f"publisher {name} compute_port target must be the "
-                    "client cache endpoint"
+                    f"publisher {name} compute_port cache_role does not "
+                    "match the required compute role"
                 )
         elif cache_role != required_endpoint.guest_cache_role:
             raise CoordinatorError(

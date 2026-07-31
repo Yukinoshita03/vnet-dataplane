@@ -39,6 +39,7 @@ class FakeRunner:
             "publisher-a": {"epoch": 0, "mode": 0, "flags": 0},
             "publisher-b": {"epoch": 0, "mode": 0, "flags": 0},
         }
+        self.map_counts = {"publisher-a": 2, "publisher-b": 2}
 
     def run(self, args, timeout_seconds):
         command = tuple(args)
@@ -65,7 +66,7 @@ class FakeRunner:
                 value = {
                     "schema_version": 1,
                     "present": True,
-                    "maps": 2,
+                    "maps": self.map_counts.get(endpoint, 2),
                     **current,
                 }
             return CommandResult(0, stdout=json.dumps(value))
@@ -197,7 +198,20 @@ def write_snapshot(
     ifindex=14,
     binding_host="compute2",
     revision_number=7,
+    accel_role="client",
 ):
+    dns_capability = (
+        "xdp_client_cache" if accel_role == "client" else "tc_observability"
+    )
+    guest_grpc_listen_port = 50053 if accel_role == "client" else 50052
+    endpoint_config = {
+        "server_id": SERVER_ID,
+        "accel_role": accel_role,
+        "grpc_observe_port": 50052,
+        "guest_grpc_listen_port": guest_grpc_listen_port,
+    }
+    if accel_role == "client":
+        endpoint_config["trusted_dns"] = ["10.0.0.12"]
     port_health = []
     if state is not None:
         port_health.append(
@@ -205,10 +219,10 @@ def write_snapshot(
                 "port_id": PORT_ID,
                 "state": state,
                 "reason": "test_state",
-                "accel_role": "client",
+                "accel_role": accel_role,
                 "grpc_observe_port": 50052,
-                "guest_grpc_listen_port": 50053,
-                "dns_capability": "xdp_client_cache",
+                "guest_grpc_listen_port": guest_grpc_listen_port,
+                "dns_capability": dns_capability,
                 "grpc_capability": "tc_observability",
                 "binding": {
                     "server_id": SERVER_ID,
@@ -216,10 +230,10 @@ def write_snapshot(
                     "host": host,
                     "interface": "tap-test",
                     "ifindex": ifindex,
-                    "accel_role": "client",
+                    "accel_role": accel_role,
                     "grpc_observe_port": 50052,
-                    "guest_grpc_listen_port": 50053,
-                    "dns_capability": "xdp_client_cache",
+                    "guest_grpc_listen_port": guest_grpc_listen_port,
+                    "dns_capability": dns_capability,
                     "grpc_capability": "tc_observability",
                 },
             }
@@ -230,15 +244,7 @@ def write_snapshot(
                 "schema_version": 3,
                 "local_host": host,
                 "updated_ms": updated_ms,
-                "endpoint_config": [
-                    {
-                        "server_id": SERVER_ID,
-                        "accel_role": "client",
-                        "grpc_observe_port": 50052,
-                        "guest_grpc_listen_port": 50053,
-                        "trusted_dns": ["10.0.0.12"],
-                    }
-                ],
+                "endpoint_config": [endpoint_config],
                 "grpc_capability": "tc_observability",
                 "port_health": port_health,
                 "port_inventory": [
@@ -373,6 +379,48 @@ def test_config(master_state, compute_state):
     )
 
 
+def observer_compute_config(master_state, compute_state):
+    return CoordinatorConfig(
+        required_endpoints=(
+            RequiredEndpoint(
+                SERVER_ID,
+                PORT_ID,
+                compute_role="observer",
+            ),
+        ),
+        state_sources=(
+            StateSource("master-state", path=master_state),
+            StateSource("compute2-state", path=compute_state),
+        ),
+        publishers=(
+            PublisherEndpoint(
+                "master-backend",
+                "master",
+                SERVER_ID,
+                PORT_ID,
+                ("master-backend",),
+                actor_id="backend-host-caches",
+                target_kind="compute_port",
+                services=("grpc",),
+                cache_role="server",
+            ),
+            PublisherEndpoint(
+                "compute2-backend",
+                "compute2",
+                SERVER_ID,
+                PORT_ID,
+                ("compute2-backend",),
+                actor_id="backend-host-caches",
+                target_kind="compute_port",
+                services=("grpc",),
+                cache_role="server",
+            ),
+        ),
+        max_state_age_ms=10_000,
+        command_timeout_seconds=3.0,
+    )
+
+
 class EpochCoordinatorTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -430,6 +478,479 @@ class EpochCoordinatorTest(unittest.TestCase):
         recovered = self.coordinator.reconcile("server", NOW_MS)
         self.assertEqual(recovered.exit_code, 0)
         self.assertEqual((recovered.state.mode, recovered.state.epoch), ("server", 4))
+
+    def test_observer_compute_publish_targets_only_the_healthy_backend_host(self):
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+        }
+        coordinator = EpochCoordinator(
+            observer_compute_config(self.master_state, self.compute_state),
+            self.runtime_state,
+            runner=self.runner,
+        )
+
+        result = coordinator.reconcile("server", NOW_MS)
+
+        self.assertEqual(result.outcome, "policy_published")
+        self.assertEqual((result.state.mode, result.state.epoch), ("server", 2))
+        accelerated_endpoints = {
+            command[0]
+            for command, _timeout in self.runner.calls
+            if command[command.index("--operation") + 1]
+            in {"stage", "verify-staged", "commit", "verify-committed"}
+        }
+        self.assertEqual(accelerated_endpoints, {"compute2-backend"})
+
+    def test_observer_compute_publish_aborts_a_direct_host_switch_after_stage(self):
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+        }
+        coordinator = EpochCoordinator(
+            observer_compute_config(self.master_state, self.compute_state),
+            self.runtime_state,
+            runner=self.runner,
+        )
+        initial = coordinator.reconcile("server", NOW_MS)
+        self.assertEqual((initial.state.mode, initial.state.epoch), ("server", 2))
+        self.runner.calls.clear()
+        original_run = self.runner.run
+        switched = False
+
+        def switch_binding_after_stage(args, timeout_seconds):
+            nonlocal switched
+            result = original_run(args, timeout_seconds)
+            command = tuple(args)
+            if (
+                not switched
+                and command[0] == "compute2-backend"
+                and command[command.index("--operation") + 1]
+                == "verify-staged"
+            ):
+                switched = True
+                write_snapshot(
+                    self.master_state,
+                    "master",
+                    "healthy",
+                    binding_host="master",
+                    accel_role="observer",
+                )
+                write_snapshot(
+                    self.compute_state,
+                    "compute2",
+                    "absent",
+                    binding_host="master",
+                    accel_role="observer",
+                )
+                self.runner.maps["compute2-backend"] = None
+                self.runner.maps["master-backend"] = {
+                    "epoch": 1,
+                    "mode": 1,
+                    "flags": 1,
+                }
+            return result
+
+        self.runner.run = switch_binding_after_stage
+
+        result = coordinator.reconcile("dual", NOW_MS)
+
+        self.assertEqual(result.outcome, "gate_changed_bypass_recovered")
+        self.assertEqual((result.state.mode, result.state.epoch), ("bypass", 3))
+        self.assertFalse(
+            any(
+                command[command.index("--operation") + 1] == "commit"
+                and command[command.index("--mode") + 1] == "dual"
+                for command, _timeout in self.runner.calls
+            )
+        )
+        self.assertEqual(
+            self.runner.maps["master-backend"],
+            {"epoch": 3, "mode": 1, "flags": 1},
+        )
+
+    def test_observer_compute_publish_rejects_host_switch_before_final_readback(self):
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+        }
+        coordinator = EpochCoordinator(
+            observer_compute_config(self.master_state, self.compute_state),
+            self.runtime_state,
+            runner=self.runner,
+        )
+        original_run = self.runner.run
+        final_readback_armed = False
+        switched = False
+
+        def switch_binding_before_final_readback(args, timeout_seconds):
+            nonlocal final_readback_armed, switched
+            command = tuple(args)
+            operation = command[command.index("--operation") + 1]
+            if final_readback_armed and not switched and operation == "read-current":
+                switched = True
+                write_snapshot(
+                    self.master_state,
+                    "master",
+                    "healthy",
+                    ifindex=31,
+                    binding_host="master",
+                    accel_role="observer",
+                )
+                write_snapshot(
+                    self.compute_state,
+                    "compute2",
+                    "absent",
+                    binding_host="master",
+                    accel_role="observer",
+                )
+            result = original_run(args, timeout_seconds)
+            if operation == "verify-committed":
+                final_readback_armed = True
+            return result
+
+        self.runner.run = switch_binding_before_final_readback
+
+        result = coordinator.reconcile("server", NOW_MS)
+
+        self.assertTrue(switched)
+        self.assertNotEqual(result.outcome, "policy_published")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.state.mode, "bypass")
+        self.assertFalse(result.state.known)
+        self.assertEqual(
+            self.runner.maps["compute2-backend"],
+            {"epoch": 2, "mode": 1, "flags": 1},
+        )
+
+    def test_observer_compute_unchanged_policy_rechecks_host_after_readback(self):
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+        }
+        coordinator = EpochCoordinator(
+            observer_compute_config(self.master_state, self.compute_state),
+            self.runtime_state,
+            runner=self.runner,
+        )
+        initial = coordinator.reconcile("server", NOW_MS)
+        self.assertEqual(initial.outcome, "policy_published")
+        self.runner.calls.clear()
+        original_run = self.runner.run
+        switched = False
+
+        def switch_binding_during_readback(args, timeout_seconds):
+            nonlocal switched
+            command = tuple(args)
+            operation = command[command.index("--operation") + 1]
+            if not switched and operation == "read-current":
+                switched = True
+                write_snapshot(
+                    self.master_state,
+                    "master",
+                    "healthy",
+                    ifindex=31,
+                    binding_host="master",
+                    accel_role="observer",
+                )
+                write_snapshot(
+                    self.compute_state,
+                    "compute2",
+                    "absent",
+                    binding_host="master",
+                    accel_role="observer",
+                )
+            return original_run(args, timeout_seconds)
+
+        self.runner.run = switch_binding_during_readback
+
+        result = coordinator.reconcile("server", NOW_MS)
+
+        self.assertTrue(switched)
+        self.assertEqual(result.outcome, "fail_safe_bypass_published")
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(
+            (result.state.mode, result.state.epoch, result.state.known),
+            ("bypass", 3, True),
+        )
+        self.assertEqual(
+            self.runner.maps["compute2-backend"],
+            {"epoch": 3, "mode": 1, "flags": 1},
+        )
+
+    def test_observer_compute_plan_keeps_guest_and_bypasses_all_candidates(self):
+        guest_state = Path(self.temp.name) / "backend-guest.json"
+        write_guest_snapshot(guest_state, role="server")
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        base = observer_compute_config(self.master_state, self.compute_state)
+        config = CoordinatorConfig(
+            required_endpoints=(
+                RequiredEndpoint(
+                    SERVER_ID,
+                    PORT_ID,
+                    compute_role="observer",
+                    guest_cache_role="server",
+                ),
+            ),
+            state_sources=(
+                *base.state_sources,
+                StateSource(
+                    "backend-guest",
+                    path=guest_state,
+                    kind="guest_endpoint",
+                ),
+            ),
+            publishers=(
+                *base.publishers,
+                PublisherEndpoint(
+                    "backend-guest",
+                    "backend-guest",
+                    SERVER_ID,
+                    PORT_ID,
+                    ("backend-guest",),
+                    actor_id="backend-guest-caches",
+                    target_kind="guest_endpoint",
+                    services=("dns", "grpc"),
+                    cache_role="server",
+                ),
+            ),
+            max_state_age_ms=base.max_state_age_ms,
+            command_timeout_seconds=base.command_timeout_seconds,
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+            "backend-guest": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+            "backend-guest": 2,
+        }
+        coordinator = EpochCoordinator(
+            config,
+            self.runtime_state,
+            runner=self.runner,
+        )
+
+        published = coordinator.reconcile("server", NOW_MS)
+
+        self.assertEqual(
+            published.outcome,
+            "policy_published",
+            published.gate.reason,
+        )
+        accelerated = {
+            command[0]
+            for command, _timeout in self.runner.calls
+            if command[command.index("--operation") + 1] == "commit"
+            and command[command.index("--mode") + 1] == "server"
+        }
+        self.assertEqual(accelerated, {"compute2-backend", "backend-guest"})
+        read_back = {
+            command[0]
+            for command, _timeout in self.runner.calls
+            if command[command.index("--operation") + 1] == "read-current"
+        }
+        self.assertEqual(
+            read_back,
+            {"master-backend", "compute2-backend", "backend-guest"},
+        )
+
+        self.runner.calls.clear()
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "transition",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        frozen = coordinator.reconcile("server", NOW_MS)
+
+        self.assertEqual(frozen.outcome, "migration_forced_bypass")
+        bypassed = {
+            command[0]
+            for command, _timeout in self.runner.calls
+            if command[command.index("--operation") + 1] == "force-bypass"
+        }
+        self.assertEqual(
+            bypassed,
+            {"master-backend", "compute2-backend", "backend-guest"},
+        )
+
+    def test_observer_compute_publish_rebases_a_new_backend_map_after_migration(self):
+        write_snapshot(
+            self.master_state,
+            "master",
+            "absent",
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "healthy",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        self.runner.maps = {
+            "master-backend": None,
+            "compute2-backend": {"epoch": 1, "mode": 1, "flags": 1},
+        }
+        self.runner.map_counts = {
+            "master-backend": 1,
+            "compute2-backend": 1,
+        }
+        coordinator = EpochCoordinator(
+            observer_compute_config(self.master_state, self.compute_state),
+            self.runtime_state,
+            runner=self.runner,
+        )
+        initial = coordinator.reconcile("server", NOW_MS)
+        self.assertEqual((initial.state.mode, initial.state.epoch), ("server", 2))
+
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "transition",
+            ifindex=21,
+            binding_host="compute2",
+            accel_role="observer",
+        )
+        frozen = coordinator.reconcile("server", NOW_MS)
+        self.assertEqual(frozen.outcome, "migration_forced_bypass")
+        self.assertEqual((frozen.state.mode, frozen.state.epoch), ("bypass", 3))
+
+        self.runner.maps["compute2-backend"] = None
+        self.runner.maps["master-backend"] = {
+            "epoch": 1,
+            "mode": 1,
+            "flags": 1,
+        }
+        write_snapshot(
+            self.master_state,
+            "master",
+            "healthy",
+            ifindex=31,
+            binding_host="master",
+            accel_role="observer",
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "absent",
+            binding_host="master",
+            accel_role="observer",
+        )
+        self.runner.calls.clear()
+
+        recovered = coordinator.reconcile("server", NOW_MS)
+
+        self.assertEqual(recovered.outcome, "policy_published")
+        self.assertEqual((recovered.state.mode, recovered.state.epoch), ("server", 5))
+        accelerated_endpoints = {
+            command[0]
+            for command, _timeout in self.runner.calls
+            if command[command.index("--operation") + 1]
+            in {"stage", "verify-staged", "commit", "verify-committed"}
+        }
+        self.assertEqual(accelerated_endpoints, {"master-backend"})
+        self.assertEqual(
+            self.runner.maps["master-backend"],
+            {"epoch": 5, "mode": 2, "flags": 1},
+        )
 
     def test_partial_publish_failure_is_overwritten_with_bypass_same_epoch(self):
         self.coordinator.reconcile("server", NOW_MS)
@@ -1497,7 +2018,7 @@ class CoordinatorConfigTest(unittest.TestCase):
             / "coordinator.json.example"
         )
         config = load_config(example)
-        self.assertEqual(len(config.publishers), 4)
+        self.assertEqual(len(config.publishers), 6)
         self.assertEqual(
             config.policy_lock_root, "/run/vnet-dataplane-policy"
         )
@@ -1505,6 +2026,63 @@ class CoordinatorConfigTest(unittest.TestCase):
             config.required_endpoints[0].grpc_backend_server_id,
             config.required_endpoints[1].server_id,
         )
+
+    def test_observer_compute_publisher_uses_server_cache_role(self):
+        payload = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "deploy"
+                / "lab"
+                / "shuka1-p1"
+                / "coordinator.json"
+            ).read_text(encoding="utf-8")
+        )
+        publisher = next(
+            item
+            for item in payload["publishers"]
+            if item["name"] == "backend-host-caches"
+        )
+        publisher["target_kind"] = "compute_port"
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "coordinator.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            config = load_config(config_path)
+
+        observed = next(
+            item
+            for item in config.publishers
+            if item.name == "backend-host-caches"
+        )
+        self.assertEqual(observed.target_kind, "compute_port")
+        self.assertEqual(observed.cache_role, "server")
+
+    def test_observer_compute_publisher_rejects_client_cache_role(self):
+        payload = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "deploy"
+                / "lab"
+                / "shuka1-p1"
+                / "coordinator.json"
+            ).read_text(encoding="utf-8")
+        )
+        publisher = next(
+            item
+            for item in payload["publishers"]
+            if item["name"] == "backend-host-caches"
+        )
+        publisher["target_kind"] = "compute_port"
+        publisher["cache_role"] = "client"
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "coordinator.json"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                CoordinatorError,
+                "compute_port cache_role does not match",
+            ):
+                load_config(config_path)
 
     def test_shuka1_config_accepts_the_pinned_ssh_prefix(self):
         config_path = (

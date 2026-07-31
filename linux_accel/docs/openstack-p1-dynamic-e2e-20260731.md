@@ -182,6 +182,87 @@ master、compute2、client guest、backend guest 的相关 unit 当前均为
   `cleanup_audit_passed`，七类检查全部为真，47 个原始清理观察均在，72 个普通文件
   的 `sha256sums.txt` 全部校验通过。
 
+## 多宿主 publisher 与 stop 补充验收
+
+在父提交 `5a326484e0d3d8bed4a7136ef80f09d1449f0450` 上，backend gRPC observer
+不再被配置成固定 Guest publisher，而是为 `master`、`compute2` 各建立一个
+`compute_port/server` 候选。协调器只向当前健康 Neutron binding 所在宿主发布加速
+epoch，同时保留 Guest publisher；初始回读和故障 `force-bypass` 仍覆盖全部候选。
+拓扑指纹包含 `server + port + host + interface + ifindex`，在 map 回读和事务各阶段
+重复验证，避免迁移竞态错误走 `policy_unchanged` 或成功发布路径。
+
+构建与部署证据：
+
+```text
+/var/log/vnet-dataplane-e2e/p1-multihost-build-20260731T211219Z
+/var/log/vnet-dataplane-e2e/p1-multihost-root-gates-20260731T211955Z
+/var/log/vnet-dataplane-e2e/p1-multihost-preflight-20260731T212120Z
+```
+
+- Linux 构建生成 4 个 eBPF 对象和 10 个生产可执行程序；Python 回归 223 项通过、
+  11 项按环境跳过。
+- verifier、runtime-control、policy transaction、DNS runtime mode、gRPC runtime mode
+  五项 root 门禁及其清理均通过。
+- preflight 为真实模式，未执行 workload，部署身份、配置和 NetMig 共存检查通过。
+
+第一次 stop 验证保留为无效原始证据：
+
+```text
+/var/log/vnet-dataplane-e2e/p1-multihost-systemctl-stop-20260731T212341Z
+```
+
+该轮只等待 compute2 unit 进入 `active`，没有等待 compute2 首份原子状态快照落盘，
+随后读取 `/run/vnet-dataplane-agent/state.json` 失败。退出 trap 已按顺序停止两端
+Agent；该轮不进入有效结果。补上 compute2 状态文件就绪条件后，使用全新目录重跑：
+
+```text
+/var/log/vnet-dataplane-e2e/p1-multihost-systemctl-stop-retry-20260731T212954Z
+sha256(sha256sums.txt)=ab998655f7645a3041040b6a4b96f779cb0c8c802df1b3719d0116ae36b4ca2e
+```
+
+有效 stop 验收证明：
+
+- master 同时健康管理 `tap2200c160-c0/ifindex 21` 和
+  `tap8ddb7d32-92/ifindex 15`；client DNS、client gRPC、backend gRPC map ID 分别为
+  `330156`、`330150`、`330141`，三者互不相同。
+- compute2 快照为 schema 3、`local_host=compute2`、指纹一致、`status=idle`、
+  `attachments={}`，两个端口都明确绑定在 master。
+- 两端真实 `systemctl stop` 后 unit 为 `inactive/dead` 且 `Result=success`；目标 pin、
+  quiesce、Agent 进程、Agent TC `0x1/0x2` 和 XDP 均无残留。后续独立 `pgrep`
+  同时确认 compute2 上的 DNS/gRPC monitor 无残留。
+- NetMig ingress `0x65` 与 egress `0x66` 的程序 ID/tag 在 stop 前后完全一致。
+
+随后只运行一轮新的动态 DNS+gRPC 功能 smoke：
+
+```text
+/var/log/vnet-dataplane-e2e/p1-multihost-dynamic-dns-grpc-one-round-20260731T213141Z
+sha256(sha256sums.txt)=238eeb2d99a2272ad436aae43f6dd6b901c73d1c7e757bae7aba7dbf7e326ffc
+```
+
+本轮 epoch 为 `78 baseline -> 79 BYPASS -> 80 SERVER_CACHE -> 81 BYPASS
+(shutdown=true)`，每种协议仍使用 10 个 warmup 和 40 个计量请求：
+
+| 协议 | 成功/失败 | QPS | avg | p50 | p95 | p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| DNS | 40/0 | 723.80 | 1379.80 us | 497.38 us | 4363.34 us | 12609.55 us |
+| gRPC | 40/0 | 332.81 | 2027.35 us | 1280 us | 6153 us | 6183 us |
+
+计量快照变化：
+
+```text
+DNS  backend_count 50 -> 50, cache_hit 0 -> 50, cache_tx 0 -> 50
+      cache_miss 0 -> 0, policy_bypass 50 -> 50
+gRPC accepted 50 -> 100, cache_hit 0 -> 50, serving_cache_hit 0 -> 50
+      fallback 50 -> 50, fallback_error/parse_error/tx_error 均保持 0
+      runtime_epoch 79 -> 80
+```
+
+`verification.json` 的 18 项断言全部为真；七类清理检查全部通过，manifest 在证据
+目录内逐文件校验成功。`result-summary.json` 明确记录 `formal_rounds=0`、
+`grpc_kernel_response=false`：DNS 是 Guest generic XDP server cache，gRPC 仍是 Guest
+用户态 h2c fast-cache，宿主 TC 只负责观测。本轮没有同条件 BYPASS 对照，QPS 只能
+作为功能 smoke 记录，不能据此计算加速比。
+
 ## 尚未完成
 
 固定在 `master` 的 DNS/gRPC systemd 自动闭环已经通过，但 P1 仍缺：
