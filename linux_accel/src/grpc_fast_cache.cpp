@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -51,15 +52,6 @@ uint64_t hash_payload_string(const std::string &payload)
     uint64_t hash = 1469598103934665603ull;
     for (unsigned char ch : payload) {
         hash ^= ch;
-        hash *= 1099511628211ull;
-    }
-    return hash;
-}
-
-uint64_t fnv1a_update(uint64_t hash, const uint8_t *data, size_t len)
-{
-    for (size_t i = 0; i < len; ++i) {
-        hash ^= data[i];
         hash *= 1099511628211ull;
     }
     return hash;
@@ -375,6 +367,7 @@ void print_stats(const Options &options, const CacheStats &stats)
               << (options.cache_role == CACHE_RUNTIME_ROLE_CLIENT ? "client"
                                                                   : "server")
               << " accepted=" << stats.accepted
+              << " empty_connection=" << stats.empty_connection
               << " policy_miss=" << stats.policy_miss
               << " policy_bypass=" << stats.policy_bypass
               << " runtime_map_error=" << stats.runtime_map_error
@@ -407,7 +400,7 @@ void print_request_decision(const Options &options, const RequestInfo &request,
               << " decision=" << decision << "\n";
 }
 
-uint64_t monotonic_now_ns()
+uint64_t fast_cache_monotonic_now_ns()
 {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -556,8 +549,39 @@ int main(int argc, char **argv)
               << options.backend_port
               << " method " << options.method << "\n";
     print_stats(options, stats);
+    constexpr uint64_t kStatsIntervalNs = 1000000000ull;
+    uint64_t next_stats_ns =
+        fast_cache_monotonic_now_ns() + kStatsIntervalNs;
+    auto maybe_print_stats = [&](bool request_completed) {
+        const uint64_t now_ns = fast_cache_monotonic_now_ns();
+        if ((options.verbose && request_completed) || now_ns >= next_stats_ns) {
+            print_stats(options, stats);
+            next_stats_ns = now_ns + kStatsIntervalNs;
+        }
+    };
 
     while (!exiting) {
+        pollfd listener_poll = {};
+        listener_poll.fd = listener_fd;
+        listener_poll.events = POLLIN;
+        const int ready = poll(&listener_poll, 1, 250);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            std::cerr << "poll failed: " << strerror(errno) << "\n";
+            break;
+        }
+        if (ready == 0) {
+            maybe_print_stats(false);
+            continue;
+        }
+        if (!(listener_poll.revents & POLLIN)) {
+            if (!exiting)
+                std::cerr << "listener poll reported error events: "
+                          << listener_poll.revents << "\n";
+            break;
+        }
+
         sockaddr_in peer = {};
         socklen_t peer_len = sizeof(peer);
         int client =
@@ -571,10 +595,17 @@ int main(int argc, char **argv)
             break;
         }
 
-        stats.accepted++;
         RequestInfo request;
         std::vector<uint8_t> raw_request;
         bool parsed = read_request_stream(client, &request, &raw_request);
+        if (!parsed && raw_request.empty()) {
+            stats.empty_connection++;
+            close(client);
+            maybe_print_stats(true);
+            continue;
+        }
+
+        stats.accepted++;
         if (request.method.empty())
             request.method = options.method;
 
@@ -651,8 +682,7 @@ int main(int argc, char **argv)
                                            "response_cache_miss_error");
                 }
                 close(client);
-                if (options.verbose || stats.accepted % 1000 == 0)
-                    print_stats(options, stats);
+                maybe_print_stats(true);
                 continue;
             }
 
@@ -672,8 +702,7 @@ int main(int argc, char **argv)
         }
 
         close(client);
-        if (options.verbose || stats.accepted % 1000 == 0)
-            print_stats(options, stats);
+        maybe_print_stats(true);
     }
 
     print_stats(options, stats);

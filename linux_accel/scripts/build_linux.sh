@@ -96,6 +96,14 @@ c++ -std=c++17 -O2 -g \
 
 c++ -std=c++17 -O2 -g \
   -I"${ROOT_DIR}/src/include" \
+  -I"${ROOT_DIR}/include" \
+  "${ROOT_DIR}/src/cache_policy_txn.cpp" \
+  "${ROOT_DIR}/src/dynamic_cache_controller.cpp" \
+  -o "${BUILD_DIR}/cache_policy_txn" \
+  -lbpf -lelf -lz
+
+c++ -std=c++17 -O2 -g \
+  -I"${ROOT_DIR}/src/include" \
   "${ROOT_DIR}/src/dns_cache_stats_reader.cpp" \
   -o "${BUILD_DIR}/dns_cache_stats_reader" \
   -lbpf -lelf -lz
@@ -111,6 +119,11 @@ c++ -std=c++17 -O2 -g \
   "${ROOT_DIR}/tests/cache_runtime_control_test.cpp" \
   -o "${BUILD_DIR}/cache_runtime_control_test"
 
+c++ -std=c++17 -O2 -g -Wall -Wextra -Werror \
+  -I"${ROOT_DIR}/src/include" \
+  "${ROOT_DIR}/tests/cache_policy_txn_path_test.cpp" \
+  -o "${BUILD_DIR}/cache_policy_txn_path_test"
+
 cc -O2 -g \
   "${ROOT_DIR}/bench/openstack_dns_harness.c" \
   -o "${BUILD_DIR}/openstack_dns_harness"
@@ -121,14 +134,27 @@ cc -O2 -g \
 
 "${BUILD_DIR}/tc_coexistence_test"
 "${BUILD_DIR}/dynamic_cache_controller_test"
+bash "${ROOT_DIR}/tests/dynamic_cache_desired_mode_test.sh" \
+  "${BUILD_DIR}/dynamic_cache_controller"
 "${BUILD_DIR}/cache_runtime_control_test"
+"${BUILD_DIR}/cache_policy_txn_path_test"
+bash "${ROOT_DIR}/tests/openstack_dns_harness_domain_test.sh"
+bash "${ROOT_DIR}/tests/grpc_fast_cache_metrics_test.sh"
 bash "${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 bash -n "${ROOT_DIR}/tests/hook_ownership_regression_test.sh"
 bash -n "${ROOT_DIR}/tests/grpc_stream_correlation_test.sh"
+bash -n "${ROOT_DIR}/tests/cache_policy_txn_integration_test.sh"
 bash "${ROOT_DIR}/tests/openstack_campaign_lifecycle_test.sh"
+bash "${ROOT_DIR}/tests/openstack_systemd_dynamic_e2e_lifecycle_test.sh"
 python3 -m py_compile "${ROOT_DIR}/tests/grpc_h2_stream_replay.py"
 (cd "${ROOT_DIR}" &&
-  python3 -m unittest tests.test_openstack_dataplane_agent)
+  python3 -m unittest \
+    tests.test_openstack_dataplane_agent \
+    tests.test_openstack_epoch_gate \
+    tests.test_openstack_epoch_coordinator \
+    tests.test_openstack_guest_endpoint_agent \
+    tests.test_openstack_metrics_bridge \
+    tests.test_monitor_initial_runtime_bypass)
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
 echo "Built ${BUILD_DIR}/dns_xdp_monitor.bpf.o"
@@ -140,15 +166,27 @@ echo "Built ${BUILD_DIR}/grpc_fast_cache"
 echo "Built ${BUILD_DIR}/cachectl"
 echo "Built ${BUILD_DIR}/virt_service_classifier"
 echo "Built ${BUILD_DIR}/dynamic_cache_controller"
+echo "Built ${BUILD_DIR}/cache_policy_txn"
 echo "Built ${BUILD_DIR}/dns_cache_stats_reader"
 echo "Built ${BUILD_DIR}/openstack_dns_harness"
 echo "Built ${BUILD_DIR}/openstack_grpc_harness"
 echo "Passed ${BUILD_DIR}/tc_coexistence_test"
 echo "Passed ${BUILD_DIR}/dynamic_cache_controller_test"
+echo "Passed ${ROOT_DIR}/tests/dynamic_cache_desired_mode_test.sh"
 echo "Passed ${BUILD_DIR}/cache_runtime_control_test"
+echo "Passed ${BUILD_DIR}/cache_policy_txn_path_test"
+echo "Passed ${ROOT_DIR}/tests/openstack_dns_harness_domain_test.sh"
+echo "Passed ${ROOT_DIR}/tests/grpc_fast_cache_metrics_test.sh"
 echo "Passed ${ROOT_DIR}/tests/tc_pipeline_semantics_test.sh"
 echo "Checked ${ROOT_DIR}/tests/hook_ownership_regression_test.sh"
 echo "Checked ${ROOT_DIR}/tests/grpc_stream_correlation_test.sh"
+echo "Checked ${ROOT_DIR}/tests/cache_policy_txn_integration_test.sh"
 echo "Passed ${ROOT_DIR}/tests/openstack_campaign_lifecycle_test.sh"
+echo "Passed ${ROOT_DIR}/tests/openstack_systemd_dynamic_e2e_lifecycle_test.sh"
 echo "Checked ${ROOT_DIR}/tests/grpc_h2_stream_replay.py"
 echo "Passed ${ROOT_DIR}/tests/test_openstack_dataplane_agent.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_epoch_gate.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_epoch_coordinator.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_guest_endpoint_agent.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_metrics_bridge.py"
+echo "Passed ${ROOT_DIR}/tests/test_monitor_initial_runtime_bypass.py"

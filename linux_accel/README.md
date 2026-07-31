@@ -42,7 +42,7 @@
 | 统一策略工具 | 已完成 | `cachectl` 支持 DNS、gRPC、gRPC cache 策略校验与加载 |
 | 虚拟化路径基线 | 已完成 | 使用 `netns + bridge + veth` 复现虚拟化路径并输出 benchmark |
 | OpenStack 挂载验证 | 已完成 smoke test | 可发现 `br-int`、`br-ex`、veth、OVS 等候选接口并完成 tc attach |
-| OpenStack 数据面 Agent | 已完成往返迁移验证 | 从 Neutron/OVSDB 精确发现 VM 接口，并在 `master -> compute2 -> master` 后按新 ifindex 重挂载 DNS/gRPC hook |
+| OpenStack 数据面 Agent | P1 固定主机闭环 smoke 已通过 | 多实例健康、systemd、四阶段 epoch、失败 BYPASS 和 DNS/gRPC 单轮真实闭环已验证；无人干预的双 Compute 往返迁移仍待验收 |
 | Kubernetes 路径探测 | 已完成脚本 | 只读发现 CNI、pod veth、node NIC 等可挂载位置 |
 | 用户态协议解析与服务分类 | 已完成原型 | 解析原始 Ethernet 帧并识别 `dns / grpc / other` |
 

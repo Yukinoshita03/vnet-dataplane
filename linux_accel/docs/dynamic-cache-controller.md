@@ -77,6 +77,22 @@ struct cache_runtime_control {
 旧策略和新策略同时服务请求。它不是分布式共识协议，跨主机正式实验仍需由编排脚本
 向各主机发布相同 epoch，并保留每个端点的回读证据。
 
+### OpenStack 多主机事务
+
+P1 新增 `cache_policy_txn`，把跨主机控制拆成可远程编排的五个操作：
+
+- `stage`：写入未提交模式和 epoch，并在本机回读。
+- `verify-staged`：确认准备态仍一致。
+- `commit`：只允许从完全匹配的准备态提交，并再次回读。
+- `verify-committed`：确认最终 mode、epoch 和 flags。
+- `force-bypass`：不经过策略迟滞或 cooldown，直接提交 `BYPASS`。
+
+`openstack_epoch_coordinator.py` 先通过 Agent 健康状态门控，再对所有端点逐阶段执行。
+某主机当前没有该 Neutron 端口时，配置可使用 `--allow-all-missing`：只有整组 map 都不
+存在才视为空操作；只缺其中一部分仍判失败。任一阶段失败都会停止新策略提交，并向
+所有可达端点发送同 epoch `force-bypass`。这仍不是分布式共识，但能保证未提交端点
+fail-closed，并对成功提交过的可达端点进行明确安全覆盖。
+
 ## 启动示例
 
 DNS 服务端：
@@ -130,6 +146,7 @@ sudo ./build/dynamic_cache_controller \
 ./scripts/build_linux.sh
 sudo ./tests/bpf_runtime_verifier_test.sh
 sudo ./tests/runtime_control_bpf_integration_test.sh
+sudo ./tests/cache_policy_txn_integration_test.sh
 sudo ./tests/dns_runtime_mode_integration_test.sh
 sudo ./tests/grpc_runtime_mode_integration_test.sh
 ```
@@ -138,6 +155,8 @@ sudo ./tests/grpc_runtime_mode_integration_test.sh
   内核 verifier，并在退出时删除临时 pin。
 - `runtime_control_bpf_integration_test.sh` 使用两张真实 BPF map 验证正常提交，并通过
   freeze 第二张 map 注入发布失败，确认第一张 map 回滚。
+- `cache_policy_txn_integration_test.sh` 验证分阶段回读、提交、整组缺失空操作，并通过
+  freeze map 注入准备失败，确认可写端点被覆盖为 committed `BYPASS`。
 - `dns_runtime_mode_integration_test.sh` 在 netns + veth 上验证 DNS 服务端和客户端角色
   对四种模式的执行结果及后端请求计数。
 - `grpc_runtime_mode_integration_test.sh` 在真实 h2c 请求上验证 server/client 两种角色

@@ -1,0 +1,25 @@
+[Unit]
+Description=VNet production metrics bridge and dynamic cache controller
+Wants=network-online.target
+After=network-online.target vnet-dataplane-agent.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+UMask=0027
+EnvironmentFile=/etc/vnet-dataplane-metrics-controller/metrics-bridge.env
+RuntimeDirectory=vnet-dataplane-metrics-controller
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/test -r ${VNET_METRICS_BRIDGE_SCRIPT}
+ExecStartPre=/usr/bin/test -r ${VNET_METRICS_BRIDGE_CONFIG}
+ExecStartPre=/usr/bin/python3 ${VNET_METRICS_BRIDGE_SCRIPT} check-config --config ${VNET_METRICS_BRIDGE_CONFIG}
+ExecStart=/usr/bin/python3 ${VNET_METRICS_BRIDGE_SCRIPT} run --config ${VNET_METRICS_BRIDGE_CONFIG}
+Restart=always
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

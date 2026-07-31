@@ -1,5 +1,6 @@
 #include "dns_monitor.hpp"
 #include "dns_tc_attach_plan.hpp"
+#include "cache_runtime_control.h"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -233,7 +235,33 @@ bool attach_xdp_program(Attachments *attachments, unsigned int ifindex,
     return true;
 }
 
-bool install_dns_cache(bpf_object *obj, const Options &options)
+struct StaticDnsCache {
+    int map_fd = -1;
+    std::vector<DnsCacheEntry> entries;
+    std::chrono::milliseconds refresh_interval = std::chrono::milliseconds(0);
+    std::chrono::steady_clock::time_point next_refresh;
+};
+
+bool install_dns_cache_entries(int cache_fd,
+                               const std::vector<DnsCacheEntry> &entries,
+                               bool announce)
+{
+    std::string error;
+    for (const DnsCacheEntry &entry : entries) {
+        if (!install_dns_cache_entry(cache_fd, entry, &error)) {
+            std::cerr << error << "\n";
+            return false;
+        }
+        if (announce) {
+            std::cout << "Installed DNS cache entry " << entry.domain
+                      << " A " << entry.ip << " ttl=" << entry.ttl << "\n";
+        }
+    }
+    return true;
+}
+
+bool install_dns_cache(bpf_object *obj, const Options &options,
+                       StaticDnsCache *static_cache)
 {
     std::vector<DnsCacheEntry> entries;
     std::string error;
@@ -255,15 +283,33 @@ bool install_dns_cache(bpf_object *obj, const Options &options)
     }
 
     int cache_fd = bpf_map__fd(cache_map);
-    for (const DnsCacheEntry &entry : entries) {
-        if (!install_dns_cache_entry(cache_fd, entry, &error)) {
-            std::cerr << error << "\n";
-            return false;
-        }
-        std::cout << "Installed DNS cache entry " << entry.domain
-                  << " A " << entry.ip << " ttl=" << entry.ttl << "\n";
+    if (!install_dns_cache_entries(cache_fd, entries, true))
+        return false;
+
+    if (static_cache && options.cache_refresh_ms > 0) {
+        static_cache->map_fd = cache_fd;
+        static_cache->entries = std::move(entries);
+        static_cache->refresh_interval =
+            std::chrono::milliseconds(options.cache_refresh_ms);
+        static_cache->next_refresh = std::chrono::steady_clock::now() +
+                                     static_cache->refresh_interval;
     }
     return true;
+}
+
+void refresh_dns_cache_if_due(StaticDnsCache *static_cache,
+                              std::chrono::steady_clock::time_point now)
+{
+    if (!static_cache || static_cache->map_fd < 0 ||
+        static_cache->entries.empty() ||
+        now < static_cache->next_refresh) {
+        return;
+    }
+    static_cache->next_refresh = now + static_cache->refresh_interval;
+    if (!install_dns_cache_entries(static_cache->map_fd,
+                                   static_cache->entries, false)) {
+        std::cerr << "Failed to refresh static DNS cache entries\n";
+    }
 }
 
 bool install_client_config(bpf_object *obj, const Options &options)
@@ -302,6 +348,42 @@ bool install_client_config(bpf_object *obj, const Options &options)
         0) {
         std::cerr << "Failed to install client DNS cache config: "
                   << strerror(errno) << "\n";
+        return false;
+    }
+    return true;
+}
+
+bool initialize_runtime_bypass(bpf_object *obj)
+{
+    bpf_map *control_map =
+        bpf_object__find_map_by_name(obj, "cache_rt_ctl");
+    if (!control_map) {
+        std::cerr << "Failed to find cache_rt_ctl for initial runtime BYPASS\n";
+        return false;
+    }
+
+    const __u32 key = 0;
+    cache_runtime_control expected = {};
+    expected.epoch = 1;
+    expected.mode = CACHE_RUNTIME_BYPASS;
+    expected.flags = CACHE_RUNTIME_COMMITTED;
+    const int map_fd = bpf_map__fd(control_map);
+    if (map_fd < 0) {
+        std::cerr << "Failed to get cache_rt_ctl map fd\n";
+        return false;
+    }
+    if (bpf_map_update_elem(map_fd, &key, &expected, BPF_ANY) != 0) {
+        std::cerr << "Failed to initialize runtime BYPASS: "
+                  << strerror(errno) << "\n";
+        return false;
+    }
+
+    cache_runtime_control observed = {};
+    if (bpf_map_lookup_elem(map_fd, &key, &observed) != 0 ||
+        observed.epoch != expected.epoch ||
+        observed.mode != expected.mode ||
+        observed.flags != expected.flags) {
+        std::cerr << "Failed to verify initial runtime BYPASS\n";
         return false;
     }
     return true;
@@ -415,13 +497,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    StaticDnsCache static_dns_cache;
     if (options.hook == "xdp" && options.role == "server" &&
-        !install_dns_cache(obj, options)) {
+        !install_dns_cache(obj, options, &static_dns_cache)) {
         bpf_object__close(obj);
         return 1;
     }
     if (options.hook == "xdp" && options.role == "client" &&
         !install_client_config(obj, options)) {
+        bpf_object__close(obj);
+        return 1;
+    }
+    if (options.initial_runtime_bypass &&
+        !initialize_runtime_bypass(obj)) {
         bpf_object__close(obj);
         return 1;
     }
@@ -541,6 +629,7 @@ int main(int argc, char **argv)
         }
 
         auto now = std::chrono::steady_clock::now();
+        refresh_dns_cache_if_due(&static_dns_cache, now);
         if (now >= next_report) {
             print_metrics(&state);
             next_report = now + std::chrono::seconds(1);

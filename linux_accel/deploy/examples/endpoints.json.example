@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "endpoints": [
+    {
+      "server_id": "REPLACE_CLIENT_SERVER_ID",
+      "accel_role": "client",
+      "grpc_observe_port": 50052,
+      "guest_grpc_listen_port": 50053,
+      "trusted_dns": [
+        "10.0.0.55"
+      ]
+    },
+    {
+      "server_id": "REPLACE_BACKEND_SERVER_ID",
+      "accel_role": "observer",
+      "grpc_observe_port": 50052,
+      "guest_grpc_listen_port": 50052
+    }
+  ]
+}

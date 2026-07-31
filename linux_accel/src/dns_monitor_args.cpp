@@ -36,10 +36,12 @@ void print_usage(const char *program)
               << " [--role server|client]"
               << " [--cache-domain <name> --cache-ip <ipv4> [--cache-ttl <sec>]]"
               << " [--cache-file <path>]"
+              << " [--cache-refresh-ms <ms>]"
               << " [--pin-dir <bpffs-dir>]"
               << " [--trusted-dns <ipv4>] [--max-learn-ttl <sec>]"
               << " [--learn-window-ms <ms>]"
               << " [--timeout-ms <ms>] [--verbose-events]"
+              << " [--initial-runtime-bypass]"
               << " [--qps-spike-factor <n>] [--latency-spike-factor <n>]\n";
 }
 
@@ -76,6 +78,9 @@ bool parse_options(int argc, char **argv, Options *options)
         } else if (arg == "--cache-ttl" && i + 1 < argc) {
             if (!parse_int(argv[++i], &options->cache_ttl))
                 return false;
+        } else if (arg == "--cache-refresh-ms" && i + 1 < argc) {
+            if (!parse_int(argv[++i], &options->cache_refresh_ms))
+                return false;
         } else if (arg == "--max-learn-ttl" && i + 1 < argc) {
             if (!parse_int(argv[++i], &options->max_learn_ttl))
                 return false;
@@ -87,6 +92,8 @@ bool parse_options(int argc, char **argv, Options *options)
                 return false;
         } else if (arg == "--verbose-events") {
             options->verbose_events = true;
+        } else if (arg == "--initial-runtime-bypass") {
+            options->initial_runtime_bypass = true;
         } else if (arg == "--qps-spike-factor" && i + 1 < argc) {
             if (!parse_double(argv[++i], &options->qps_spike_factor))
                 return false;
@@ -120,13 +127,19 @@ bool parse_options(int argc, char **argv, Options *options)
         std::cerr << "--pin-dir is only supported with --hook xdp\n";
         return false;
     }
+    if (options->initial_runtime_bypass && options->hook != "xdp") {
+        std::cerr << "--initial-runtime-bypass is only supported with --hook xdp\n";
+        return false;
+    }
     if (options->role == "client" && options->trusted_dns.empty()) {
         std::cerr << "--role client requires at least one --trusted-dns\n";
         return false;
     }
     if (options->role == "client" &&
         (!options->cache_domain.empty() || !options->cache_file.empty())) {
-        std::cerr << "client cache learns responses and does not accept static cache entries\n";
+        std::cerr
+            << "client cache learns responses and does not accept static "
+               "cache entries\n";
         return false;
     }
     if (options->role != "client" && !options->trusted_dns.empty()) {

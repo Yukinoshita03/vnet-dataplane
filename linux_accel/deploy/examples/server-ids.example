@@ -1,0 +1,3 @@
+# One managed Nova server UUID per line. Blank lines and comments are ignored.
+REPLACE_CLIENT_SERVER_UUID
+REPLACE_BACKEND_SERVER_UUID

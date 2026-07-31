@@ -116,6 +116,53 @@ static int parse_name_end(const uint8_t *packet, size_t length, size_t offset,
     return -1;
 }
 
+static uint8_t ascii_lower(uint8_t value)
+{
+    if (value >= 'A' && value <= 'Z')
+        return (uint8_t)(value + ('a' - 'A'));
+    return value;
+}
+
+static int query_matches_domain(const uint8_t *query, size_t query_len,
+                                const char *domain)
+{
+    uint8_t expected_name[256];
+    size_t question_end;
+    size_t expected_start;
+    size_t cursor;
+    int suffix_is_label_boundary = 0;
+    int expected_len = encode_name(expected_name, sizeof(expected_name), domain);
+    if (expected_len < 0 || query_len < 16 || query[4] != 0 || query[5] != 1 ||
+        parse_name_end(query, query_len, 12, &question_end) != 0 ||
+        question_end + 4 > query_len ||
+        question_end - 12 < (size_t)expected_len)
+        return 0;
+
+    expected_start = question_end - (size_t)expected_len;
+    cursor = 12;
+    while (cursor < question_end) {
+        uint8_t label = query[cursor];
+        if (cursor == expected_start)
+            suffix_is_label_boundary = 1;
+        if (label == 0)
+            break;
+        if (label > 63 || cursor + 1 + label > question_end)
+            return 0;
+        cursor += 1 + label;
+    }
+    if (!suffix_is_label_boundary)
+        return 0;
+
+    for (int index = 0; index < expected_len; ++index) {
+        if (ascii_lower(query[expected_start + (size_t)index]) !=
+            ascii_lower(expected_name[index])) {
+            return 0;
+        }
+    }
+    return query[question_end] == 0 && query[question_end + 1] == 1 &&
+           query[question_end + 2] == 0 && query[question_end + 3] == 1;
+}
+
 static int build_response(const uint8_t *query, size_t query_len,
                           uint8_t *response, size_t cap,
                           const struct in_addr *answer, unsigned int ttl,
@@ -202,6 +249,14 @@ static int run_server(const char *bind_ip, int port, const char *domain,
                 continue;
             break;
         }
+        if (!query_matches_domain(query, (size_t)received, domain)) {
+            int response_len = build_response(query, (size_t)received, response,
+                                              sizeof(response), &answer, ttl, 1);
+            if (response_len > 0)
+                sendto(fd, response, (size_t)response_len, 0,
+                       (struct sockaddr *)&peer, peer_len);
+            continue;
+        }
         requests++;
         fprintf(counter, "%llu\n", requests);
         fflush(counter);
@@ -214,7 +269,6 @@ static int run_server(const char *bind_ip, int port, const char *domain,
     }
     fclose(counter);
     close(fd);
-    (void)domain;
     return 0;
 }
 

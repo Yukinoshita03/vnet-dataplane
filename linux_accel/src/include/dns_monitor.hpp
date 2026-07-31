@@ -62,10 +62,12 @@ struct Options {
     std::string pin_dir;
     std::vector<std::string> trusted_dns;
     int cache_ttl = 60;
+    int cache_refresh_ms = 1000;
     int max_learn_ttl = 300;
     int learn_window_ms = 2000;
     int timeout_ms = 2000;
     bool verbose_events = false;
+    bool initial_runtime_bypass = false;
     double qps_spike_factor = 3.0;
     double latency_spike_factor = 3.0;
 };

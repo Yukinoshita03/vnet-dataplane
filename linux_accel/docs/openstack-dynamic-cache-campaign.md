@@ -161,9 +161,10 @@ NotFound/404 才计为已清理；认证、API 或网络错误会让 campaign �
 只要 campaign 自己的 pin、进程或 TC handle `0x1/0x2` 有残留，清理状态就
 会失败。NetMig 的 `0x65/0x66` 不属于 campaign，脚本不会删除。
 
-对 TC/XDP monitor hook，当前脚本只通过结束自己启动的 monitor 触发清理；不会使用
-固定 handle 的 `tc filter del` 或 `xdp off` 作为兜底。monitor 会先核对程序 ID；
-所有权丢失时保留 hook 并让 cleanup audit 失败，而不是删除未知程序。每次 campaign
+对 TC/XDP monitor hook，脚本先通过结束自己启动的 monitor 触发清理；若 monitor 在
+清理前退出，Agent 会读取 attach 时记录的程序 ID，只对仍属于本次运行的 `0x1/0x2`
+和客户端 DNS XDP 做精确兜底，并在操作后复核。所有权丢失时保留 hook 并让 cleanup
+audit 失败，而不是删除未知程序。每次 campaign
 会生成经过清洗的 `RUN_TOKEN`，将 guest 二进制、日志、PID 文件和 DNS 计数写入私有
 目录，并在私有 BPF pin 根目录下工作。helper 以私有 `setsid` 进程组启动；收尾前会
 核对 PID、进程组和启动时间，不匹配时拒绝发送信号并保留证据。脚本不再使用

@@ -357,7 +357,8 @@ void print_metrics(ReaderState *state)
                << " policy_bypass=" << cache_policy_bypass_delta
                << " shadow_hit=" << cache_shadow_hit_delta
                << " shadow_miss=" << cache_shadow_miss_delta
-               << " alerts=" << alerts << "\n";
+               << " alerts=" << alerts << "\n"
+               << std::flush;
 
     state->history.push_back(
         {state->current.query_count + state->current.response_count, p95_ms});

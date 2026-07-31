@@ -1,0 +1,36 @@
+[Unit]
+Description=VNet OpenStack eBPF dataplane agent
+Wants=network-online.target vnet-dataplane-bpffs.service
+After=network-online.target openvswitch-switch.service vnet-dataplane-bpffs.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Environment=VNET_AGENT_INTERVAL=2
+Environment=VNET_MISSING_GRACE_CYCLES=2
+EnvironmentFile=/etc/vnet-dataplane-agent/openstack.env
+EnvironmentFile=/etc/vnet-dataplane-agent/agent.env
+RuntimeDirectory=vnet-dataplane-agent
+RuntimeDirectoryMode=0750
+LogsDirectory=vnet-dataplane-agent
+LogsDirectoryMode=0750
+ExecStartPre=/usr/bin/test -r ${VNET_AGENT_SCRIPT}
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/vnet-dataplane-policy
+ExecStartPre=/usr/bin/test -r ${VNET_ENDPOINT_CONFIG}
+ExecStartPre=/usr/bin/test -x ${VNET_DNS_MONITOR}
+ExecStartPre=/usr/bin/test -r ${VNET_DNS_CLIENT_BPF}
+ExecStartPre=/usr/bin/test -r ${VNET_DNS_TC_BPF}
+ExecStartPre=/usr/bin/test -x ${VNET_GRPC_MONITOR}
+ExecStartPre=/usr/bin/test -r ${VNET_GRPC_BPF}
+ExecStartPre=/usr/bin/test -x ${VNET_CACHE_POLICY_TXN}
+ExecStart=/usr/bin/python3 ${VNET_AGENT_SCRIPT} watch --endpoint-config ${VNET_ENDPOINT_CONFIG} --local-host ${VNET_LOCAL_HOST} --dns-monitor ${VNET_DNS_MONITOR} --dns-client-bpf ${VNET_DNS_CLIENT_BPF} --dns-tc-bpf ${VNET_DNS_TC_BPF} --grpc-monitor ${VNET_GRPC_MONITOR} --grpc-bpf ${VNET_GRPC_BPF} --cache-policy-txn ${VNET_CACHE_POLICY_TXN} --pin-root /sys/fs/bpf/vnet-dataplane-agent --log-root /var/log/vnet-dataplane-agent --state-file /run/vnet-dataplane-agent/state.json --audit-log /var/log/vnet-dataplane-agent/audit.jsonl --interval ${VNET_AGENT_INTERVAL} --missing-grace-cycles ${VNET_MISSING_GRACE_CYCLES}
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

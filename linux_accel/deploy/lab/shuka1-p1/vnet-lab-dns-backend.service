@@ -1,0 +1,18 @@
+[Unit]
+Description=VNet Shuka1 DNS lab backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/usr/bin/mkdir -p /var/log/vnet-dataplane-guest
+ExecStart=/opt/vnet-dataplane/linux_accel/build/openstack_dns_harness server 10.0.0.55 53 dynamic.test 10.0.0.55 60 /var/log/vnet-dataplane-guest/dns-count 0
+Restart=always
+RestartSec=1
+StandardOutput=append:/var/log/vnet-dataplane-guest/dns-backend.log
+StandardError=journal
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,6 @@
 #include "grpc_event.h"
 #include "grpc_tc_attach_plan.hpp"
+#include "cache_runtime_control.h"
 
 #include <arpa/inet.h>
 #include <bpf/bpf.h>
@@ -31,6 +32,7 @@ struct Options {
     int port = 50051;
     int timeout_ms = 2000;
     bool verbose_events = false;
+    bool initial_runtime_bypass = false;
 };
 
 struct FlowKeyHash {
@@ -98,7 +100,8 @@ void print_usage(const char *program)
     std::cerr << "Usage: " << program
               << " --dev <ifname> [--bpf-object <path>]"
               << " [--pin-dir <bpffs-dir>]"
-              << " [--port 50051] [--timeout-ms <ms>] [--verbose-events]\n";
+              << " [--port 50051] [--timeout-ms <ms>] [--verbose-events]"
+              << " [--initial-runtime-bypass]\n";
 }
 
 bool parse_int(const std::string &value, int *out)
@@ -129,6 +132,8 @@ bool parse_options(int argc, char **argv, Options *options)
                 return false;
         } else if (arg == "--verbose-events") {
             options->verbose_events = true;
+        } else if (arg == "--initial-runtime-bypass") {
+            options->initial_runtime_bypass = true;
         } else if (arg == "-h" || arg == "--help") {
             return false;
         } else {
@@ -336,7 +341,8 @@ void print_metrics(ReaderState *state)
               << " h2_data=" << state->current.h2_data_count
               << " h2_end_stream=" << state->current.h2_end_stream_count
               << " stream_aware=" << state->current.stream_aware_count
-              << " ringbuf_drop=" << state->current.ringbuf_drop_delta << "\n";
+              << " ringbuf_drop=" << state->current.ringbuf_drop_delta << "\n"
+              << std::flush;
 
     state->current = WindowMetrics{};
 }
@@ -466,6 +472,42 @@ bool pin_map(bpf_object *obj, const std::string &pin_dir,
     return true;
 }
 
+bool initialize_runtime_bypass(bpf_object *obj)
+{
+    bpf_map *control_map =
+        bpf_object__find_map_by_name(obj, "cache_rt_ctl");
+    if (!control_map) {
+        std::cerr << "Failed to find cache_rt_ctl for initial runtime BYPASS\n";
+        return false;
+    }
+
+    const __u32 key = 0;
+    cache_runtime_control expected = {};
+    expected.epoch = 1;
+    expected.mode = CACHE_RUNTIME_BYPASS;
+    expected.flags = CACHE_RUNTIME_COMMITTED;
+    const int map_fd = bpf_map__fd(control_map);
+    if (map_fd < 0) {
+        std::cerr << "Failed to get cache_rt_ctl map fd\n";
+        return false;
+    }
+    if (bpf_map_update_elem(map_fd, &key, &expected, BPF_ANY) != 0) {
+        std::cerr << "Failed to initialize runtime BYPASS: "
+                  << strerror(errno) << "\n";
+        return false;
+    }
+
+    cache_runtime_control observed = {};
+    if (bpf_map_lookup_elem(map_fd, &key, &observed) != 0 ||
+        observed.epoch != expected.epoch ||
+        observed.mode != expected.mode ||
+        observed.flags != expected.flags) {
+        std::cerr << "Failed to verify initial runtime BYPASS\n";
+        return false;
+    }
+    return true;
+}
+
 bool pin_grpc_maps(bpf_object *obj, const std::string &pin_dir)
 {
     // Keep the ELF/kernel map name within BPF_OBJ_NAME_LEN while preserving
@@ -522,6 +564,11 @@ int main(int argc, char **argv)
     }
 
     if (!configure_port(obj, options.port)) {
+        bpf_object__close(obj);
+        return 1;
+    }
+    if (options.initial_runtime_bypass &&
+        !initialize_runtime_bypass(obj)) {
         bpf_object__close(obj);
         return 1;
     }

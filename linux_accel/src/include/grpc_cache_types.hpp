@@ -60,6 +60,7 @@ struct Options {
 
 struct CacheStats {
     uint64_t accepted = 0;
+    uint64_t empty_connection = 0;
     uint64_t policy_miss = 0;
     uint64_t policy_bypass = 0;
     uint64_t runtime_map_error = 0;

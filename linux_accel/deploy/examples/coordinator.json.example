@@ -1,0 +1,223 @@
+{
+  "schema_version": 2,
+  "max_state_age_seconds": 10,
+  "max_snapshot_skew_seconds": 3,
+  "max_desired_mode_age_seconds": 10,
+  "command_timeout_seconds": 10,
+  "policy_lock_root": "/run/vnet-dataplane-policy",
+  "required_endpoints": [
+    {
+      "server_id": "REPLACE_CLIENT_SERVER_UUID",
+      "port_id": "REPLACE_CLIENT_PORT_UUID",
+      "compute_role": "client",
+      "guest_cache_role": "client",
+      "grpc_backend_server_id": "REPLACE_BACKEND_SERVER_UUID"
+    },
+    {
+      "server_id": "REPLACE_BACKEND_SERVER_UUID",
+      "port_id": "REPLACE_BACKEND_PORT_UUID",
+      "compute_role": "observer",
+      "guest_cache_role": "server"
+    }
+  ],
+  "state_sources": [
+    {
+      "name": "master",
+      "kind": "compute_agent",
+      "path": "/run/vnet-dataplane-agent/state.json"
+    },
+    {
+      "name": "compute2",
+      "kind": "compute_agent",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "compute2",
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/cat",
+        "/run/vnet-dataplane-agent/state.json"
+      ]
+    },
+    {
+      "name": "client-guest",
+      "kind": "guest_endpoint",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "REPLACE_CLIENT_GUEST_SSH_HOST",
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/cat",
+        "/run/vnet-dataplane-guest/state.json"
+      ]
+    },
+    {
+      "name": "backend-guest",
+      "kind": "guest_endpoint",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "REPLACE_BACKEND_GUEST_SSH_HOST",
+        "/usr/bin/sudo",
+        "-n",
+        "/usr/bin/cat",
+        "/run/vnet-dataplane-guest/state.json"
+      ]
+    }
+  ],
+  "publishers": [
+    {
+      "name": "master-dns-client",
+      "host": "master",
+      "server_id": "REPLACE_CLIENT_SERVER_UUID",
+      "port_id": "REPLACE_CLIENT_PORT_UUID",
+      "actor_id": "dns-client-cache",
+      "target_kind": "compute_port",
+      "cache_role": "client",
+      "services": [
+        "dns"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-agent/REPLACE_CLIENT_PORT_UUID/dns/cache_runtime_control"
+      ]
+    },
+    {
+      "name": "compute2-dns-client",
+      "host": "compute2",
+      "server_id": "REPLACE_CLIENT_SERVER_UUID",
+      "port_id": "REPLACE_CLIENT_PORT_UUID",
+      "actor_id": "dns-client-cache",
+      "target_kind": "compute_port",
+      "cache_role": "client",
+      "services": [
+        "dns"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "compute2",
+        "/usr/bin/sudo",
+        "-n",
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-agent/REPLACE_CLIENT_PORT_UUID/dns/cache_runtime_control"
+      ]
+    },
+    {
+      "name": "client-guest-grpc",
+      "host": "REPLACE_CLIENT_GUEST_SSH_HOST",
+      "server_id": "REPLACE_CLIENT_SERVER_UUID",
+      "port_id": "REPLACE_CLIENT_PORT_UUID",
+      "actor_id": "grpc-client-cache",
+      "target_kind": "guest_endpoint",
+      "cache_role": "client",
+      "services": [
+        "grpc"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "REPLACE_CLIENT_GUEST_SSH_HOST",
+        "/usr/bin/sudo",
+        "-n",
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_CLIENT_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-guest/REPLACE_CLIENT_PORT_UUID/grpc/cache_runtime_control"
+      ]
+    },
+    {
+      "name": "backend-guest-caches",
+      "host": "REPLACE_BACKEND_GUEST_SSH_HOST",
+      "server_id": "REPLACE_BACKEND_SERVER_UUID",
+      "port_id": "REPLACE_BACKEND_PORT_UUID",
+      "actor_id": "backend-guest-caches",
+      "target_kind": "guest_endpoint",
+      "cache_role": "server",
+      "services": [
+        "dns",
+        "grpc"
+      ],
+      "protocol": "cache-policy-txn-v1",
+      "command": [
+        "/usr/bin/ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "UserKnownHostsFile=/etc/vnet-dataplane-agent/known_hosts",
+        "-o",
+        "HostKeyAlgorithms=ssh-ed25519",
+        "REPLACE_BACKEND_GUEST_SSH_HOST",
+        "/usr/bin/sudo",
+        "-n",
+        "/opt/vnet-dataplane/linux_accel/build/cache_policy_txn",
+        "--allow-all-missing",
+        "--lock-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.lock",
+        "--quiesce-file",
+        "/run/vnet-dataplane-policy/vnet-dataplane-REPLACE_BACKEND_PORT_UUID.quiesce",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-guest/REPLACE_BACKEND_PORT_UUID/dns/cache_runtime_control",
+        "--control-map",
+        "/sys/fs/bpf/vnet-dataplane-guest/REPLACE_BACKEND_PORT_UUID/grpc/cache_runtime_control"
+      ]
+    }
+  ]
+}

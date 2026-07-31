@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "server_id": "66666666-7777-8888-9999-aaaaaaaaaaaa",
+  "port_id": "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+  "accel_role": "server",
+  "interface": "ens3",
+  "verbose_events": false,
+  "grpc": {
+    "listen": "0.0.0.0:50052",
+    "backend": "10.0.0.55:50051",
+    "method": "/grpc.health.v1.Health/Check",
+    "cache_file": "/etc/vnet-dataplane-guest/grpc-cache.policy"
+  },
+  "dns_cache_file": "/etc/vnet-dataplane-guest/dns-cache.policy"
+}

@@ -1,0 +1,4 @@
+ubuntu ALL=(root) NOPASSWD: /usr/bin/cat /run/vnet-dataplane-guest/state.json
+ubuntu ALL=(root) NOPASSWD: /usr/bin/python3 /opt/vnet-dataplane/linux_accel/agent/openstack_metrics_bridge.py snapshot-log --path /var/log/vnet-dataplane-agent/* --max-bytes 262144
+ubuntu ALL=(root) NOPASSWD: /usr/bin/python3 /opt/vnet-dataplane/linux_accel/agent/openstack_metrics_bridge.py snapshot-log --path /var/log/vnet-dataplane-guest/* --max-bytes 262144
+ubuntu ALL=(root) NOPASSWD: /opt/vnet-dataplane/linux_accel/build/cache_policy_txn *

@@ -1,0 +1,2 @@
+# DNS server XDP cache format: domain ipv4 ttl
+example.test 192.0.2.53 60

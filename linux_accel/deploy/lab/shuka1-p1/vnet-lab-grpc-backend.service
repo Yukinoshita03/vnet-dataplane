@@ -1,0 +1,17 @@
+[Unit]
+Description=VNet Shuka1 gRPC lab backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/opt/vnet-dataplane/linux_accel/build/openstack_grpc_harness server 10.0.0.55 50051 1000
+Restart=always
+RestartSec=1
+StandardOutput=append:/var/log/vnet-dataplane-guest/grpc-backend.log
+StandardError=journal
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

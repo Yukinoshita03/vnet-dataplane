@@ -7,6 +7,7 @@ scripts=(
   "${root_dir}/bench/openstack_dynamic_cache_campaign.sh"
   "${root_dir}/bench/openstack_existing_pair_campaign.sh"
   "${root_dir}/bench/openstack_service_migration_probe.sh"
+  "${root_dir}/bench/openstack_systemd_dynamic_e2e.sh"
 )
 
 for script in "${scripts[@]}"; do

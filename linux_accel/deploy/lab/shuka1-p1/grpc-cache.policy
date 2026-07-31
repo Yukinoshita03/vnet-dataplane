@@ -1,0 +1,3 @@
+# gRPC cache policy for the lab health method
+grpc /grpc.health.v1.Health/Check 60 idempotent
+grpc-cache /grpc.health.v1.Health/Check health-check SERVING 60
