@@ -1,8 +1,10 @@
 import argparse
 import contextlib
+import errno
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -58,10 +60,14 @@ class FakeDriver:
     def __init__(self):
         self.attached = {}
         self.actions = []
+        self.shutdown_deadlines = []
         self.unhealthy = set()
         self.persistent_unhealthy = set()
         self.fail_attach = set()
         self.fail_detach = set()
+
+    def begin_shutdown(self, deadline):
+        self.shutdown_deadlines.append(deadline)
 
     def attach(self, binding):
         if binding.port_id in self.fail_attach:
@@ -352,6 +358,43 @@ class CommandRunnerTest(unittest.TestCase):
             ),
         ):
             CommandRunner(0.25).run(["openstack", "port", "list"])
+
+    def test_shutdown_deadline_clamps_external_command_timeout(self):
+        completed = argparse.Namespace(returncode=0, stdout="ok\n", stderr="")
+        runner = CommandRunner(30.0)
+        runner.set_deadline(105.0)
+
+        with (
+            patch(
+                "agent.openstack_dataplane_agent.time.monotonic",
+                return_value=100.0,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent.subprocess.run",
+                return_value=completed,
+            ) as run,
+        ):
+            self.assertEqual(runner.run(["slow-helper"]), "ok\n")
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 5.0)
+
+    def test_expired_shutdown_deadline_refuses_external_command(self):
+        runner = CommandRunner(30.0)
+        runner.set_deadline(99.0)
+
+        with (
+            patch(
+                "agent.openstack_dataplane_agent.time.monotonic",
+                return_value=100.0,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent.subprocess.run"
+            ) as run,
+            self.assertRaisesRegex(AgentError, "shutdown deadline expired"),
+        ):
+            runner.run(["must-not-run"])
+
+        run.assert_not_called()
 
 
 class ResolverTest(unittest.TestCase):
@@ -1956,19 +1999,123 @@ class DeploymentUnitTest(unittest.TestCase):
         self.assertNotIn("${VNET_VERBOSE_EVENTS}", unit)
         self.assertNotIn("Environment=VNET_VERBOSE_EVENTS=", unit)
 
-    def test_agent_unit_allows_fail_closed_multi_port_cleanup_to_finish(self):
+    def test_agent_units_keep_cli_shutdown_budget_below_systemd_timeout(self):
         root = Path(__file__).resolve().parents[1]
-        unit = (
-            root
-            / "deploy"
-            / "systemd"
-            / "vnet-dataplane-agent.service"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("TimeoutStopSec=300", unit)
+        unit_dir = root / "deploy" / "systemd"
+        for name in (
+            "vnet-dataplane-agent.service",
+            "vnet-dataplane-shared-agent.service",
+        ):
+            with self.subTest(unit=name):
+                unit = (unit_dir / name).read_text(encoding="utf-8")
+                shutdown_budget = float(
+                    next(
+                        line.rsplit("=", 1)[1]
+                        for line in unit.splitlines()
+                        if line.startswith(
+                            "Environment=VNET_AGENT_SHUTDOWN_TIMEOUT="
+                        )
+                    )
+                )
+                systemd_timeout = float(
+                    next(
+                        line.split("=", 1)[1]
+                        for line in unit.splitlines()
+                        if line.startswith("TimeoutStopSec=")
+                    )
+                )
+                self.assertIn(
+                    "--shutdown-timeout-seconds "
+                    "${VNET_AGENT_SHUTDOWN_TIMEOUT}",
+                    unit,
+                )
+                self.assertLess(shutdown_budget, systemd_timeout)
 
 
 class WatchLifecycleTest(unittest.TestCase):
+    def test_repeated_stop_signal_does_not_extend_shutdown_deadline(self):
+        driver = FakeDriver()
+        endpoint = EndpointConfig(
+            server_id="server-1",
+            accel_role="client",
+            grpc_observe_port=50052,
+            guest_grpc_listen_port=50053,
+            port_ids=(binding().port_id,),
+            trusted_dns=("10.0.0.53",),
+        )
+        sample = argparse.Namespace(
+            result=DiscoveryResult(bindings=(), port_inventory=()),
+            completed_ms=1_000,
+        )
+        handlers = {}
+        args = argparse.Namespace(
+            interval=0.001,
+            shutdown_timeout_seconds=5.0,
+            policy_lock_root=Path("/run/vnet-dataplane-policy"),
+            endpoint_config=Path("/unused/endpoints.json"),
+            local_host="master",
+            dns_monitor=Path("/unused/dns-monitor"),
+            dns_client_bpf=Path("/unused/dns-client.bpf.o"),
+            dns_tc_bpf=Path("/unused/dns-tc.bpf.o"),
+            grpc_monitor=Path("/unused/grpc-monitor"),
+            grpc_bpf=Path("/unused/grpc.bpf.o"),
+            cache_policy_txn=Path("/unused/cache-policy-txn"),
+            pin_root=Path("/sys/fs/bpf/vnet-dataplane-agent"),
+            log_root=Path("/var/log/vnet-dataplane-agent"),
+            verbose_events=False,
+            missing_grace_cycles=1,
+            state_file=Path("/unused/state.json"),
+            audit_log=None,
+            max_cycles=0,
+        )
+
+        def register(signum, handler):
+            handlers[signum] = handler
+
+        def sample_and_stop(*_args, **_kwargs):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return sample
+
+        with (
+            patch(
+                "agent.openstack_dataplane_agent.os.geteuid",
+                return_value=0,
+                create=True,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._load_endpoint_configs",
+                return_value=(endpoint,),
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._local_host",
+                return_value="master",
+            ),
+            patch("agent.openstack_dataplane_agent.OpenStackOvsResolver"),
+            patch(
+                "agent.openstack_dataplane_agent.ProcessAttachmentDriver",
+                return_value=driver,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._sample_discovery",
+                side_effect=sample_and_stop,
+            ),
+            patch("agent.openstack_dataplane_agent._write_state"),
+            patch(
+                "agent.openstack_dataplane_agent.signal.signal",
+                side_effect=register,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent.time.monotonic",
+                return_value=100.0,
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = _watch(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(driver.shutdown_deadlines, [105.0])
+
     def test_watch_returns_failure_when_stop_cleanup_leaves_an_attachment(self):
         driver = FakeDriver()
         current = binding()
@@ -2040,6 +2187,34 @@ class WatchLifecycleTest(unittest.TestCase):
 
 
 class ProcessAttachmentDriverTest(unittest.TestCase):
+    def test_expired_shutdown_deadline_stops_waiting_for_policy_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            driver = ProcessAttachmentDriver(attachment_config(Path(temp)))
+            driver.begin_shutdown(99.0)
+
+            def blocked_flock(_descriptor, _operation):
+                raise BlockingIOError(errno.EAGAIN, "policy lock busy")
+
+            blocked = argparse.Namespace(
+                LOCK_EX=1,
+                LOCK_NB=2,
+                flock=blocked_flock,
+            )
+            with (
+                patch(
+                    "agent.openstack_dataplane_agent.fcntl",
+                    blocked,
+                ),
+                patch(
+                    "agent.openstack_dataplane_agent.time.monotonic",
+                    return_value=100.0,
+                ),
+                self.assertRaisesRegex(
+                    AgentError, "expired waiting for policy lock"
+                ),
+            ):
+                driver._acquire_policy_lock(123)
+
     def test_watch_requires_the_private_production_policy_root(self):
         args = argparse.Namespace(
             interval=1.0,

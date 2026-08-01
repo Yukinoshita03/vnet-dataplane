@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import subprocess
@@ -440,6 +441,66 @@ class EpochCoordinatorTest(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_shutdown_deadline_clamps_every_publication_command_timeout(self):
+        self.coordinator.request_shutdown(102.5)
+
+        with (
+            mock.patch.object(coordinator_module, "fcntl", None),
+            mock.patch.object(
+                coordinator_module.time,
+                "monotonic",
+                return_value=100.0,
+            ),
+        ):
+            result = self.coordinator.reconcile_shutdown(NOW_MS)
+
+        self.assertTrue(self.runner.calls)
+        self.assertTrue(all(timeout == 2.5 for _, timeout in self.runner.calls))
+        self.assertEqual(result.state.mode, "bypass")
+
+    def test_expired_shutdown_deadline_refuses_publication_commands(self):
+        self.coordinator.request_shutdown(99.0)
+
+        with (
+            mock.patch.object(coordinator_module, "fcntl", None),
+            mock.patch.object(
+                coordinator_module.time,
+                "monotonic",
+                return_value=100.0,
+            ),
+            self.assertRaisesRegex(
+                CoordinatorError, "publication deadline expired"
+            ),
+        ):
+            self.coordinator.reconcile_shutdown(NOW_MS)
+
+        self.assertEqual(self.runner.calls, [])
+
+    def test_expired_shutdown_deadline_stops_waiting_for_state_lock(self):
+        blocked_fcntl = mock.Mock()
+        blocked_fcntl.LOCK_EX = 1
+        blocked_fcntl.LOCK_NB = 2
+        blocked_fcntl.LOCK_UN = 4
+        blocked_fcntl.flock.side_effect = BlockingIOError(
+            errno.EAGAIN, "state lock busy"
+        )
+        self.coordinator.request_shutdown(99.0)
+
+        with (
+            mock.patch.object(coordinator_module, "fcntl", blocked_fcntl),
+            mock.patch.object(
+                coordinator_module.time,
+                "monotonic",
+                return_value=100.0,
+            ),
+            self.assertRaisesRegex(
+                CoordinatorError, "expired waiting for state lock"
+            ),
+        ):
+            self.coordinator.reconcile_shutdown(NOW_MS)
+
+        self.assertEqual(self.runner.calls, [])
 
     def test_bootstrap_bypass_precedes_first_accelerated_policy(self):
         result = self.coordinator.reconcile("server", NOW_MS)
@@ -2541,14 +2602,36 @@ class CoordinatorConfigTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("vnet-dataplane-agent.service", unit)
 
-    def test_controller_unit_allows_shutdown_bypass_publication_to_finish(self):
-        unit = (
-            Path(__file__).resolve().parents[1]
-            / "deploy"
-            / "systemd"
-            / "vnet-dataplane-epoch-coordinator.service"
-        ).read_text(encoding="utf-8")
-        self.assertIn("TimeoutStopSec=120", unit)
+    def test_controller_units_keep_cli_shutdown_budget_below_systemd_timeout(self):
+        unit_dir = Path(__file__).resolve().parents[1] / "deploy" / "systemd"
+        for name in (
+            "vnet-dataplane-epoch-coordinator.service",
+            "vnet-dataplane-shared-epoch-coordinator.service",
+        ):
+            with self.subTest(unit=name):
+                unit = (unit_dir / name).read_text(encoding="utf-8")
+                shutdown_budget = float(
+                    next(
+                        line.rsplit("=", 1)[1]
+                        for line in unit.splitlines()
+                        if line.startswith(
+                            "Environment=VNET_COORDINATOR_SHUTDOWN_TIMEOUT="
+                        )
+                    )
+                )
+                systemd_timeout = float(
+                    next(
+                        line.split("=", 1)[1]
+                        for line in unit.splitlines()
+                        if line.startswith("TimeoutStopSec=")
+                    )
+                )
+                self.assertIn(
+                    "--shutdown-timeout-seconds "
+                    "${VNET_COORDINATOR_SHUTDOWN_TIMEOUT}",
+                    unit,
+                )
+                self.assertLess(shutdown_budget, systemd_timeout)
 
     def test_desired_mode_freshness_uses_atomic_payload_timestamp(self):
         with tempfile.TemporaryDirectory() as temp:
