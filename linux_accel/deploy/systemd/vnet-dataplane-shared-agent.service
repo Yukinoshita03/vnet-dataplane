@@ -1,0 +1,37 @@
+[Unit]
+Description=VNet shared-cluster OpenStack eBPF dataplane agent
+Wants=network-online.target
+After=network-online.target openvswitch-switch.service
+RefuseManualStart=yes
+ConditionPathExists=/run/vnet-dataplane-shared-activation/approved
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Environment=VNET_AGENT_INTERVAL=2
+Environment=VNET_MISSING_GRACE_CYCLES=2
+Environment=VNET_AGENT_SHUTDOWN_TIMEOUT=240
+EnvironmentFile=/etc/vnet-dataplane-shared/agent.env
+RuntimeDirectory=vnet-dataplane-shared-agent
+RuntimeDirectoryMode=0750
+ExecStartPre=/usr/bin/test -r ${VNET_AGENT_SCRIPT}
+ExecStartPre=/usr/bin/test -r ${VNET_ENDPOINT_CONFIG}
+ExecStartPre=/usr/bin/test -x ${VNET_DNS_MONITOR}
+ExecStartPre=/usr/bin/test -r ${VNET_DNS_CLIENT_BPF}
+ExecStartPre=/usr/bin/test -r ${VNET_DNS_TC_BPF}
+ExecStartPre=/usr/bin/test -x ${VNET_GRPC_MONITOR}
+ExecStartPre=/usr/bin/test -r ${VNET_GRPC_BPF}
+ExecStartPre=/usr/bin/test -x ${VNET_CACHE_POLICY_TXN}
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/vnet-dataplane-policy
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0750 /var/log/vnet-dataplane-agent/shared-${VNET_DEPLOYMENT_ID}
+ExecStart=/usr/bin/python3 ${VNET_AGENT_SCRIPT} watch --endpoint-config ${VNET_ENDPOINT_CONFIG} --local-host ${VNET_LOCAL_HOST} --dns-monitor ${VNET_DNS_MONITOR} --dns-client-bpf ${VNET_DNS_CLIENT_BPF} --dns-tc-bpf ${VNET_DNS_TC_BPF} --grpc-monitor ${VNET_GRPC_MONITOR} --grpc-bpf ${VNET_GRPC_BPF} --cache-policy-txn ${VNET_CACHE_POLICY_TXN} --pin-root /sys/fs/bpf/vnet-dataplane-shared --log-root /var/log/vnet-dataplane-agent/shared-${VNET_DEPLOYMENT_ID} --state-file /run/vnet-dataplane-shared-agent/state.json --audit-log /var/log/vnet-dataplane-agent/shared-${VNET_DEPLOYMENT_ID}/audit.jsonl --interval ${VNET_AGENT_INTERVAL} --missing-grace-cycles ${VNET_MISSING_GRACE_CYCLES} --shutdown-timeout-seconds ${VNET_AGENT_SHUTDOWN_TIMEOUT}
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

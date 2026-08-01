@@ -33,12 +33,15 @@ def snapshot(
     grpc_observe_port=50052,
     guest_grpc_listen_port=50053,
     trusted_dns=None,
+    port_ids=None,
     legacy_grpc_port=None,
 ):
     inventory_host = host if binding_host is None else binding_host
     observed_host = host if observation_host is None else observation_host
     if trusted_dns is None:
         trusted_dns = ["10.0.0.12"] if accel_role == "client" else []
+    if port_ids is None:
+        port_ids = [PORT_ID]
     dns_capability = (
         "xdp_client_cache"
         if accel_role == "client"
@@ -72,6 +75,7 @@ def snapshot(
         )
     endpoint_item = {
         "server_id": SERVER_ID,
+        "port_ids": port_ids,
         "accel_role": accel_role,
         "grpc_observe_port": grpc_observe_port,
         "guest_grpc_listen_port": guest_grpc_listen_port,
@@ -234,6 +238,7 @@ def two_endpoint_compute_snapshot(source="master-state", host="master"):
             "endpoint_config": [
                 {
                     "server_id": item["server_id"],
+                    "port_ids": [item["port_id"]],
                     "accel_role": item["accel_role"],
                     "grpc_observe_port": item["grpc_observe_port"],
                     "guest_grpc_listen_port": item[
@@ -587,6 +592,43 @@ class EpochGateTest(unittest.TestCase):
             "endpoint_config_mismatch", guest_listen_port_drift.reason
         )
 
+    def test_required_port_must_be_in_every_compute_allowlist(self):
+        missing = evaluate_gate(
+            [
+                snapshot("master-state", "master", "healthy"),
+                snapshot(
+                    "compute2-state",
+                    "compute2",
+                    "absent",
+                    binding_host="master",
+                    port_ids=[BACKEND_PORT_ID],
+                ),
+            ],
+            self.required,
+            NOW_MS,
+            max_age_ms=10_000,
+        )
+        drift = evaluate_gate(
+            [
+                snapshot("master-state", "master", "healthy"),
+                snapshot(
+                    "compute2-state",
+                    "compute2",
+                    "absent",
+                    binding_host="master",
+                    port_ids=[PORT_ID, BACKEND_PORT_ID],
+                ),
+            ],
+            self.required,
+            NOW_MS,
+            max_age_ms=10_000,
+        )
+
+        self.assertEqual(missing.action, GateAction.BYPASS)
+        self.assertIn("endpoint_port_not_allowed", missing.reason)
+        self.assertEqual(drift.action, GateAction.BYPASS)
+        self.assertIn("endpoint_config_mismatch", drift.reason)
+
     def test_legacy_grpc_port_field_is_rejected(self):
         with self.assertRaisesRegex(GateError, "legacy grpc_port"):
             snapshot(
@@ -605,23 +647,43 @@ class EpochGateTest(unittest.TestCase):
                     "transition",
                     binding_host="compute2",
                 ),
-                snapshot("compute2-state", "compute2", "healthy", ifindex=21),
+                snapshot(
+                    "compute2-state",
+                    "compute2",
+                    "healthy",
+                    ifindex=21,
+                    revision_number=8,
+                ),
             ],
             self.required,
             NOW_MS,
             max_age_ms=10_000,
         )
         self.assertEqual(decision.action, GateAction.FREEZE)
+        self.assertEqual(
+            decision.reason,
+            f"migration_transition:{SERVER_ID}:{PORT_ID}:master-state",
+        )
         self.assertTrue(decision.force_bypass)
 
     def test_degraded_or_stale_snapshot_forces_bypass(self):
         degraded = evaluate_gate(
-            [snapshot("master-state", "master", "degraded")],
+            [
+                snapshot("master-state", "master", "degraded"),
+                snapshot(
+                    "compute2-state",
+                    "compute2",
+                    "transition",
+                    binding_host="master",
+                    revision_number=8,
+                ),
+            ],
             self.required,
             NOW_MS,
             max_age_ms=10_000,
         )
         self.assertEqual(degraded.action, GateAction.BYPASS)
+        self.assertIn("endpoint_unhealthy", degraded.reason)
 
         stale = evaluate_gate(
             [
@@ -817,6 +879,7 @@ class EpochGateTest(unittest.TestCase):
                     "endpoint_config": [
                         {
                             "server_id": SERVER_ID,
+                            "port_ids": [PORT_ID],
                             "accel_role": "client",
                             "grpc_observe_port": 50052,
                             "guest_grpc_listen_port": 50053,

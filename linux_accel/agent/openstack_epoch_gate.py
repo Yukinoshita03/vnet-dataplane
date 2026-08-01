@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ipaddress
+import uuid
 
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -45,6 +46,7 @@ class RequiredEndpoint:
 class EndpointConfigObservation:
     source: str
     server_id: str
+    port_ids: tuple[str, ...]
     accel_role: str
     grpc_observe_port: int
     guest_grpc_listen_port: int
@@ -180,6 +182,34 @@ def parse_agent_snapshot(value: Any, source: str) -> AgentSnapshot:
                 f"agent state from {source} repeats endpoint server {server_id}"
             )
         seen_endpoint_servers.add(server_id)
+        port_ids_value = item.get("port_ids")
+        if not isinstance(port_ids_value, list) or not port_ids_value:
+            raise GateError(
+                f"agent state from {source} has invalid port_ids for "
+                f"{server_id}"
+            )
+        port_ids: list[str] = []
+        seen_port_ids: set[str] = set()
+        for raw_port_id in port_ids_value:
+            if not isinstance(raw_port_id, str) or raw_port_id != raw_port_id.strip():
+                raise GateError(
+                    f"agent state from {source} has invalid port_ids for "
+                    f"{server_id}"
+                )
+            try:
+                parsed_port_id = uuid.UUID(raw_port_id)
+            except (ValueError, AttributeError) as error:
+                raise GateError(
+                    f"agent state from {source} has invalid port_ids for "
+                    f"{server_id}"
+                ) from error
+            if str(parsed_port_id) != raw_port_id or raw_port_id in seen_port_ids:
+                raise GateError(
+                    f"agent state from {source} has invalid port_ids for "
+                    f"{server_id}"
+                )
+            seen_port_ids.add(raw_port_id)
+            port_ids.append(raw_port_id)
         accel_role = item.get("accel_role")
         if accel_role not in _COMPUTE_ROLES:
             raise GateError(
@@ -218,6 +248,7 @@ def parse_agent_snapshot(value: Any, source: str) -> AgentSnapshot:
             EndpointConfigObservation(
                 source,
                 server_id,
+                tuple(port_ids),
                 accel_role,
                 grpc_ports["grpc_observe_port"],
                 grpc_ports["guest_grpc_listen_port"],
@@ -659,6 +690,21 @@ def evaluate_gate(
                 )
             endpoint_configs.append(matches[0])
         config_reference = endpoint_configs[0]
+        missing_port_config = next(
+            (
+                item
+                for item in endpoint_configs
+                if endpoint.port_id not in item.port_ids
+            ),
+            None,
+        )
+        if missing_port_config is not None:
+            return GateDecision(
+                GateAction.BYPASS,
+                f"endpoint_port_not_allowed:{endpoint.server_id}:"
+                f"{endpoint.port_id}:{missing_port_config.source}",
+                required,
+            )
         if config_reference.accel_role != endpoint.compute_role:
             return GateDecision(
                 GateAction.BYPASS,
@@ -681,11 +727,13 @@ def evaluate_gate(
             )
         for candidate in endpoint_configs[1:]:
             if (
+                candidate.port_ids,
                 candidate.accel_role,
                 candidate.grpc_observe_port,
                 candidate.guest_grpc_listen_port,
                 candidate.trusted_dns,
             ) != (
+                config_reference.port_ids,
                 config_reference.accel_role,
                 config_reference.grpc_observe_port,
                 config_reference.guest_grpc_listen_port,
@@ -715,29 +763,6 @@ def evaluate_gate(
                 )
             endpoint_inventory.append(matches[0])
         reference = endpoint_inventory[0]
-        for candidate in endpoint_inventory[1:]:
-            mismatch = _inventory_mismatch(reference, candidate)
-            if mismatch is not None:
-                return GateDecision(
-                    GateAction.BYPASS,
-                    f"inventory_mismatch:{endpoint.server_id}:{endpoint.port_id}:"
-                    f"{mismatch}:{reference.source}:{candidate.source}",
-                    required,
-                )
-        if reference.status != "ACTIVE":
-            return GateDecision(
-                GateAction.BYPASS,
-                f"endpoint_inventory_not_active:{endpoint.server_id}:"
-                f"{endpoint.port_id}:{reference.status}",
-                required,
-            )
-        if reference.vif_type != "ovs":
-            return GateDecision(
-                GateAction.BYPASS,
-                f"endpoint_inventory_not_ovs:{endpoint.server_id}:"
-                f"{endpoint.port_id}:{reference.vif_type}",
-                required,
-            )
 
         observations = [
             item
@@ -765,6 +790,30 @@ def evaluate_gate(
                 GateAction.FREEZE,
                 f"migration_transition:{endpoint.server_id}:{endpoint.port_id}:"
                 f"{transition.source}",
+                required,
+            )
+
+        for candidate in endpoint_inventory[1:]:
+            mismatch = _inventory_mismatch(reference, candidate)
+            if mismatch is not None:
+                return GateDecision(
+                    GateAction.BYPASS,
+                    f"inventory_mismatch:{endpoint.server_id}:{endpoint.port_id}:"
+                    f"{mismatch}:{reference.source}:{candidate.source}",
+                    required,
+                )
+        if reference.status != "ACTIVE":
+            return GateDecision(
+                GateAction.BYPASS,
+                f"endpoint_inventory_not_active:{endpoint.server_id}:"
+                f"{endpoint.port_id}:{reference.status}",
+                required,
+            )
+        if reference.vif_type != "ovs":
+            return GateDecision(
+                GateAction.BYPASS,
+                f"endpoint_inventory_not_ovs:{endpoint.server_id}:"
+                f"{endpoint.port_id}:{reference.vif_type}",
                 required,
             )
         endpoint_healthy = [

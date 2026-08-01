@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -197,6 +198,7 @@ def attachment_config(root):
                 accel_role="client",
                 grpc_observe_port=50052,
                 guest_grpc_listen_port=50053,
+                port_ids=(binding().port_id,),
                 trusted_dns=("10.0.0.53",),
             ),
         ),
@@ -218,6 +220,7 @@ def client_observer_config(root):
                 accel_role="observer",
                 grpc_observe_port=50052,
                 guest_grpc_listen_port=50052,
+                port_ids=(observer_binding().port_id,),
             ),
         ),
     )
@@ -235,6 +238,7 @@ def healthy_state(updated_ms):
         "endpoint_config": [
             {
                 "server_id": "server-1",
+                "port_ids": [binding().port_id],
                 "accel_role": "client",
                 "grpc_observe_port": 50052,
                 "guest_grpc_listen_port": 50053,
@@ -255,6 +259,7 @@ def healthy_state(updated_ms):
         },
         "port_health": [
             {
+                "port_id": binding().port_id,
                 "state": "healthy",
                 "accel_role": "client",
                 "dns_capability": "xdp_client_cache",
@@ -263,6 +268,7 @@ def healthy_state(updated_ms):
                 "grpc_capability": "tc_observability",
                 "binding": {
                     "server_id": "server-1",
+                    "port_id": binding().port_id,
                     "accel_role": "client",
                     "dns_capability": "xdp_client_cache",
                     "grpc_observe_port": 50052,
@@ -280,6 +286,7 @@ def healthy_client_observer_state(updated_ms):
     state["endpoint_config"].append(
         {
             "server_id": "server-2",
+            "port_ids": [observer_binding().port_id],
             "accel_role": "observer",
             "grpc_observe_port": 50052,
             "guest_grpc_listen_port": 50052,
@@ -292,6 +299,7 @@ def healthy_client_observer_state(updated_ms):
     state["health"]["dns_capabilities"]["server-2"] = "tc_observability"
     state["port_health"].append(
         {
+            "port_id": observer_binding().port_id,
             "state": "healthy",
             "accel_role": "observer",
             "dns_capability": "tc_observability",
@@ -300,6 +308,7 @@ def healthy_client_observer_state(updated_ms):
             "grpc_capability": "tc_observability",
             "binding": {
                 "server_id": "server-2",
+                "port_id": observer_binding().port_id,
                 "accel_role": "observer",
                 "dns_capability": "tc_observability",
                 "grpc_observe_port": 50052,
@@ -409,7 +418,11 @@ class ResolverTest(unittest.TestCase):
             ): [{"ifindex": 14, "ifname": "tapaaaaaaaa-b"}],
         }
         resolver = OpenStackOvsResolver(FakeRunner(responses), "master.local")
-        discovery = resolver.discover_with_inventory("server-1")
+        discovery = resolver.discover_with_inventory(
+            "server-1",
+            (local_port,),
+        )
+        self.assertEqual(discovery.policy_errors, ())
         self.assertEqual(
             list(discovery.bindings),
             [
@@ -443,6 +456,198 @@ class ResolverTest(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_extra_active_local_ovs_port_blocks_all_bindings_and_attach(self):
+        allowed_port = binding().port_id
+        extra_port = "11111111-2222-3333-4444-555555555555"
+        responses = {
+            (
+                "openstack",
+                "port",
+                "list",
+                "--server",
+                "server-1",
+                "-f",
+                "json",
+                "-c",
+                "ID",
+            ): [{"ID": allowed_port}, {"ID": extra_port}],
+        }
+        for port_id in (allowed_port, extra_port):
+            responses[
+                (
+                    "openstack",
+                    "port",
+                    "show",
+                    port_id,
+                    "-f",
+                    "json",
+                )
+            ] = {
+                "id": port_id,
+                "device_id": "server-1",
+                "status": "ACTIVE",
+                "binding_host_id": "master",
+                "binding_vif_type": "ovs",
+                "revision_number": 7,
+            }
+        resolver = OpenStackOvsResolver(FakeRunner(responses), "master")
+
+        discovery = resolver.discover_with_inventory(
+            "server-1",
+            (allowed_port,),
+        )
+        driver = FakeDriver()
+        reconciler = Reconciler(
+            driver,
+            allowed_port_ids_by_server={"server-1": (allowed_port,)},
+        )
+        reconciler.reconcile(discovery.bindings)
+
+        self.assertEqual(discovery.bindings, ())
+        self.assertEqual(driver.actions, [])
+        self.assertIn("undeclared ACTIVE local OVS port", discovery.policy_errors[0])
+        self.assertIn(extra_port, discovery.policy_errors[0])
+
+    def test_declared_port_missing_from_server_inventory_blocks_discovery(self):
+        allowed_port = binding().port_id
+        responses = {
+            (
+                "openstack",
+                "port",
+                "list",
+                "--server",
+                "server-1",
+                "-f",
+                "json",
+                "-c",
+                "ID",
+            ): [],
+        }
+        resolver = OpenStackOvsResolver(FakeRunner(responses), "master")
+
+        discovery = resolver.discover_with_inventory(
+            "server-1",
+            (allowed_port,),
+        )
+
+        self.assertEqual(discovery.bindings, ())
+        self.assertIn("declared port is missing", discovery.policy_errors[0])
+        self.assertIn(allowed_port, discovery.policy_errors[0])
+
+    def test_declared_port_bound_to_other_host_is_normal_absent(self):
+        allowed_port = binding().port_id
+        responses = {
+            (
+                "openstack",
+                "port",
+                "list",
+                "--server",
+                "server-1",
+                "-f",
+                "json",
+                "-c",
+                "ID",
+            ): [{"ID": allowed_port}],
+            (
+                "openstack",
+                "port",
+                "show",
+                allowed_port,
+                "-f",
+                "json",
+            ): {
+                "id": allowed_port,
+                "device_id": "server-1",
+                "status": "ACTIVE",
+                "binding_host_id": "compute2",
+                "binding_vif_type": "ovs",
+                "revision_number": 8,
+            },
+        }
+        resolver = OpenStackOvsResolver(FakeRunner(responses), "master")
+
+        discovery = resolver.discover_with_inventory(
+            "server-1",
+            (allowed_port,),
+        )
+
+        self.assertEqual(discovery.bindings, ())
+        self.assertEqual(discovery.policy_errors, ())
+        self.assertEqual(discovery.port_inventory[0].binding_host, "compute2")
+
+    def test_same_allowlist_moves_cleanly_between_two_compute_resolvers(self):
+        allowed_port = binding().port_id
+
+        def responses_for(binding_host, interface, ifindex):
+            responses = {
+                (
+                    "openstack",
+                    "port",
+                    "list",
+                    "--server",
+                    "server-1",
+                    "-f",
+                    "json",
+                    "-c",
+                    "ID",
+                ): [{"ID": allowed_port}],
+                (
+                    "openstack",
+                    "port",
+                    "show",
+                    allowed_port,
+                    "-f",
+                    "json",
+                ): {
+                    "id": allowed_port,
+                    "device_id": "server-1",
+                    "status": "ACTIVE",
+                    "binding_host_id": binding_host,
+                    "binding_vif_type": "ovs",
+                    "revision_number": 9,
+                },
+                (
+                    "ovs-vsctl",
+                    "--format=json",
+                    "--columns=name",
+                    "find",
+                    "Interface",
+                    f"external_ids:iface-id={allowed_port}",
+                ): {"headings": ["name"], "data": [[interface]]},
+                (
+                    "ip",
+                    "-j",
+                    "link",
+                    "show",
+                    "dev",
+                    interface,
+                ): [{"ifindex": ifindex, "ifname": interface}],
+            }
+            return responses
+
+        before = responses_for("master", "tap-source", 14)
+        after = responses_for("compute2", "tap-target", 21)
+        source_before = OpenStackOvsResolver(FakeRunner(before), "master")
+        target_before = OpenStackOvsResolver(FakeRunner(before), "compute2")
+        source_after = OpenStackOvsResolver(FakeRunner(after), "master")
+        target_after = OpenStackOvsResolver(FakeRunner(after), "compute2")
+
+        discoveries = [
+            resolver.discover_with_inventory("server-1", (allowed_port,))
+            for resolver in (
+                source_before,
+                target_before,
+                source_after,
+                target_after,
+            )
+        ]
+
+        self.assertEqual([item.policy_errors for item in discoveries], [()] * 4)
+        self.assertEqual(len(discoveries[0].bindings), 1)
+        self.assertEqual(discoveries[1].bindings, ())
+        self.assertEqual(discoveries[2].bindings, ())
+        self.assertEqual(len(discoveries[3].bindings), 1)
 
     def test_external_discovery_commands_are_configurable(self):
         port_id = binding().port_id
@@ -619,6 +824,23 @@ class SnapshotConsistencyTest(unittest.TestCase):
 
 
 class ReconcilerTest(unittest.TestCase):
+    def test_undeclared_binding_is_rejected_before_attach(self):
+        driver = FakeDriver()
+        allowed_port = binding().port_id
+        undeclared = replace(
+            binding(),
+            port_id="11111111-2222-3333-4444-555555555555",
+        )
+        reconciler = Reconciler(
+            driver,
+            allowed_port_ids_by_server={"server-1": (allowed_port,)},
+        )
+
+        with self.assertRaisesRegex(AgentError, "not declared for server"):
+            reconciler.reconcile([undeclared])
+
+        self.assertEqual(driver.actions, [])
+
     def test_attach_is_idempotent_and_interface_recreation_reattaches(self):
         driver = FakeDriver()
         reconciler = Reconciler(driver, missing_grace_cycles=2)
@@ -785,6 +1007,7 @@ class StateSnapshotTest(unittest.TestCase):
                 accel_role="client",
                 grpc_observe_port=50052,
                 guest_grpc_listen_port=50053,
+                port_ids=(binding().port_id,),
                 trusted_dns=("10.0.0.53",),
             ),
             EndpointConfig(
@@ -792,6 +1015,7 @@ class StateSnapshotTest(unittest.TestCase):
                 accel_role="observer",
                 grpc_observe_port=50052,
                 guest_grpc_listen_port=50052,
+                port_ids=(observer_binding().port_id,),
             ),
         )
 
@@ -820,6 +1044,7 @@ class StateSnapshotTest(unittest.TestCase):
             [
                 {
                     "server_id": "server-1",
+                    "port_ids": [binding().port_id],
                     "accel_role": "client",
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50053,
@@ -827,6 +1052,7 @@ class StateSnapshotTest(unittest.TestCase):
                 },
                 {
                     "server_id": "server-2",
+                    "port_ids": [observer_binding().port_id],
                     "accel_role": "observer",
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50052,
@@ -914,6 +1140,7 @@ class StateSnapshotTest(unittest.TestCase):
                 accel_role="client",
                 grpc_observe_port=50052,
                 guest_grpc_listen_port=50053,
+                port_ids=(binding().port_id,),
                 trusted_dns=("10.0.0.53",),
             ),
         )
@@ -955,6 +1182,245 @@ class StateSnapshotTest(unittest.TestCase):
         )
         self.assertEqual(state["port_health"][0]["state"], "degraded")
         self.assertIsNone(state["port_health"][0]["binding"])
+
+
+class WaitReconcileCommandTest(unittest.TestCase):
+    def _run_wait(
+        self,
+        audit_log,
+        *,
+        after_offset,
+        audit_device,
+        audit_inode,
+        action="detach",
+        reason="binding_left_host",
+        expected_host="master",
+        timeout="0.08",
+    ):
+        module = Path(__file__).resolve().parents[1] / "agent" / (
+            "openstack_dataplane_agent.py"
+        )
+        return subprocess.run(
+            [
+                sys.executable,
+                str(module),
+                "wait-reconcile",
+                "--audit-log",
+                str(audit_log),
+                "--after-offset",
+                str(after_offset),
+                "--audit-device",
+                str(audit_device),
+                "--audit-inode",
+                str(audit_inode),
+                "--port-id",
+                binding().port_id,
+                "--server-id",
+                binding().server_id,
+                "--action",
+                action,
+                "--reason",
+                reason,
+                "--expected-host",
+                expected_host,
+                "--timeout",
+                timeout,
+                "--interval",
+                "0.01",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_wait_reconcile_matches_source_detach_after_exact_offset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.write_bytes(b'{"event":"agent_started"}\n')
+            identity = audit.stat()
+            after_offset = identity.st_size
+            expected_binding = {
+                "server_id": binding().server_id,
+                "port_id": binding().port_id,
+                "host": "master",
+                "interface": "tapport",
+                "ifindex": 14,
+            }
+            record = {
+                "event": "reconcile",
+                "action": "detach",
+                "port_id": binding().port_id,
+                "reason": "binding_left_host",
+                "binding": expected_binding,
+            }
+            with audit.open("ab") as output:
+                output.write(
+                    json.dumps(record, separators=(",", ":")).encode("utf-8")
+                    + b"\n"
+                )
+            matched_end = audit.stat().st_size
+
+            result = self._run_wait(
+                audit,
+                after_offset=after_offset,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "ready": True,
+                "matched_byte_start": after_offset,
+                "matched_byte_end": matched_end,
+                "binding": expected_binding,
+            },
+        )
+
+    def test_wait_reconcile_matches_target_attach(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            expected_binding = {
+                "server_id": binding().server_id,
+                "port_id": binding().port_id,
+                "host": "compute2",
+                "interface": "tap-target",
+                "ifindex": 27,
+            }
+            audit.write_text(
+                json.dumps(
+                    {
+                        "event": "reconcile",
+                        "action": "attach",
+                        "port_id": binding().port_id,
+                        "reason": "binding_local",
+                        "binding": expected_binding,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_wait(
+                audit,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+                action="attach",
+                reason="binding_local",
+                expected_host="compute2",
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["binding"], expected_binding)
+
+    def test_wait_reconcile_rejects_audit_identity_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+
+            result = self._run_wait(
+                audit,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino + 1,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("audit log identity changed", result.stderr)
+
+    def test_wait_reconcile_rejects_truncation_below_offset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.write_bytes(b"{}\n")
+            identity = audit.stat()
+
+            result = self._run_wait(
+                audit,
+                after_offset=identity.st_size + 1,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("truncated below after-offset", result.stderr)
+
+    def test_wait_reconcile_rejects_complete_malformed_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.write_bytes(b"not-json\n")
+            identity = audit.stat()
+
+            result = self._run_wait(
+                audit,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid JSON after offset 0", result.stderr)
+
+    def test_wait_reconcile_does_not_accept_an_invalid_binding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            audit.write_text(
+                json.dumps(
+                    {
+                        "event": "reconcile",
+                        "action": "detach",
+                        "port_id": binding().port_id,
+                        "reason": "binding_left_host",
+                        "binding": {
+                            "server_id": binding().server_id,
+                            "port_id": binding().port_id,
+                            "host": "master",
+                            "interface": "tapport",
+                            "ifindex": "14",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = self._run_wait(
+                audit,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+                timeout="0.03",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("audit_has_no_matching_reconcile", result.stderr)
+
+    def test_wait_reconcile_rejects_an_action_reason_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            audit = Path(temp) / "agent-audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+
+            result = self._run_wait(
+                audit,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+                action="detach",
+                reason="binding_local",
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "detach requires reason binding_left_host",
+            result.stderr,
+        )
 
 
 class HealthCommandTest(unittest.TestCase):
@@ -1217,15 +1683,76 @@ class EndpointConfigTest(unittest.TestCase):
         path.write_text(json.dumps(value), encoding="utf-8")
         return _load_endpoint_configs(path)
 
+    def test_port_ids_are_required_canonical_and_unique(self):
+        port_id = binding().port_id
+        valid = {
+            "server_id": "client-vm",
+            "port_ids": [port_id],
+            "accel_role": "client",
+            "grpc_observe_port": 50052,
+            "guest_grpc_listen_port": 50053,
+            "trusted_dns": ["10.0.0.53"],
+        }
+        cases = {
+            "missing": (
+                {key: value for key, value in valid.items() if key != "port_ids"},
+                "port_ids must be a non-empty",
+            ),
+            "empty": ({**valid, "port_ids": []}, "port_ids must be a non-empty"),
+            "duplicate": (
+                {**valid, "port_ids": [port_id, port_id]},
+                "duplicate port ID",
+            ),
+            "non-canonical": (
+                {**valid, "port_ids": [port_id.upper()]},
+                "canonical UUID",
+            ),
+            "invalid": (
+                {**valid, "port_ids": ["not-a-uuid"]},
+                "canonical UUID",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, (endpoint, error) in cases.items():
+                with (
+                    self.subTest(name=name),
+                    self.assertRaisesRegex(AgentError, error),
+                ):
+                    self._load(
+                        root,
+                        {"schema_version": 2, "endpoints": [endpoint]},
+                    )
+
+            duplicate_across_endpoints = [
+                valid,
+                {
+                    "server_id": "observer-vm",
+                    "port_ids": [port_id],
+                    "accel_role": "observer",
+                    "grpc_observe_port": 50052,
+                    "guest_grpc_listen_port": 50052,
+                },
+            ]
+            with self.assertRaisesRegex(AgentError, "duplicate port ID"):
+                self._load(
+                    root,
+                    {
+                        "schema_version": 2,
+                        "endpoints": duplicate_across_endpoints,
+                    },
+                )
+
     def test_loads_separate_observe_and_guest_listen_ports(self):
         with tempfile.TemporaryDirectory() as temp:
             configs = self._load(
                 Path(temp),
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "endpoints": [
                         {
                             "server_id": "client-vm",
+                            "port_ids": [binding().port_id],
                             "accel_role": "client",
                             "grpc_observe_port": 50052,
                             "guest_grpc_listen_port": 50053,
@@ -1233,6 +1760,7 @@ class EndpointConfigTest(unittest.TestCase):
                         },
                         {
                             "server_id": "backend-vm",
+                            "port_ids": [observer_binding().port_id],
                             "accel_role": "observer",
                             "grpc_observe_port": 50052,
                             "guest_grpc_listen_port": 50052,
@@ -1249,6 +1777,7 @@ class EndpointConfigTest(unittest.TestCase):
                     accel_role="client",
                     grpc_observe_port=50052,
                     guest_grpc_listen_port=50053,
+                    port_ids=(binding().port_id,),
                     trusted_dns=("10.0.0.53", "10.0.0.54"),
                 ),
                 EndpointConfig(
@@ -1256,6 +1785,7 @@ class EndpointConfigTest(unittest.TestCase):
                     accel_role="observer",
                     grpc_observe_port=50052,
                     guest_grpc_listen_port=50052,
+                    port_ids=(observer_binding().port_id,),
                 ),
             ),
         )
@@ -1263,6 +1793,7 @@ class EndpointConfigTest(unittest.TestCase):
     def test_legacy_missing_and_invalid_grpc_port_fields_fail_closed(self):
         valid = {
             "server_id": "client-vm",
+            "port_ids": [binding().port_id],
             "accel_role": "client",
             "grpc_observe_port": 50052,
             "guest_grpc_listen_port": 50053,
@@ -1308,7 +1839,7 @@ class EndpointConfigTest(unittest.TestCase):
                     self._load(
                         root,
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "endpoints": [endpoint],
                         },
                     )
@@ -1318,6 +1849,7 @@ class EndpointConfigTest(unittest.TestCase):
             "missing role": [
                 {
                     "server_id": "server-1",
+                    "port_ids": [binding().port_id],
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50053,
                     "trusted_dns": ["10.0.0.53"],
@@ -1326,6 +1858,7 @@ class EndpointConfigTest(unittest.TestCase):
             "invalid role": [
                 {
                     "server_id": "server-1",
+                    "port_ids": [binding().port_id],
                     "accel_role": "dual",
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50053,
@@ -1335,6 +1868,7 @@ class EndpointConfigTest(unittest.TestCase):
             "duplicate server": [
                 {
                     "server_id": "server-1",
+                    "port_ids": [binding().port_id],
                     "accel_role": "client",
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50053,
@@ -1342,6 +1876,7 @@ class EndpointConfigTest(unittest.TestCase):
                 },
                 {
                     "server_id": "server-1",
+                    "port_ids": [observer_binding().port_id],
                     "accel_role": "client",
                     "grpc_observe_port": 50052,
                     "guest_grpc_listen_port": 50054,
@@ -1355,7 +1890,7 @@ class EndpointConfigTest(unittest.TestCase):
                 with self.subTest(name=name), self.assertRaises(AgentError):
                     self._load(
                         root,
-                        {"schema_version": 1, "endpoints": endpoints},
+                        {"schema_version": 2, "endpoints": endpoints},
                     )
 
     def test_server_dns_role_is_rejected_on_host_vm_interface(self):
@@ -1364,10 +1899,11 @@ class EndpointConfigTest(unittest.TestCase):
                 self._load(
                     Path(temp),
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "endpoints": [
                             {
                                 "server_id": "backend-vm",
+                                "port_ids": [observer_binding().port_id],
                                 "accel_role": "server",
                                 "grpc_observe_port": 50052,
                                 "guest_grpc_listen_port": 50052,
@@ -1392,10 +1928,11 @@ class EndpointConfigTest(unittest.TestCase):
                     self._load(
                         root,
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "endpoints": [
                                 {
                                     "server_id": "backend-vm",
+                                    "port_ids": [observer_binding().port_id],
                                     "accel_role": "observer",
                                     "grpc_observe_port": 50052,
                                     "guest_grpc_listen_port": 50052,
@@ -1418,6 +1955,88 @@ class DeploymentUnitTest(unittest.TestCase):
 
         self.assertNotIn("${VNET_VERBOSE_EVENTS}", unit)
         self.assertNotIn("Environment=VNET_VERBOSE_EVENTS=", unit)
+
+    def test_agent_unit_allows_fail_closed_multi_port_cleanup_to_finish(self):
+        root = Path(__file__).resolve().parents[1]
+        unit = (
+            root
+            / "deploy"
+            / "systemd"
+            / "vnet-dataplane-agent.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("TimeoutStopSec=300", unit)
+
+
+class WatchLifecycleTest(unittest.TestCase):
+    def test_watch_returns_failure_when_stop_cleanup_leaves_an_attachment(self):
+        driver = FakeDriver()
+        current = binding()
+        driver.fail_detach.add(current.port_id)
+        endpoint = EndpointConfig(
+            server_id=current.server_id,
+            accel_role="client",
+            grpc_observe_port=50052,
+            guest_grpc_listen_port=50053,
+            port_ids=(current.port_id,),
+            trusted_dns=("10.0.0.53",),
+        )
+        sample = argparse.Namespace(
+            result=discovery_result(),
+            completed_ms=1_000,
+        )
+        args = argparse.Namespace(
+            interval=0.001,
+            policy_lock_root=Path("/run/vnet-dataplane-policy"),
+            endpoint_config=Path("/unused/endpoints.json"),
+            local_host="master",
+            dns_monitor=Path("/unused/dns-monitor"),
+            dns_client_bpf=Path("/unused/dns-client.bpf.o"),
+            dns_tc_bpf=Path("/unused/dns-tc.bpf.o"),
+            grpc_monitor=Path("/unused/grpc-monitor"),
+            grpc_bpf=Path("/unused/grpc.bpf.o"),
+            cache_policy_txn=Path("/unused/cache-policy-txn"),
+            pin_root=Path("/sys/fs/bpf/vnet-dataplane-agent"),
+            log_root=Path("/var/log/vnet-dataplane-agent"),
+            verbose_events=False,
+            missing_grace_cycles=1,
+            state_file=Path("/unused/state.json"),
+            audit_log=None,
+            max_cycles=1,
+        )
+
+        with (
+            patch(
+                "agent.openstack_dataplane_agent.os.geteuid",
+                return_value=0,
+                create=True,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._load_endpoint_configs",
+                return_value=(endpoint,),
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._local_host",
+                return_value="master",
+            ),
+            patch("agent.openstack_dataplane_agent.OpenStackOvsResolver"),
+            patch(
+                "agent.openstack_dataplane_agent.ProcessAttachmentDriver",
+                return_value=driver,
+            ),
+            patch(
+                "agent.openstack_dataplane_agent._sample_discovery",
+                return_value=sample,
+            ),
+            patch("agent.openstack_dataplane_agent._write_state"),
+            patch("agent.openstack_dataplane_agent.signal.signal"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            result = _watch(args)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(reconciled := driver.attached, {current.port_id: current})
+        self.assertIn(current.port_id, reconciled)
 
 
 class ProcessAttachmentDriverTest(unittest.TestCase):
@@ -2165,6 +2784,20 @@ class ProcessAttachmentDriverTest(unittest.TestCase):
                 AgentError, "no endpoint config for server server-2"
             ):
                 driver.commands(unconfigured)
+
+    def test_binding_with_undeclared_port_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            driver = ProcessAttachmentDriver(attachment_config(Path(temp)))
+            undeclared = replace(
+                binding(),
+                port_id="11111111-2222-3333-4444-555555555555",
+            )
+
+            with self.assertRaisesRegex(
+                AgentError,
+                "not declared for server server-1",
+            ):
+                driver.commands(undeclared)
 
     def test_attach_initializes_committed_bypass_before_health(self):
         with tempfile.TemporaryDirectory() as temp:

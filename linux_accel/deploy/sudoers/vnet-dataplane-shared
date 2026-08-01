@@ -1,0 +1,5 @@
+# Generated for the disabled shared-cluster staging units.
+# Wildcard arguments are constrained by root-owned validating wrappers.
+ubuntu ALL=(root) NOPASSWD: /usr/bin/cat /run/vnet-dataplane-shared-agent/state.json
+ubuntu ALL=(root) NOPASSWD: /opt/vnet-dataplane-shared/bin/cache_policy_txn *
+ubuntu ALL=(root) NOPASSWD: /opt/vnet-dataplane-shared/bin/snapshot_log *

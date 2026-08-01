@@ -105,6 +105,9 @@ struct ReaderState {
     uint64_t last_cache_policy_bypass = 0;
     uint64_t last_cache_shadow_hit = 0;
     uint64_t last_cache_shadow_miss = 0;
+    uint64_t query_total = 0;
+    uint64_t timeout_total = 0;
+    uint64_t unmatched_total = 0;
     int dropped_events_fd = -1;
     int cache_stats_fd = -1;
 };
@@ -128,6 +131,7 @@ double average_history_p95(const std::deque<HistoryWindow> &history);
 void collect_timeouts(ReaderState *state);
 uint64_t read_dropped_events_total(int map_fd);
 uint64_t read_percpu_counter_total(int map_fd, __u32 key);
+bool try_read_percpu_counter_total(int map_fd, __u32 key, uint64_t *total);
 std::string build_alerts(const WindowMetrics &metrics,
                          const std::deque<HistoryWindow> &history,
                          double qps_spike_factor,

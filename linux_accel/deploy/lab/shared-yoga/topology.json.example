@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "deployment_id": "shared-yoga-e2e",
+  "known_hosts_file": "/etc/vnet-dataplane-agent/known_hosts.shared-yoga-e2e",
+  "inventory": {
+    "schema_version": 1,
+    "clock_tolerance_ms": 10,
+    "allowed_server_ids": [
+      "REPLACE_CLIENT_SERVER_UUID",
+      "REPLACE_BACKEND_SERVER_UUID"
+    ],
+    "allowed_port_ids": [
+      "REPLACE_CLIENT_PORT_UUID",
+      "REPLACE_BACKEND_PORT_UUID"
+    ],
+    "owner_project_id": "REPLACE_OWNER_PROJECT_UUID",
+    "ownership_tag": "vnet-dataplane-owner-replace-me",
+    "port_server_bindings": {
+      "REPLACE_CLIENT_PORT_UUID": "REPLACE_CLIENT_SERVER_UUID",
+      "REPLACE_BACKEND_PORT_UUID": "REPLACE_BACKEND_SERVER_UUID"
+    },
+    "port_fixed_ipv4s": {
+      "REPLACE_CLIENT_PORT_UUID": "REPLACE_CLIENT_PRIVATE_IPV4",
+      "REPLACE_BACKEND_PORT_UUID": "REPLACE_BACKEND_PRIVATE_IPV4"
+    },
+    "port_mac_addresses": {
+      "REPLACE_CLIENT_PORT_UUID": "REPLACE_CLIENT_MAC_ADDRESS",
+      "REPLACE_BACKEND_PORT_UUID": "REPLACE_BACKEND_MAC_ADDRESS"
+    },
+    "minimum_target_capacity": {
+      "vcpus": 2,
+      "memory_mb": 2048,
+      "disk_gb": 20
+    },
+    "roles": {
+      "controller": {
+        "address": "REPLACE_CONTROLLER_PRIVATE_IPV4",
+        "ssh_user": "ubuntu",
+        "expected_hostname": "controller",
+        "host_key_fingerprint": "REPLACE_VERIFIED_CONTROLLER_ED25519_FINGERPRINT",
+        "expected_clock_reference": "REPLACE_APPROVED_CLOCK_REFERENCE",
+        "openstack_cloud": "REPLACE_OPENSTACK_CLOUD_NAME"
+      },
+      "source": {
+        "address": "REPLACE_COMPUTE2_PRIVATE_IPV4",
+        "ssh_user": "ubuntu",
+        "expected_hostname": "compute2",
+        "host_key_fingerprint": "REPLACE_VERIFIED_COMPUTE2_ED25519_FINGERPRINT",
+        "expected_clock_reference": "REPLACE_APPROVED_CLOCK_REFERENCE",
+        "allowed_libvirt_domains": [
+          "REPLACE_OWNED_CLIENT_DOMAIN",
+          "REPLACE_OWNED_BACKEND_DOMAIN"
+        ],
+        "required_ovs_bridges": [
+          "br-int"
+        ],
+        "required_tap_interfaces": [
+          "REPLACE_COMPUTE2_CLIENT_TAP",
+          "REPLACE_COMPUTE2_BACKEND_TAP"
+        ],
+        "required_port_bindings": {
+          "REPLACE_CLIENT_PORT_UUID": "REPLACE_COMPUTE2_CLIENT_TAP",
+          "REPLACE_BACKEND_PORT_UUID": "REPLACE_COMPUTE2_BACKEND_TAP"
+        }
+      },
+      "target": {
+        "address": "REPLACE_COMPUTE3_PRIVATE_IPV4",
+        "ssh_user": "ubuntu",
+        "expected_hostname": "compute3",
+        "host_key_fingerprint": "REPLACE_VERIFIED_COMPUTE3_ED25519_FINGERPRINT",
+        "expected_clock_reference": "REPLACE_APPROVED_CLOCK_REFERENCE",
+        "allowed_libvirt_domains": [],
+        "required_ovs_bridges": [
+          "br-int"
+        ],
+        "required_tap_interfaces": [],
+        "required_port_bindings": {}
+      }
+    }
+  },
+  "hosts": {
+    "controller": {
+      "ssh_destination": "ubuntu@REPLACE_CONTROLLER_PRIVATE_IPV4"
+    },
+    "source": {
+      "nova_host": "compute2",
+      "ssh_destination": "ubuntu@REPLACE_COMPUTE2_PRIVATE_IPV4"
+    },
+    "target": {
+      "nova_host": "compute3",
+      "ssh_destination": "ubuntu@REPLACE_COMPUTE3_PRIVATE_IPV4"
+    }
+  },
+  "interfaces": {
+    "source": {
+      "client": "REPLACE_COMPUTE2_CLIENT_TAP",
+      "backend": "REPLACE_COMPUTE2_BACKEND_TAP"
+    },
+    "target": {
+      "client": "REPLACE_COMPUTE2_CLIENT_TAP",
+      "backend": "REPLACE_COMPUTE2_BACKEND_TAP"
+    }
+  },
+  "guests": {
+    "client": {
+      "server_id": "REPLACE_CLIENT_SERVER_UUID",
+      "port_id": "REPLACE_CLIENT_PORT_UUID",
+      "private_ipv4": "REPLACE_CLIENT_PRIVATE_IPV4",
+      "mac_address": "REPLACE_CLIENT_MAC_ADDRESS",
+      "ssh_destination": "ubuntu@REPLACE_CLIENT_PRIVATE_IPV4",
+      "interface": "REPLACE_CLIENT_GUEST_INTERFACE"
+    },
+    "backend": {
+      "server_id": "REPLACE_BACKEND_SERVER_UUID",
+      "port_id": "REPLACE_BACKEND_PORT_UUID",
+      "private_ipv4": "REPLACE_BACKEND_PRIVATE_IPV4",
+      "mac_address": "REPLACE_BACKEND_MAC_ADDRESS",
+      "ssh_destination": "ubuntu@REPLACE_BACKEND_PRIVATE_IPV4",
+      "interface": "REPLACE_BACKEND_GUEST_INTERFACE"
+    }
+  }
+}

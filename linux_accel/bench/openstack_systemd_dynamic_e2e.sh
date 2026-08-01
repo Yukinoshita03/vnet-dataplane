@@ -19,19 +19,35 @@ convergence_windows="${CONVERGENCE_WINDOWS:-3}"
 commit_timeout="${COMMIT_TIMEOUT:-45}"
 expected_compute_host="${EXPECTED_COMPUTE_HOST:-master}"
 compute2_host="${COMPUTE2_HOST:-compute2}"
+source_compute_remote="${SOURCE_COMPUTE_REMOTE:-0}"
+source_compute_ssh="${SOURCE_COMPUTE_SSH_TARGET:-${expected_compute_host}}"
+target_compute_ssh="${TARGET_COMPUTE_SSH_TARGET:-${compute2_host}}"
 client_guest_host="${CLIENT_GUEST_HOST:-client-guest}"
 backend_guest_host="${BACKEND_GUEST_HOST:-backend-guest}"
 action_driver="${VNET_E2E_ACTION_DRIVER:-}"
 execution_mode="real"
 [[ -z "${action_driver}" ]] || execution_mode="test_driver"
+skip_shared_preflight="${VNET_E2E_SKIP_SHARED_PREFLIGHT:-0}"
 deploy_artifacts="${DEPLOY_ARTIFACTS:-1}"
 require_netmig_tc="${REQUIRE_NETMIG_TC:-1}"
 preflight_only="${PREFLIGHT_ONLY:-0}"
 cleanup_audit_only="${CLEANUP_AUDIT_ONLY:-0}"
+migration_mode="${MIGRATION_MODE:-disabled}"
+migration_timeout="${MIGRATION_TIMEOUT:-900}"
+migration_poll_interval="${MIGRATION_POLL_INTERVAL:-2}"
+migration_transition_timeout="${MIGRATION_TRANSITION_TIMEOUT:-120}"
+migration_wait_outer_timeout="${MIGRATION_WAIT_OUTER_TIMEOUT:-180}"
+migration_command_timeout="${MIGRATION_COMMAND_TIMEOUT:-30}"
+continuity_interval="${CONTINUITY_INTERVAL:-0.1}"
+continuity_command_timeout="${CONTINUITY_COMMAND_TIMEOUT:-5}"
+continuity_stop_timeout="${CONTINUITY_STOP_TIMEOUT:-15}"
+continuity_min_samples="${CONTINUITY_MIN_SAMPLES:-5}"
+continuity_max_duration="${CONTINUITY_MAX_DURATION:-2400}"
 remote_command_timeout="${REMOTE_COMMAND_TIMEOUT:-30}"
 probe_timeout="${PROBE_TIMEOUT:-5}"
 deployment_timeout="${DEPLOYMENT_TIMEOUT:-60}"
 attach_timeout="${ATTACH_TIMEOUT:-90}"
+shared_preflight_timeout="${SHARED_PREFLIGHT_TIMEOUT:-15}"
 
 openstack_openrc="${OPENSTACK_OPENRC:-/opt/stack/devstack/openrc}"
 openstack_openrc_user="${OPENSTACK_OPENRC_USER:-admin}"
@@ -43,22 +59,40 @@ sudo_bin="${SUDO_BIN:-sudo}"
 tar_bin="${TAR_BIN:-tar}"
 timeout_bin="${TIMEOUT_BIN:-timeout}"
 known_hosts="${VNET_KNOWN_HOSTS:-/etc/vnet-dataplane-agent/lab-known-hosts.p1}"
+deploy_profile="${DEPLOY_PROFILE:-shuka1-p1}"
+[[ "${deploy_profile}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || {
+  echo "DEPLOY_PROFILE contains unsupported characters" >&2
+  exit 2
+}
+profile_dir="${accel_dir}/deploy/lab/${deploy_profile}"
+profile_rel="linux_accel/deploy/lab/${deploy_profile}"
+profile_remote="/opt/vnet-dataplane/${profile_rel}"
 
 coordinator_script="${accel_dir}/agent/openstack_epoch_coordinator.py"
+migration_script="${accel_dir}/bench/openstack_migration_leg.py"
+continuity_script="${accel_dir}/bench/migration_continuity_probe.py"
+shared_preflight_script="${accel_dir}/bench/openstack_shared_cluster_preflight.py"
+shared_inventory="${SHARED_CLUSTER_INVENTORY:-}"
+shared_ssh_identity="${SHARED_SSH_IDENTITY_FILE:-}"
+host_agent_script="${accel_dir}/agent/openstack_dataplane_agent.py"
 coordinator_config="/etc/vnet-dataplane-agent/coordinator.json"
 desired_mode_file="/run/vnet-dataplane-metrics-controller/desired-mode.json"
 coordinator_state_file="/var/lib/vnet-dataplane-epoch/state.json"
 coordinator_audit_log="/var/log/vnet-dataplane-epoch/audit.jsonl"
+host_agent_state_file="/run/vnet-dataplane-agent/state.json"
+host_agent_audit_log="/var/log/vnet-dataplane-agent/audit.jsonl"
+continuity_remote_root="/var/log/vnet-dataplane-continuity"
+continuity_run_id="${VNET_CONTINUITY_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 
-coordinator_unit="vnet-dataplane-epoch-coordinator.service"
-metrics_unit="vnet-dataplane-metrics-controller.service"
-host_agent_unit="vnet-dataplane-agent.service"
-guest_agent_unit="vnet-dataplane-guest-endpoint.service"
-dns_backend_unit="vnet-lab-dns-backend.service"
-grpc_backend_unit="vnet-lab-grpc-backend.service"
+coordinator_unit="${COORDINATOR_UNIT:-vnet-dataplane-epoch-coordinator.service}"
+metrics_unit="${METRICS_UNIT:-vnet-dataplane-metrics-controller.service}"
+host_agent_unit="${HOST_AGENT_UNIT:-vnet-dataplane-agent.service}"
+guest_agent_unit="${GUEST_AGENT_UNIT:-vnet-dataplane-guest-endpoint.service}"
+dns_backend_unit="${DNS_BACKEND_UNIT:-vnet-lab-dns-backend.service}"
+grpc_backend_unit="${GRPC_BACKEND_UNIT:-vnet-lab-grpc-backend.service}"
 
-client_tap="tap${client_port_id:0:11}"
-backend_tap="tap${backend_port_id:0:11}"
+client_tap="${CLIENT_HOST_INTERFACE:-tap${client_port_id:0:11}}"
+backend_tap="${BACKEND_HOST_INTERFACE:-tap${backend_port_id:0:11}}"
 total_requests=$((requests + warmup))
 
 run_status="failed"
@@ -71,6 +105,16 @@ bypass_epoch=0
 server_epoch=0
 dns_backend_suppressed=false
 experiment_executed=false
+migration_started=0
+migration_roundtrip_completed=false
+migration_recovery_attempted=false
+migration_recovery_completed=false
+backend_current_host="${expected_compute_host}"
+continuity_active=0
+continuity_phase=""
+continuity_unit=""
+continuity_remote_dir=""
+metrics_invocation_id=""
 
 if [[ -e "${out_dir}" && ! -d "${out_dir}" ]]; then
   echo "OUT_DIR exists and is not a directory: ${out_dir}" >&2
@@ -117,13 +161,68 @@ done
   echo "COMMIT_TIMEOUT must be positive" >&2
   exit 2
 }
-for timeout_name in remote_command_timeout probe_timeout deployment_timeout attach_timeout; do
+for timeout_name in remote_command_timeout probe_timeout deployment_timeout attach_timeout shared_preflight_timeout; do
   timeout_value="${!timeout_name}"
   [[ "${timeout_value}" =~ ^[1-9][0-9]*$ ]] || {
     echo "${timeout_name} must be a positive integer" >&2
     exit 2
   }
 done
+for timeout_name in migration_timeout migration_poll_interval migration_transition_timeout migration_wait_outer_timeout migration_command_timeout; do
+  timeout_value="${!timeout_name}"
+  [[ "${timeout_value}" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo "${timeout_name} must be positive" >&2
+    exit 2
+  }
+  "${python_bin}" - "${timeout_name}" "${timeout_value}" <<'PY'
+import sys
+
+if float(sys.argv[2]) <= 0:
+    raise SystemExit(f"{sys.argv[1]} must be positive")
+PY
+done
+"${python_bin}" - "${migration_transition_timeout}" \
+  "${migration_wait_outer_timeout}" "${migration_timeout}" \
+  "${migration_command_timeout}" <<'PY'
+import sys
+
+transition, outer, total, command = map(float, sys.argv[1:])
+if outer <= transition:
+    raise SystemExit("MIGRATION_WAIT_OUTER_TIMEOUT must exceed MIGRATION_TRANSITION_TIMEOUT")
+if command > total:
+    raise SystemExit("MIGRATION_COMMAND_TIMEOUT must not exceed MIGRATION_TIMEOUT")
+PY
+for numeric_name in continuity_interval continuity_command_timeout continuity_stop_timeout continuity_max_duration; do
+  numeric_value="${!numeric_name}"
+  [[ "${numeric_value}" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo "${numeric_name} must be positive" >&2
+    exit 2
+  }
+  "${python_bin}" - "${numeric_name}" "${numeric_value}" <<'PY'
+import sys
+
+if float(sys.argv[2]) <= 0:
+    raise SystemExit(f"{sys.argv[1]} must be positive")
+PY
+done
+"${python_bin}" - "${continuity_command_timeout}" "${continuity_stop_timeout}" \
+  "${remote_command_timeout}" <<'PY'
+import sys
+
+command_timeout, stop_timeout, remote_timeout = map(float, sys.argv[1:])
+if stop_timeout <= command_timeout:
+    raise SystemExit("CONTINUITY_STOP_TIMEOUT must exceed CONTINUITY_COMMAND_TIMEOUT")
+if remote_timeout <= stop_timeout:
+    raise SystemExit("REMOTE_COMMAND_TIMEOUT must exceed CONTINUITY_STOP_TIMEOUT")
+PY
+[[ "${continuity_min_samples}" =~ ^[1-9][0-9]*$ ]] || {
+  echo "continuity_min_samples must be a positive integer" >&2
+  exit 2
+}
+[[ "${continuity_run_id}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || {
+  echo "VNET_CONTINUITY_RUN_ID contains unsupported characters" >&2
+  exit 2
+}
 [[ "${deploy_artifacts}" == 0 || "${deploy_artifacts}" == 1 ]] || {
   echo "DEPLOY_ARTIFACTS must be 0 or 1" >&2
   exit 2
@@ -140,6 +239,53 @@ done
   echo "CLEANUP_AUDIT_ONLY must be 0 or 1" >&2
   exit 2
 }
+[[ "${migration_mode}" == disabled || "${migration_mode}" == roundtrip ]] || {
+  echo "MIGRATION_MODE must be disabled or roundtrip" >&2
+  exit 2
+}
+[[ "${source_compute_remote}" == 0 || "${source_compute_remote}" == 1 ]] || {
+  echo "SOURCE_COMPUTE_REMOTE must be 0 or 1" >&2
+  exit 2
+}
+[[ "${skip_shared_preflight}" == 0 || "${skip_shared_preflight}" == 1 ]] || {
+  echo "VNET_E2E_SKIP_SHARED_PREFLIGHT must be 0 or 1" >&2
+  exit 2
+}
+if [[ "${skip_shared_preflight}" == 1 && -z "${action_driver}" ]]; then
+  echo "VNET_E2E_SKIP_SHARED_PREFLIGHT is test-driver-only" >&2
+  exit 2
+fi
+if [[ "${source_compute_remote}" == 1 ]]; then
+  for required_name in SOURCE_COMPUTE_SSH_TARGET TARGET_COMPUTE_SSH_TARGET \
+    CLIENT_HOST_INTERFACE BACKEND_HOST_INTERFACE DEPLOY_PROFILE \
+    VNET_KNOWN_HOSTS REQUIRE_NETMIG_TC SHARED_CLUSTER_INVENTORY \
+    SHARED_SSH_IDENTITY_FILE; do
+    required_value="${!required_name-}"
+    [[ -n "${required_value}" ]] || {
+      echo "remote source Compute requires explicit ${required_name}" >&2
+      exit 2
+    }
+  done
+  [[ "${deploy_artifacts}" == 0 ]] || {
+    echo "remote source Compute requires pre-staged artifacts (set DEPLOY_ARTIFACTS=0); use the shared-cluster stage deployer" >&2
+    exit 2
+  }
+fi
+for interface_name in client_tap backend_tap; do
+  interface_value="${!interface_name}"
+  [[ "${interface_value}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$ ]] || {
+    echo "${interface_name} is not a safe Linux interface name" >&2
+    exit 2
+  }
+done
+for unit_name in coordinator_unit metrics_unit host_agent_unit guest_agent_unit \
+  dns_backend_unit grpc_backend_unit; do
+  unit_value="${!unit_name}"
+  [[ "${unit_value}" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,126}[.]service$ ]] || {
+    echo "${unit_name} is not a safe systemd service name" >&2
+    exit 2
+  }
+done
 (( preflight_only + cleanup_audit_only <= 1 )) || {
   echo "PREFLIGHT_ONLY and CLEANUP_AUDIT_ONLY are mutually exclusive" >&2
   exit 2
@@ -149,6 +295,18 @@ done
   echo "client and backend OpenStack identities must be distinct" >&2
   exit 2
 }
+[[ "${expected_compute_host}" != "${compute2_host}" ]] || {
+  echo "source and target Nova hosts must be distinct" >&2
+  exit 2
+}
+[[ "${source_compute_ssh}" != "${target_compute_ssh}" ]] || {
+  echo "source and target SSH destinations must be distinct" >&2
+  exit 2
+}
+[[ "${client_guest_host}" != "${backend_guest_host}" ]] || {
+  echo "client and backend guest SSH destinations must be distinct" >&2
+  exit 2
+}
 for uuid_name in client_server_id client_port_id backend_server_id backend_port_id; do
   uuid_value="${!uuid_name}"
   [[ "${uuid_value}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || {
@@ -156,7 +314,8 @@ for uuid_name in client_server_id client_port_id backend_server_id backend_port_
     exit 2
   }
 done
-for host_name in expected_compute_host compute2_host client_guest_host backend_guest_host; do
+for host_name in expected_compute_host compute2_host source_compute_ssh \
+  target_compute_ssh client_guest_host backend_guest_host; do
   host_value="${!host_name}"
   [[ "${host_value}" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]{0,254}$ ]] || {
     echo "${host_name} contains unsupported SSH hostname characters" >&2
@@ -205,10 +364,84 @@ remote_sudo() {
   remote_exec "${host}" /usr/bin/sudo -n "$@"
 }
 
+remote_exec_timeout() {
+  local command_timeout="$1" host="$2"
+  shift 2
+  "${timeout_bin}" --signal=TERM "${command_timeout}" \
+    "${ssh_bin}" -n "${ssh_options[@]}" "${host}" "$@"
+}
+
+remote_sudo_timeout() {
+  local command_timeout="$1" host="$2"
+  shift 2
+  remote_exec_timeout "${command_timeout}" "${host}" /usr/bin/sudo -n "$@"
+}
+
 remote_sudo_probe() {
   local host="$1"
   shift
   remote_probe "${host}" /usr/bin/sudo -n "$@"
+}
+
+compute_ssh_target() {
+  case "$1" in
+    "${expected_compute_host}")
+      printf '%s\n' "${source_compute_ssh}"
+      ;;
+    "${compute2_host}")
+      printf '%s\n' "${target_compute_ssh}"
+      ;;
+    *)
+      echo "unknown compute host: $1" >&2
+      return 2
+      ;;
+  esac
+}
+
+remote_service_target() {
+  case "$1" in
+    "${expected_compute_host}"|"${compute2_host}")
+      compute_ssh_target "$1"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+host_sudo() {
+  local host="$1"
+  shift
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    local_sudo "$@"
+  else
+    remote_sudo "$(compute_ssh_target "${host}")" "$@"
+  fi
+}
+
+host_sudo_probe() {
+  local host="$1"
+  shift
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    local_sudo "$@"
+  else
+    remote_sudo_probe "$(compute_ssh_target "${host}")" "$@"
+  fi
+}
+
+host_sudo_timeout() {
+  local command_timeout="$1" host="$2"
+  shift 2
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    "${timeout_bin}" --signal=TERM "${command_timeout}" \
+      "${sudo_bin}" -n "$@"
+  else
+    remote_sudo_timeout "${command_timeout}" \
+      "$(compute_ssh_target "${host}")" "$@"
+  fi
 }
 
 systemctl_local() {
@@ -379,18 +612,19 @@ PY
 
 validate_bundle_configuration() {
   "${python_bin}" - \
-    "${accel_dir}/deploy/lab/shuka1-p1/endpoint-client.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/endpoint-server.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/coordinator.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/metrics-bridge.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/dns-cache.policy" \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-lab-dns-backend.service" \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-lab-grpc-backend.service" \
+    "${profile_dir}/endpoint-client.json" \
+    "${profile_dir}/endpoint-server.json" \
+    "${profile_dir}/coordinator.json" \
+    "${profile_dir}/metrics-bridge.json" \
+    "${profile_dir}/dns-cache.policy" \
+    "${profile_dir}/vnet-lab-dns-backend.service" \
+    "${profile_dir}/vnet-lab-grpc-backend.service" \
     "${client_server_id}" "${client_port_id}" \
     "${backend_server_id}" "${backend_port_id}" \
     "${client_ip}" "${backend_ip}" \
     "${client_guest_host}" "${backend_guest_host}" "${compute2_host}" \
-    "${expected_compute_host}" <<'PY'
+    "${expected_compute_host}" "${source_compute_ssh}" \
+    "${target_compute_ssh}" "${source_compute_remote}" <<'PY'
 import json
 import re
 import sys
@@ -422,7 +656,11 @@ def load(path):
     backend_host,
     compute2_host,
     expected_compute_host,
+    source_compute_ssh,
+    target_compute_ssh,
+    source_compute_remote,
 ) = sys.argv[1:]
+source_compute_remote = source_compute_remote == "1"
 
 client = load(client_endpoint_path)
 backend = load(backend_endpoint_path)
@@ -552,6 +790,26 @@ for name, expected_values in expected_publishers.items():
     if publisher["port_id"] not in command_text or "cache_policy_txn" not in command_text:
         raise SystemExit(f"coordinator publisher command is misbound: {name}")
 
+for name in ("master-client-caches", "backend-host-caches"):
+    publisher = publisher_by_name[name]
+    command_text = json.dumps(publisher.get("command", []), sort_keys=True)
+    if source_compute_remote:
+        if (
+            publisher.get("ssh_destination") != source_compute_ssh
+            or source_compute_ssh not in command_text
+        ):
+            raise SystemExit(f"source publisher SSH transport is misbound: {name}")
+    elif publisher.get("ssh_destination") is not None or source_compute_ssh in command_text:
+        raise SystemExit(f"local source publisher unexpectedly uses SSH: {name}")
+for name in ("compute2-client-caches", "compute2-backend-caches"):
+    publisher = publisher_by_name[name]
+    command_text = json.dumps(publisher.get("command", []), sort_keys=True)
+    if target_compute_ssh not in command_text:
+        raise SystemExit(f"target publisher SSH transport is misbound: {name}")
+    configured = publisher.get("ssh_destination")
+    if target_compute_ssh != compute2_host and configured != target_compute_ssh:
+        raise SystemExit(f"target publisher lacks explicit SSH destination: {name}")
+
 sources = metrics.get("sources", [])
 if not isinstance(sources, list) or any(not isinstance(item, dict) for item in sources):
     raise SystemExit("metrics sources are invalid")
@@ -578,6 +836,58 @@ for name, (kind, role, port_id, host) in expected_sources.items():
     source_text = json.dumps(source, sort_keys=True)
     if port_id not in source_text or (host is not None and host not in source_text):
         raise SystemExit(f"metrics source path/host is stale: {name}")
+
+for name in (
+    "master-dns-client-monitor",
+    "master-grpc-client-monitor",
+    "master-grpc-observer-monitor",
+):
+    source = source_by_name[name]
+    source_text = json.dumps(source.get("command", []), sort_keys=True)
+    if source_compute_remote:
+        if "command" not in source or source_compute_ssh not in source_text:
+            raise SystemExit(f"source metrics SSH transport is misbound: {name}")
+    elif "path" not in source or "command" in source:
+        raise SystemExit(f"local source metrics transport is invalid: {name}")
+for name in (
+    "compute2-dns-client-monitor",
+    "compute2-grpc-client-monitor",
+    "compute2-grpc-observer-monitor",
+):
+    source_text = json.dumps(source_by_name[name].get("command", []), sort_keys=True)
+    if target_compute_ssh not in source_text:
+        raise SystemExit(f"target metrics SSH transport is misbound: {name}")
+
+state_sources = coordinator.get("state_sources", [])
+if not isinstance(state_sources, list) or any(
+    not isinstance(item, dict) for item in state_sources
+):
+    raise SystemExit("coordinator state sources are invalid")
+state_by_name = {item.get("name"): item for item in state_sources}
+if len(state_by_name) != len(state_sources):
+    raise SystemExit("coordinator state source names are duplicated")
+for name in ("master", "compute2", "client-guest", "backend-guest"):
+    if name not in state_by_name:
+        raise SystemExit(f"coordinator state source is missing: {name}")
+source_state = state_by_name["master"]
+source_state_text = json.dumps(source_state.get("command", []), sort_keys=True)
+if source_compute_remote:
+    if "command" not in source_state or source_compute_ssh not in source_state_text:
+        raise SystemExit("source Agent state SSH transport is misbound")
+elif "path" not in source_state or "command" in source_state:
+    raise SystemExit("local source Agent state transport is invalid")
+if target_compute_ssh not in json.dumps(
+    state_by_name["compute2"].get("command", []), sort_keys=True
+):
+    raise SystemExit("target Agent state SSH transport is misbound")
+if client_host not in json.dumps(
+    state_by_name["client-guest"].get("command", []), sort_keys=True
+):
+    raise SystemExit("client guest state SSH transport is misbound")
+if backend_host not in json.dumps(
+    state_by_name["backend-guest"].get("command", []), sort_keys=True
+):
+    raise SystemExit("backend guest state SSH transport is misbound")
 
 documents = json.dumps(
     {"coordinator": coordinator, "metrics": metrics}, sort_keys=True
@@ -627,6 +937,9 @@ PY
 required_deployment_files() {
   printf '%s\n' \
     "${coordinator_script}" \
+    "${migration_script}" \
+    "${continuity_script}" \
+    "${shared_preflight_script}" \
     "${accel_dir}/agent/openstack_dataplane_agent.py" \
     "${accel_dir}/agent/openstack_epoch_gate.py" \
     "${accel_dir}/agent/openstack_guest_endpoint_agent.py" \
@@ -643,18 +956,18 @@ required_deployment_files() {
     "${accel_dir}/build/openstack_dns_harness" \
     "${accel_dir}/build/openstack_grpc_harness" \
     "${accel_dir}/build/dynamic_cache_controller" \
-    "${accel_dir}/deploy/lab/shuka1-p1/coordinator.env" \
-    "${accel_dir}/deploy/lab/shuka1-p1/coordinator.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/metrics-bridge.env" \
-    "${accel_dir}/deploy/lab/shuka1-p1/metrics-bridge.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/dns-cache.policy" \
-    "${accel_dir}/deploy/lab/shuka1-p1/endpoint-client.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/endpoint-server.json" \
-    "${accel_dir}/deploy/lab/shuka1-p1/grpc-cache.policy" \
-    "${accel_dir}/deploy/lab/shuka1-p1/guest-endpoint.env" \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-dataplane.sudoers" \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-lab-dns-backend.service" \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-lab-grpc-backend.service" \
+    "${profile_dir}/coordinator.env" \
+    "${profile_dir}/coordinator.json" \
+    "${profile_dir}/metrics-bridge.env" \
+    "${profile_dir}/metrics-bridge.json" \
+    "${profile_dir}/dns-cache.policy" \
+    "${profile_dir}/endpoint-client.json" \
+    "${profile_dir}/endpoint-server.json" \
+    "${profile_dir}/grpc-cache.policy" \
+    "${profile_dir}/guest-endpoint.env" \
+    "${profile_dir}/vnet-dataplane.sudoers" \
+    "${profile_dir}/vnet-lab-dns-backend.service" \
+    "${profile_dir}/vnet-lab-grpc-backend.service" \
     "${accel_dir}/deploy/systemd/vnet-dataplane-bpffs.service" \
     "${accel_dir}/deploy/systemd/vnet-dataplane-agent.service" \
     "${accel_dir}/deploy/systemd/vnet-dataplane-guest-endpoint.service" \
@@ -725,8 +1038,16 @@ PY
   local_sudo /usr/bin/true
   local_sudo /usr/bin/test -r "${known_hosts}"
   local_sudo /usr/sbin/visudo -cf \
-    "${accel_dir}/deploy/lab/shuka1-p1/vnet-dataplane.sudoers"
-  for host in "${compute2_host}" "${client_guest_host}" "${backend_guest_host}"; do
+    "${profile_dir}/vnet-dataplane.sudoers"
+  local deployment_hosts=(
+    "${target_compute_ssh}"
+    "${client_guest_host}"
+    "${backend_guest_host}"
+  )
+  if [[ "${source_compute_remote}" == 1 ]]; then
+    deployment_hosts+=("${source_compute_ssh}")
+  fi
+  for host in "${deployment_hosts[@]}"; do
     remote_exec "${host}" /usr/bin/true
     remote_sudo "${host}" /usr/bin/true
     remote_sudo "${host}" /usr/bin/test -x /usr/bin/install
@@ -739,23 +1060,27 @@ PY
       /opt/vnet-dataplane \
       /opt/vnet-dataplane/linux_accel \
       /opt/vnet-dataplane/linux_accel/agent \
+      /opt/vnet-dataplane/linux_accel/bench \
       /opt/vnet-dataplane/linux_accel/build \
       /opt/vnet-dataplane/linux_accel/deploy \
       /opt/vnet-dataplane/linux_accel/deploy/lab \
-      /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1 \
+      "${profile_remote}" \
       /opt/vnet-dataplane/linux_accel/deploy/systemd; do
       remote_sudo "${host}" /usr/bin/test ! -L "${path}"
     done
   done
-  local_sudo /usr/bin/cat /etc/vnet-dataplane-agent/endpoints.json \
-    >"${out_dir}/openstack/master-endpoints.json"
-  remote_sudo "${compute2_host}" /usr/bin/cat \
+  remote_sudo "${client_guest_host}" /usr/bin/test -x /usr/bin/systemd-run
+  host_sudo "${expected_compute_host}" /usr/bin/cat \
     /etc/vnet-dataplane-agent/endpoints.json \
-    >"${out_dir}/openstack/compute2-endpoints.json"
+    >"${out_dir}/openstack/source-compute-endpoints.json"
+  host_sudo "${compute2_host}" /usr/bin/cat \
+    /etc/vnet-dataplane-agent/endpoints.json \
+    >"${out_dir}/openstack/target-compute-endpoints.json"
   "${python_bin}" - \
-    "${out_dir}/openstack/master-endpoints.json" \
-    "${out_dir}/openstack/compute2-endpoints.json" \
-    "${client_server_id}" "${backend_server_id}" "${backend_ip}" <<'PY'
+    "${out_dir}/openstack/source-compute-endpoints.json" \
+    "${out_dir}/openstack/target-compute-endpoints.json" \
+    "${client_server_id}" "${backend_server_id}" \
+    "${client_port_id}" "${backend_port_id}" "${backend_ip}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -763,14 +1088,20 @@ from pathlib import Path
 
 def load(path):
     value = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or not isinstance(value.get("endpoints"), list):
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 2
+        or not isinstance(value.get("endpoints"), list)
+    ):
         raise SystemExit(f"invalid compute endpoint config: {path}")
     return value
 
 
 master = load(sys.argv[1])
 compute2 = load(sys.argv[2])
-client_server_id, backend_server_id, backend_ip = sys.argv[3:]
+client_server_id, backend_server_id, client_port_id, backend_port_id, backend_ip = (
+    sys.argv[3:]
+)
 if master != compute2:
     raise SystemExit("master and compute2 endpoint configs differ")
 if len(master["endpoints"]) != 2:
@@ -788,6 +1119,10 @@ client = endpoints[client_server_id]
 backend = endpoints[backend_server_id]
 if client.get("accel_role") != "client" or backend.get("accel_role") != "observer":
     raise SystemExit("compute endpoint acceleration roles do not match the lab")
+if client.get("port_ids") != [client_port_id]:
+    raise SystemExit("client endpoint port allowlist does not match CLIENT_PORT_ID")
+if backend.get("port_ids") != [backend_port_id]:
+    raise SystemExit("backend endpoint port allowlist does not match BACKEND_PORT_ID")
 if backend_ip not in client.get("trusted_dns", []):
     raise SystemExit("client endpoint does not trust BACKEND_IP for DNS")
 if client.get("grpc_observe_port") != 50052 or backend.get("grpc_observe_port") != 50052:
@@ -800,7 +1135,7 @@ PY
     local_sudo /usr/bin/test -r /etc/vnet-dataplane-agent/coordinator.json
     local_sudo /usr/bin/test -r \
       /etc/vnet-dataplane-metrics-controller/metrics-bridge.json
-    remote_sudo "${compute2_host}" /usr/bin/test -x \
+    remote_sudo "${target_compute_ssh}" /usr/bin/test -x \
       /opt/vnet-dataplane/linux_accel/build/cache_policy_txn
     remote_sudo "${client_guest_host}" /usr/bin/test -x \
       /opt/vnet-dataplane/linux_accel/build/openstack_grpc_harness
@@ -810,12 +1145,14 @@ PY
 }
 
 capture_tc_identity() {
-  local tap="$1"
-  local direction="$2"
-  local handle="$3"
-  local output="$4"
+  local host="$1"
+  local tap="$2"
+  local direction="$3"
+  local handle="$4"
+  local output="$5"
   local raw="${output%.json}.txt"
-  local_sudo /usr/sbin/tc filter show dev "${tap}" "${direction}" >"${raw}"
+  host_sudo "${host}" /usr/sbin/tc filter show dev "${tap}" "${direction}" \
+    >"${raw}"
   "${python_bin}" - "${raw}" "${handle}" "${output}" <<'PY'
 import json
 import re
@@ -847,19 +1184,19 @@ PY
 
 capture_netmig_baseline() {
   [[ "${require_netmig_tc}" == 1 ]] || return 0
-  capture_tc_identity "${client_tap}" ingress 0x65 \
+  capture_tc_identity "${expected_compute_host}" "${client_tap}" ingress 0x65 \
     "${out_dir}/systemd/${client_tap}.netmig-ingress-before.json"
-  capture_tc_identity "${client_tap}" egress 0x66 \
+  capture_tc_identity "${expected_compute_host}" "${client_tap}" egress 0x66 \
     "${out_dir}/systemd/${client_tap}.netmig-egress-before.json"
-  capture_tc_identity "${backend_tap}" ingress 0x65 \
+  capture_tc_identity "${expected_compute_host}" "${backend_tap}" ingress 0x65 \
     "${out_dir}/systemd/${backend_tap}.netmig-ingress-before.json"
-  capture_tc_identity "${backend_tap}" egress 0x66 \
+  capture_tc_identity "${expected_compute_host}" "${backend_tap}" egress 0x66 \
     "${out_dir}/systemd/${backend_tap}.netmig-egress-before.json"
 }
 
 bind_compute_config_to_fingerprints() {
   "${python_bin}" - \
-    "${out_dir}/openstack/master-endpoints.json" \
+    "${out_dir}/openstack/source-compute-endpoints.json" \
     "${out_dir}/openstack/fingerprints.json" \
     "${out_dir}/openstack/validated-endpoint-bindings.json" <<'PY'
 import json
@@ -878,13 +1215,22 @@ config = load(sys.argv[1])
 fingerprints = load(sys.argv[2])
 output = Path(sys.argv[3])
 configured = {
-    item.get("server_id"): item.get("accel_role")
+    item.get("server_id"): {
+        "accel_role": item.get("accel_role"),
+        "port_ids": item.get("port_ids"),
+    }
     for item in config.get("endpoints", [])
     if isinstance(item, dict)
 }
 expected = {
-    fingerprints["client"]["server_id"]: "client",
-    fingerprints["backend"]["server_id"]: "observer",
+    fingerprints["client"]["server_id"]: {
+        "accel_role": "client",
+        "port_ids": [fingerprints["client"]["port_id"]],
+    },
+    fingerprints["backend"]["server_id"]: {
+        "accel_role": "observer",
+        "port_ids": [fingerprints["backend"]["port_id"]],
+    },
 }
 if configured != expected:
     raise SystemExit("compute config cannot be bound to the selected Neutron ports")
@@ -894,7 +1240,7 @@ for role in ("client", "backend"):
     bindings.append(
         {
             "role": role,
-            "accel_role": configured[fingerprint["server_id"]],
+            "accel_role": configured[fingerprint["server_id"]]["accel_role"],
             **fingerprint,
         }
     )
@@ -907,6 +1253,129 @@ output.write_text(
     + "\n",
     encoding="utf-8",
 )
+PY
+}
+
+run_shared_cluster_preflight() {
+  [[ "${source_compute_remote}" == 1 ]] || return 0
+  local report="${out_dir}/openstack/shared-cluster-preflight.json"
+  "${python_bin}" "${shared_preflight_script}" \
+    --inventory "${shared_inventory}" \
+    --identity-file "${shared_ssh_identity}" \
+    --output "${report}" \
+    --timeout "${shared_preflight_timeout}" || return 1
+  "${python_bin}" - \
+    "${shared_preflight_script}" "${shared_inventory}" "${report}" \
+    "${expected_compute_host}" "${compute2_host}" \
+    "${source_compute_ssh}" "${target_compute_ssh}" \
+    "${client_server_id}" "${backend_server_id}" \
+    "${client_port_id}" "${backend_port_id}" \
+    "${client_ip}" "${backend_ip}" \
+    "${client_tap}" "${backend_tap}" <<'PY'
+import hashlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+(
+    module_path,
+    inventory_path,
+    report_path,
+    source_host,
+    target_host,
+    source_ssh,
+    target_ssh,
+    client_server_id,
+    backend_server_id,
+    client_port_id,
+    backend_port_id,
+    client_ip,
+    backend_ip,
+    client_interface,
+    backend_interface,
+) = sys.argv[1:]
+
+spec = importlib.util.spec_from_file_location("shared_preflight_binding", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("shared preflight module cannot be loaded")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+try:
+    spec.loader.exec_module(module)
+finally:
+    sys.modules.pop(spec.name, None)
+inventory = module.load_inventory(Path(inventory_path))
+report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+if (
+    not isinstance(report, dict)
+    or report.get("schema_version") != 1
+    or report.get("status") != "allowed"
+    or report.get("deploy_allowed") is not True
+):
+    raise SystemExit("shared preflight report is not an allowed schema-1 result")
+gates = report.get("gates")
+if not isinstance(gates, list) or not gates or any(
+    not isinstance(item, dict) or item.get("passed") is not True for item in gates
+):
+    raise SystemExit("shared preflight report contains a failed or invalid gate")
+canonical = json.dumps(
+    inventory, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+).encode("utf-8")
+expected_hash = hashlib.sha256(canonical).hexdigest()
+if report.get("inventory", {}).get("sha256") != expected_hash:
+    raise SystemExit("shared preflight report does not match the inventory")
+
+
+def split_destination(value):
+    if value.count("@") != 1:
+        raise SystemExit("shared Compute SSH destination must be user@address")
+    user, address = value.split("@", 1)
+    if not user or not address:
+        raise SystemExit("shared Compute SSH destination is incomplete")
+    return user, address
+
+
+source = inventory["roles"]["source"]
+target = inventory["roles"]["target"]
+if source["expected_hostname"] != source_host:
+    raise SystemExit("shared inventory source Nova host differs from the runner")
+if target["expected_hostname"] != target_host:
+    raise SystemExit("shared inventory target Nova host differs from the runner")
+for role, node, destination in (
+    ("source", source, source_ssh),
+    ("target", target, target_ssh),
+):
+    user, address = split_destination(destination)
+    if (user, address) != (node["ssh_user"], node["address"]):
+        raise SystemExit(f"shared inventory {role} SSH identity differs from the runner")
+if set(inventory["allowed_server_ids"]) != {
+    client_server_id,
+    backend_server_id,
+}:
+    raise SystemExit("shared preflight resource ownership differs from the runner")
+if set(inventory["allowed_port_ids"]) != {client_port_id, backend_port_id}:
+    raise SystemExit("shared preflight port ownership differs from the runner")
+if inventory["port_server_bindings"] != {
+    client_port_id: client_server_id,
+    backend_port_id: backend_server_id,
+}:
+    raise SystemExit("shared preflight port-to-server ownership differs from the runner")
+if inventory["port_fixed_ipv4s"] != {
+    client_port_id: client_ip,
+    backend_port_id: backend_ip,
+}:
+    raise SystemExit("shared preflight fixed IP ownership differs from the runner")
+expected_bindings = {
+    client_port_id: client_interface,
+    backend_port_id: backend_interface,
+}
+if source["required_port_bindings"] != expected_bindings:
+    raise SystemExit("shared preflight source port bindings differ from the runner")
+if set(source["required_tap_interfaces"]) != set(expected_bindings.values()):
+    raise SystemExit("shared preflight source interfaces differ from the runner")
+if target["required_port_bindings"] or target["required_tap_interfaces"]:
+    raise SystemExit("shared preflight target must be unbound before migration")
 PY
 }
 
@@ -1058,10 +1527,11 @@ stream_tree() {
     /opt/vnet-dataplane \
     /opt/vnet-dataplane/linux_accel \
     /opt/vnet-dataplane/linux_accel/agent \
+    /opt/vnet-dataplane/linux_accel/bench \
     /opt/vnet-dataplane/linux_accel/build \
     /opt/vnet-dataplane/linux_accel/deploy \
     /opt/vnet-dataplane/linux_accel/deploy/lab \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1 \
+    "${profile_remote}" \
     /opt/vnet-dataplane/linux_accel/deploy/systemd
   (
     cd "${repo_dir}"
@@ -1086,13 +1556,15 @@ secure_local_runtime_tree() {
   mapfile -t files < <(required_deployment_files)
   local_sudo /usr/bin/chown root:root \
     "${repo_dir}" "${accel_dir}" "${accel_dir}/agent" \
+    "${accel_dir}/bench" \
     "${accel_dir}/build" "${accel_dir}/deploy" \
-    "${accel_dir}/deploy/lab" "${accel_dir}/deploy/lab/shuka1-p1" \
+    "${accel_dir}/deploy/lab" "${profile_dir}" \
     "${accel_dir}/deploy/systemd"
   local_sudo /usr/bin/chmod 0755 \
     "${repo_dir}" "${accel_dir}" "${accel_dir}/agent" \
+    "${accel_dir}/bench" \
     "${accel_dir}/build" "${accel_dir}/deploy" \
-    "${accel_dir}/deploy/lab" "${accel_dir}/deploy/lab/shuka1-p1" \
+    "${accel_dir}/deploy/lab" "${profile_dir}" \
     "${accel_dir}/deploy/systemd"
   local_sudo /usr/bin/chown root:root "${files[@]}"
   local_sudo /usr/bin/chmod go-w "${files[@]}"
@@ -1100,22 +1572,34 @@ secure_local_runtime_tree() {
 }
 
 install_local_deployment() {
-  secure_local_runtime_tree
-  local_sudo /usr/bin/install -m 0644 \
-    "${accel_dir}/deploy/systemd/vnet-dataplane-bpffs.service" \
-    "${accel_dir}/deploy/systemd/vnet-dataplane-agent.service" \
+  if [[ "${source_compute_remote}" == 1 ]]; then
+    local files=()
+    mapfile -t files < <(required_deployment_files)
+    verify_local_secure_files "${files[@]}"
+  else
+    secure_local_runtime_tree
+  fi
+  local controller_units=(
     "${accel_dir}/deploy/systemd/vnet-dataplane-metrics-controller.service" \
     "${accel_dir}/deploy/systemd/vnet-dataplane-epoch-coordinator.service" \
+  )
+  if [[ "${source_compute_remote}" == 0 ]]; then
+    controller_units+=(
+      "${accel_dir}/deploy/systemd/vnet-dataplane-bpffs.service"
+      "${accel_dir}/deploy/systemd/vnet-dataplane-agent.service"
+    )
+  fi
+  local_sudo /usr/bin/install -m 0644 "${controller_units[@]}" \
     /etc/systemd/system/
   local_sudo /usr/bin/install -d -o root -g root -m 0700 \
     /etc/vnet-dataplane-agent /etc/vnet-dataplane-metrics-controller
   local_sudo /usr/bin/install -m 0600 \
-    "${accel_dir}/deploy/lab/shuka1-p1/coordinator.env" \
-    "${accel_dir}/deploy/lab/shuka1-p1/coordinator.json" \
+    "${profile_dir}/coordinator.env" \
+    "${profile_dir}/coordinator.json" \
     /etc/vnet-dataplane-agent/
   local_sudo /usr/bin/install -m 0600 \
-    "${accel_dir}/deploy/lab/shuka1-p1/metrics-bridge.env" \
-    "${accel_dir}/deploy/lab/shuka1-p1/metrics-bridge.json" \
+    "${profile_dir}/metrics-bridge.env" \
+    "${profile_dir}/metrics-bridge.json" \
     /etc/vnet-dataplane-metrics-controller/
   for required in openstack.env agent.env endpoints.json; do
     local_sudo /usr/bin/test -r "/etc/vnet-dataplane-agent/${required}"
@@ -1124,7 +1608,8 @@ install_local_deployment() {
   local_sudo /usr/bin/systemctl daemon-reload
 }
 
-install_compute2_deployment() {
+install_remote_compute_deployment() {
+  local host="$1"
   local files=(
     linux_accel/agent/openstack_dataplane_agent.py
     linux_accel/agent/openstack_metrics_bridge.py
@@ -1137,16 +1622,16 @@ install_compute2_deployment() {
     linux_accel/deploy/systemd/vnet-dataplane-agent.service
     linux_accel/deploy/systemd/vnet-dataplane-bpffs.service
   )
-  stream_tree "${compute2_host}" "${files[@]}"
-  remote_sudo "${compute2_host}" /usr/bin/install -m 0644 \
+  stream_tree "${host}" "${files[@]}"
+  remote_sudo "${host}" /usr/bin/install -m 0644 \
     /opt/vnet-dataplane/linux_accel/deploy/systemd/vnet-dataplane-agent.service \
     /opt/vnet-dataplane/linux_accel/deploy/systemd/vnet-dataplane-bpffs.service \
     /etc/systemd/system/
   for required in openstack.env agent.env endpoints.json; do
-    remote_sudo "${compute2_host}" /usr/bin/test -r \
+    remote_sudo "${host}" /usr/bin/test -r \
       "/etc/vnet-dataplane-agent/${required}"
   done
-  remote_sudo "${compute2_host}" /usr/bin/systemctl daemon-reload
+  remote_sudo "${host}" /usr/bin/systemctl daemon-reload
 }
 
 install_guest_deployment() {
@@ -1156,6 +1641,7 @@ install_guest_deployment() {
   local files=(
     linux_accel/agent/openstack_guest_endpoint_agent.py
     linux_accel/agent/openstack_metrics_bridge.py
+    linux_accel/bench/migration_continuity_probe.py
     linux_accel/build/cache_policy_txn
     linux_accel/build/dns_cache_stats_reader
     linux_accel/build/dns_monitor
@@ -1163,48 +1649,48 @@ install_guest_deployment() {
     linux_accel/build/grpc_fast_cache
     linux_accel/build/openstack_dns_harness
     linux_accel/build/openstack_grpc_harness
-    linux_accel/deploy/lab/shuka1-p1/dns-cache.policy
-    linux_accel/deploy/lab/shuka1-p1/grpc-cache.policy
-    linux_accel/deploy/lab/shuka1-p1/guest-endpoint.env
-    "linux_accel/deploy/lab/shuka1-p1/${endpoint_file}"
-    linux_accel/deploy/lab/shuka1-p1/vnet-dataplane.sudoers
+    "${profile_rel}/dns-cache.policy"
+    "${profile_rel}/grpc-cache.policy"
+    "${profile_rel}/guest-endpoint.env"
+    "${profile_rel}/${endpoint_file}"
+    "${profile_rel}/vnet-dataplane.sudoers"
     linux_accel/deploy/systemd/vnet-dataplane-bpffs.service
     linux_accel/deploy/systemd/vnet-dataplane-guest-endpoint.service
   )
   if [[ "${install_backend_units}" == 1 ]]; then
     files+=(
-      linux_accel/deploy/lab/shuka1-p1/vnet-lab-dns-backend.service
-      linux_accel/deploy/lab/shuka1-p1/vnet-lab-grpc-backend.service
+      "${profile_rel}/vnet-lab-dns-backend.service"
+      "${profile_rel}/vnet-lab-grpc-backend.service"
     )
   fi
   stream_tree "${host}" "${files[@]}"
   remote_sudo "${host}" /usr/bin/install -d -o root -g root -m 0700 \
     /etc/vnet-dataplane-guest
   remote_sudo "${host}" /usr/bin/install -m 0600 \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/guest-endpoint.env \
+    "${profile_remote}/guest-endpoint.env" \
     /etc/vnet-dataplane-guest/guest-endpoint.env
   remote_sudo "${host}" /usr/bin/install -m 0600 \
-    "/opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/${endpoint_file}" \
+    "${profile_remote}/${endpoint_file}" \
     /etc/vnet-dataplane-guest/endpoint.json
   remote_sudo "${host}" /usr/bin/install -m 0644 \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/dns-cache.policy \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/grpc-cache.policy \
+    "${profile_remote}/dns-cache.policy" \
+    "${profile_remote}/grpc-cache.policy" \
     /etc/vnet-dataplane-guest/
   remote_sudo "${host}" /usr/bin/install -m 0644 \
     /opt/vnet-dataplane/linux_accel/deploy/systemd/vnet-dataplane-bpffs.service \
     /opt/vnet-dataplane/linux_accel/deploy/systemd/vnet-dataplane-guest-endpoint.service \
     /etc/systemd/system/
   remote_sudo "${host}" /usr/sbin/visudo -cf \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/vnet-dataplane.sudoers
+    "${profile_remote}/vnet-dataplane.sudoers"
   remote_sudo "${host}" /usr/bin/install -o root -g root -m 0440 \
-    /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/vnet-dataplane.sudoers \
+    "${profile_remote}/vnet-dataplane.sudoers" \
     /etc/sudoers.d/vnet-dataplane
   remote_sudo "${host}" /usr/sbin/visudo -cf \
     /etc/sudoers.d/vnet-dataplane
   if [[ "${install_backend_units}" == 1 ]]; then
     remote_sudo "${host}" /usr/bin/install -m 0644 \
-      /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/vnet-lab-dns-backend.service \
-      /opt/vnet-dataplane/linux_accel/deploy/lab/shuka1-p1/vnet-lab-grpc-backend.service \
+      "${profile_remote}/vnet-lab-dns-backend.service" \
+      "${profile_remote}/vnet-lab-grpc-backend.service" \
       /etc/systemd/system/
   fi
   remote_sudo "${host}" /usr/bin/systemctl daemon-reload
@@ -1217,6 +1703,8 @@ deploy_or_verify() {
   fi
   local required_local=(
     "${coordinator_script}"
+    "${migration_script}"
+    "${continuity_script}"
     "${accel_dir}/agent/openstack_dataplane_agent.py"
     "${accel_dir}/agent/openstack_guest_endpoint_agent.py"
     "${accel_dir}/agent/openstack_metrics_bridge.py"
@@ -1237,28 +1725,33 @@ deploy_or_verify() {
   done
   if [[ "${deploy_artifacts}" == 1 ]]; then
     install_local_deployment
-    install_compute2_deployment
+    install_remote_compute_deployment "${target_compute_ssh}"
+    if [[ "${source_compute_remote}" == 1 ]]; then
+      install_remote_compute_deployment "${source_compute_ssh}"
+    fi
     install_guest_deployment "${client_guest_host}" endpoint-client.json 0
     install_guest_deployment "${backend_guest_host}" endpoint-server.json 1
   else
     local_sudo /usr/bin/test -r /etc/vnet-dataplane-agent/coordinator.json
     local_sudo /usr/bin/test -r /etc/vnet-dataplane-metrics-controller/metrics-bridge.json
-    remote_sudo "${compute2_host}" /usr/bin/test -x \
+    remote_sudo "${target_compute_ssh}" /usr/bin/test -x \
       /opt/vnet-dataplane/linux_accel/build/cache_policy_txn
     remote_sudo "${client_guest_host}" /usr/bin/test -x \
       /opt/vnet-dataplane/linux_accel/build/openstack_grpc_harness
+    remote_sudo "${client_guest_host}" /usr/bin/test -r \
+      /opt/vnet-dataplane/linux_accel/bench/migration_continuity_probe.py
     remote_sudo "${backend_guest_host}" /usr/bin/test -x \
       /opt/vnet-dataplane/linux_accel/build/dns_monitor
   fi
 }
 
 capture_running_stack_evidence() {
-  local_sudo /usr/bin/python3 \
+  host_sudo "${expected_compute_host}" /usr/bin/python3 \
     /opt/vnet-dataplane/linux_accel/agent/openstack_dataplane_agent.py health \
     --state-file /run/vnet-dataplane-agent/state.json \
     --server-id "${client_server_id}" --server-id "${backend_server_id}" \
     --max-age-seconds 20 \
-    >"${out_dir}/systemd/master-agent-health.json" || return 1
+    >"${out_dir}/systemd/source-compute-agent-health.json" || return 1
   remote_sudo "${client_guest_host}" /usr/bin/python3 \
     /opt/vnet-dataplane/linux_accel/agent/openstack_guest_endpoint_agent.py health \
     --config /etc/vnet-dataplane-guest/endpoint.json \
@@ -1269,11 +1762,12 @@ capture_running_stack_evidence() {
     --config /etc/vnet-dataplane-guest/endpoint.json \
     --state-file /run/vnet-dataplane-guest/state.json --max-age-seconds 20 \
     >"${out_dir}/systemd/backend-guest-health.json" || return 1
-  local_sudo /usr/bin/cat /run/vnet-dataplane-agent/state.json \
-    >"${out_dir}/systemd/master-agent-state.json" || return 1
-  remote_sudo "${compute2_host}" /usr/bin/cat \
+  host_sudo "${expected_compute_host}" /usr/bin/cat \
     /run/vnet-dataplane-agent/state.json \
-    >"${out_dir}/systemd/compute2-agent-state.json" || return 1
+    >"${out_dir}/systemd/source-compute-agent-state.json" || return 1
+  host_sudo "${compute2_host}" /usr/bin/cat \
+    /run/vnet-dataplane-agent/state.json \
+    >"${out_dir}/systemd/target-compute-agent-state.json" || return 1
   remote_sudo "${client_guest_host}" /usr/bin/cat \
     /run/vnet-dataplane-guest/state.json \
     >"${out_dir}/systemd/client-guest-state.json" || return 1
@@ -1284,15 +1778,15 @@ capture_running_stack_evidence() {
     >"${out_dir}/systemd/client-guest-ens3.json" || return 1
   remote_sudo "${backend_guest_host}" /usr/sbin/ip -j address show dev ens3 \
     >"${out_dir}/systemd/backend-guest-ens3.json" || return 1
-  local_sudo /usr/sbin/bpftool -j map show pinned \
+  host_sudo "${expected_compute_host}" /usr/sbin/bpftool -j map show pinned \
     "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/dns/cache_runtime_control" \
-    >"${out_dir}/systemd/master-client-dns-runtime-map.json" || return 1
-  local_sudo /usr/sbin/bpftool -j map show pinned \
+    >"${out_dir}/systemd/source-compute-client-dns-runtime-map.json" || return 1
+  host_sudo "${expected_compute_host}" /usr/sbin/bpftool -j map show pinned \
     "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/grpc/cache_runtime_control" \
-    >"${out_dir}/systemd/master-client-grpc-runtime-map.json" || return 1
-  local_sudo /usr/sbin/bpftool -j map show pinned \
+    >"${out_dir}/systemd/source-compute-client-grpc-runtime-map.json" || return 1
+  host_sudo "${expected_compute_host}" /usr/sbin/bpftool -j map show pinned \
     "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}/grpc/cache_runtime_control" \
-    >"${out_dir}/systemd/master-backend-grpc-runtime-map.json" || return 1
+    >"${out_dir}/systemd/source-compute-backend-grpc-runtime-map.json" || return 1
   remote_sudo "${client_guest_host}" /usr/sbin/bpftool -j map show pinned \
     "/sys/fs/bpf/vnet-dataplane-guest/${client_port_id}/grpc/cache_runtime_control" \
     >"${out_dir}/systemd/client-guest-grpc-runtime-map.json" || return 1
@@ -1305,15 +1799,15 @@ capture_running_stack_evidence() {
 
   "${python_bin}" - \
     "${out_dir}/openstack/fingerprints.json" \
-    "${out_dir}/systemd/master-agent-state.json" \
-    "${out_dir}/systemd/compute2-agent-state.json" \
+    "${out_dir}/systemd/source-compute-agent-state.json" \
+    "${out_dir}/systemd/target-compute-agent-state.json" \
     "${out_dir}/systemd/client-guest-state.json" \
     "${out_dir}/systemd/backend-guest-state.json" \
     "${out_dir}/systemd/client-guest-ens3.json" \
     "${out_dir}/systemd/backend-guest-ens3.json" \
-    "${out_dir}/systemd/master-client-dns-runtime-map.json" \
-    "${out_dir}/systemd/master-client-grpc-runtime-map.json" \
-    "${out_dir}/systemd/master-backend-grpc-runtime-map.json" \
+    "${out_dir}/systemd/source-compute-client-dns-runtime-map.json" \
+    "${out_dir}/systemd/source-compute-client-grpc-runtime-map.json" \
+    "${out_dir}/systemd/source-compute-backend-grpc-runtime-map.json" \
     "${out_dir}/systemd/client-guest-grpc-runtime-map.json" \
     "${out_dir}/systemd/backend-guest-dns-runtime-map.json" \
     "${out_dir}/systemd/backend-guest-grpc-runtime-map.json" \
@@ -1325,6 +1819,7 @@ capture_running_stack_evidence() {
     "${out_dir}/systemd/map-identities.json" <<'PY' || return 1
 import json
 import sys
+import time
 from pathlib import Path
 
 
@@ -1333,8 +1828,8 @@ def load(path):
 
 
 fingerprints = load(sys.argv[1])
-master = load(sys.argv[2])
-compute2 = load(sys.argv[3])
+source = load(sys.argv[2])
+target = load(sys.argv[3])
 client_state = load(sys.argv[4])
 backend_state = load(sys.argv[5])
 client_link = load(sys.argv[6])
@@ -1342,7 +1837,7 @@ backend_link = load(sys.argv[7])
 map_documents = [load(path) for path in sys.argv[8:14]]
 (
     expected_host,
-    compute2_host,
+    target_host,
     client_guest_host,
     backend_guest_host,
     client_server_id,
@@ -1360,16 +1855,16 @@ def contains(document, value):
 
 
 expected_servers = {client_server_id, backend_server_id}
-if set(master.get("server_ids", [])) != expected_servers:
-    raise SystemExit("master state server identities do not match the run")
-if master.get("local_host") != expected_host:
-    raise SystemExit("master state local_host does not match Neutron binding")
-attachments = master.get("attachments")
+if set(source.get("server_ids", [])) != expected_servers:
+    raise SystemExit("source Compute state server identities do not match the run")
+if source.get("local_host") != expected_host:
+    raise SystemExit("source Compute local_host does not match Neutron binding")
+attachments = source.get("attachments")
 if not isinstance(attachments, dict) or set(attachments) != {
     client_port_id,
     backend_port_id,
 }:
-    raise SystemExit("master state does not contain two independent attachments")
+    raise SystemExit("source Compute state does not contain two independent attachments")
 for port_id, server_id, interface in (
     (client_port_id, client_server_id, client_tap),
     (backend_port_id, backend_server_id, backend_tap),
@@ -1387,32 +1882,53 @@ for port_id, server_id, interface in (
         "host": expected_host,
         "interface": interface,
     }:
-        raise SystemExit(f"master attachment binding is stale: {port_id}")
+        raise SystemExit(f"source Compute attachment binding is stale: {port_id}")
     if not isinstance(binding.get("ifindex"), int) or binding["ifindex"] <= 0:
-        raise SystemExit(f"master attachment ifindex is invalid: {port_id}")
+        raise SystemExit(f"source Compute attachment ifindex is invalid: {port_id}")
     if record.get("healthy") is not True or record.get("missing_pins") != []:
-        raise SystemExit(f"master attachment is not healthy: {port_id}")
+        raise SystemExit(f"source Compute attachment is not healthy: {port_id}")
     if record.get("hook_ownership_verified") is not True:
-        raise SystemExit(f"master hook ownership is not verified: {port_id}")
+        raise SystemExit(f"source Compute hook ownership is not verified: {port_id}")
     expected_programs = record.get("program_ids")
     current_programs = record.get("current_program_ids")
     if not isinstance(expected_programs, dict) or current_programs != expected_programs:
-        raise SystemExit(f"master hook program IDs changed: {port_id}")
+        raise SystemExit(f"source Compute hook program IDs changed: {port_id}")
     for name, program_id in expected_programs.items():
         if name == "dns_xdp" and program_id is None:
             continue
         if not isinstance(program_id, int) or program_id <= 0:
-            raise SystemExit(f"master hook program ID is invalid: {port_id}/{name}")
+            raise SystemExit(f"source Compute hook program ID is invalid: {port_id}/{name}")
 
-if set(compute2.get("server_ids", [])) != expected_servers:
-    raise SystemExit("compute2 state server identities do not match the run")
-if compute2.get("local_host") != compute2_host:
-    raise SystemExit("compute2 state has an unexpected local_host")
-compute2_attachments = compute2.get("attachments")
-if not isinstance(compute2_attachments, dict) or any(
-    port_id in compute2_attachments for port_id in (client_port_id, backend_port_id)
+if set(target.get("server_ids", [])) != expected_servers:
+    raise SystemExit("target Compute state server identities do not match the run")
+if target.get("local_host") != target_host:
+    raise SystemExit("target Compute state has an unexpected local_host")
+target_attachments = target.get("attachments")
+if not isinstance(target_attachments, dict) or any(
+    port_id in target_attachments for port_id in (client_port_id, backend_port_id)
 ):
-    raise SystemExit("compute2 unexpectedly owns a master-bound attachment")
+    raise SystemExit("target Compute unexpectedly owns a source-bound attachment")
+updated_ms = target.get("updated_ms")
+if isinstance(updated_ms, bool) or not isinstance(updated_ms, int):
+    raise SystemExit("target Compute state has no integer updated_ms")
+if abs(int(time.time() * 1000) - updated_ms) > 20_000:
+    raise SystemExit("target Compute state is stale or from the future")
+target_snapshot = target.get("snapshot_consistency")
+if not isinstance(target_snapshot, dict) or {
+    "status": target_snapshot.get("status"),
+    "error": target_snapshot.get("error"),
+} != {"status": "consistent", "error": None}:
+    raise SystemExit("target Compute discovery snapshot is not consistent")
+target_health = target.get("health")
+if not isinstance(target_health, dict) or target_health.get("status") != "idle":
+    raise SystemExit("target Compute Agent is not in a fresh idle state")
+for field in (
+    "healthy_port_ids",
+    "transition_port_ids",
+    "degraded_port_ids",
+):
+    if target_health.get(field) != []:
+        raise SystemExit(f"target Compute Agent has unexpected {field}")
 
 for role, state, link in (
     ("client", client_state, client_link),
@@ -1469,17 +1985,17 @@ def map_identity(label, node, path, value):
 
 map_specs = (
     (
-        "master_client_dns",
+        "source_client_dns",
         expected_host,
         f"/sys/fs/bpf/vnet-dataplane-agent/{client_port_id}/dns/cache_runtime_control",
     ),
     (
-        "master_client_grpc",
+        "source_client_grpc",
         expected_host,
         f"/sys/fs/bpf/vnet-dataplane-agent/{client_port_id}/grpc/cache_runtime_control",
     ),
     (
-        "master_backend_grpc",
+        "source_backend_grpc",
         expected_host,
         f"/sys/fs/bpf/vnet-dataplane-agent/{backend_port_id}/grpc/cache_runtime_control",
     ),
@@ -1503,14 +2019,14 @@ identities = {
     label: map_identity(label, node, path, document)
     for (label, node, path), document in zip(map_specs, map_documents)
 }
-master_ids = {
+source_ids = {
     identities[label]["id"]
-    for label in ("master_client_dns", "master_client_grpc", "master_backend_grpc")
+    for label in ("source_client_dns", "source_client_grpc", "source_backend_grpc")
 }
-if len(master_ids) != 3:
-    raise SystemExit("master runtime maps are not independent")
-if identities["master_client_grpc"]["id"] == identities["master_backend_grpc"]["id"]:
-    raise SystemExit("master client/backend gRPC runtime maps are not independent")
+if len(source_ids) != 3:
+    raise SystemExit("source Compute runtime maps are not independent")
+if identities["source_client_grpc"]["id"] == identities["source_backend_grpc"]["id"]:
+    raise SystemExit("source Compute client/backend gRPC runtime maps are not independent")
 if identities["backend_guest_dns"]["id"] == identities["backend_guest_grpc"]["id"]:
     raise SystemExit("backend guest DNS/gRPC runtime maps are not independent")
 map_output.write_text(
@@ -1519,8 +2035,8 @@ map_output.write_text(
             "schema_version": 1,
             "maps": identities,
             "checks": {
-                "master_maps_independent": True,
-                "master_client_backend_grpc_independent": True,
+                "source_compute_maps_independent": True,
+                "source_compute_client_backend_grpc_independent": True,
                 "backend_guest_protocol_maps_independent": True,
             },
         },
@@ -1537,16 +2053,16 @@ PY
 audit_running_stack() {
   local deadline=$((SECONDS + attach_timeout))
   while (( SECONDS <= deadline )); do
-    if local_sudo /usr/bin/systemctl is-active --quiet "${host_agent_unit}" &&
-       remote_sudo_probe "${compute2_host}" /usr/bin/systemctl is-active --quiet "${host_agent_unit}" &&
+    if host_sudo_probe "${expected_compute_host}" /usr/bin/systemctl is-active --quiet "${host_agent_unit}" &&
+       host_sudo_probe "${compute2_host}" /usr/bin/systemctl is-active --quiet "${host_agent_unit}" &&
        remote_sudo_probe "${client_guest_host}" /usr/bin/systemctl is-active --quiet "${guest_agent_unit}" &&
        remote_sudo_probe "${backend_guest_host}" /usr/bin/systemctl is-active --quiet "${guest_agent_unit}" &&
-       local_sudo /usr/bin/grep -q "${client_port_id}" /run/vnet-dataplane-agent/state.json &&
-       local_sudo /usr/bin/grep -q "${backend_port_id}" /run/vnet-dataplane-agent/state.json &&
-       local_sudo /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/dns/cache_runtime_control" &&
-       local_sudo /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/grpc/cache_runtime_control" &&
-       local_sudo /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}/grpc/cache_runtime_control" &&
-       local_sudo /usr/bin/python3 /opt/vnet-dataplane/linux_accel/agent/openstack_dataplane_agent.py health \
+       host_sudo_probe "${expected_compute_host}" /usr/bin/grep -q "${client_port_id}" /run/vnet-dataplane-agent/state.json &&
+       host_sudo_probe "${expected_compute_host}" /usr/bin/grep -q "${backend_port_id}" /run/vnet-dataplane-agent/state.json &&
+       host_sudo_probe "${expected_compute_host}" /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/dns/cache_runtime_control" &&
+       host_sudo_probe "${expected_compute_host}" /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}/grpc/cache_runtime_control" &&
+       host_sudo_probe "${expected_compute_host}" /usr/bin/test -e "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}/grpc/cache_runtime_control" &&
+       host_sudo_probe "${expected_compute_host}" /usr/bin/python3 /opt/vnet-dataplane/linux_accel/agent/openstack_dataplane_agent.py health \
          --state-file /run/vnet-dataplane-agent/state.json \
          --server-id "${client_server_id}" --server-id "${backend_server_id}" \
          --max-age-seconds 20 >/dev/null &&
@@ -1619,10 +2135,650 @@ run_workload() {
     grpc)
       remote_exec "${client_guest_host}" \
         /opt/vnet-dataplane/linux_accel/build/openstack_grpc_harness \
-        client "${backend_ip}" 50052 "${requests}" "${warmup}" health-check
+        client "127.0.0.1" 50053 "${requests}" "${warmup}" health-check
       ;;
     *)
       echo "unknown workload protocol: ${protocol}" >&2
+      return 2
+      ;;
+  esac
+}
+
+run_migration_leg() {
+  local phase="$1" server_id="$2" source_host="$3" target_host="$4"
+  local evidence_dir="${out_dir}/migration/${phase}/openstack"
+  mkdir -p "${evidence_dir}"
+  "${python_bin}" "${migration_script}" \
+    --phase "${phase}" \
+    --server-id "${server_id}" \
+    --port-id "${backend_port_id}" \
+    --source-host "${source_host}" \
+    --target-host "${target_host}" \
+    --evidence-dir "${evidence_dir}" \
+    --openstack-bin "${openstack_bin}" \
+    --api-version 2.30 \
+    --timeout "${migration_timeout}" \
+    --command-timeout "${migration_command_timeout}" \
+    --poll "${migration_poll_interval}"
+}
+
+capture_migration_baseline() {
+  local phase="$1" source_host="$2" target_host="$3" after_epoch="$4"
+  local leg_dir="${out_dir}/migration/${phase}"
+  local source_state="${leg_dir}/source-agent-state-before.json"
+  local target_state="${leg_dir}/target-agent-state-before.json"
+  local source_map="${leg_dir}/source-runtime-map-before.json"
+  local server_json="${leg_dir}/backend-server-before.json"
+  local port_json="${leg_dir}/backend-port-before.json"
+  local pin_path="/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}/grpc/cache_runtime_control"
+  local coordinator_cursor source_cursor target_cursor
+  mkdir -p "${leg_dir}"
+
+  coordinator_cursor="$(local_sudo /usr/bin/stat -Lc '%d:%i:%s' \
+    "${coordinator_audit_log}")" || return 1
+  source_cursor="$(host_sudo "${source_host}" /usr/bin/stat -Lc '%d:%i:%s' \
+    "${host_agent_audit_log}")" || return 1
+  target_cursor="$(host_sudo "${target_host}" /usr/bin/stat -Lc '%d:%i:%s' \
+    "${host_agent_audit_log}")" || return 1
+  for cursor in "${coordinator_cursor}" "${source_cursor}" "${target_cursor}"; do
+    [[ "${cursor}" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || {
+      echo "migration audit cursor is invalid: ${cursor}" >&2
+      return 1
+    }
+  done
+
+  host_sudo "${source_host}" /usr/bin/cat "${host_agent_state_file}" \
+    >"${source_state}" || return 1
+  host_sudo "${target_host}" /usr/bin/cat "${host_agent_state_file}" \
+    >"${target_state}" || return 1
+  host_sudo "${source_host}" /usr/sbin/bpftool -j map show pinned \
+    "${pin_path}" >"${source_map}" || return 1
+  if host_sudo_probe "${target_host}" /usr/bin/test -e "${pin_path}"; then
+    echo "target host already contains the backend runtime pin before migration" >&2
+    return 1
+  fi
+  "${timeout_bin}" --signal=TERM "${remote_command_timeout}" \
+    "${openstack_bin}" server show "${backend_server_id}" -f json \
+    >"${server_json}" || return 1
+  "${timeout_bin}" --signal=TERM "${remote_command_timeout}" \
+    "${openstack_bin}" port show "${backend_port_id}" -f json \
+    >"${port_json}" || return 1
+
+  "${python_bin}" - \
+    "${source_state}" "${target_state}" "${source_map}" \
+    "${server_json}" "${port_json}" \
+    "${out_dir}/openstack/fingerprints.json" \
+    "${phase}" "${source_host}" "${target_host}" "${after_epoch}" \
+    "${coordinator_cursor}" "${source_cursor}" "${target_cursor}" \
+    "${backend_server_id}" "${backend_port_id}" "${pin_path}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+
+def load(path):
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, (dict, list)):
+        raise SystemExit(f"invalid JSON document: {path}")
+    return value
+
+
+def normalized(value):
+    return re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+
+
+def field(value, *names):
+    fields = {normalized(key): item for key, item in value.items()}
+    for name in names:
+        key = normalized(name)
+        if key in fields:
+            return fields[key]
+    raise SystemExit(f"missing OpenStack field: {names}")
+
+
+source_state = load(sys.argv[1])
+target_state = load(sys.argv[2])
+source_map = load(sys.argv[3])
+server = load(sys.argv[4])
+port = load(sys.argv[5])
+fingerprints = load(sys.argv[6])
+phase, source_host, target_host = sys.argv[7:10]
+after_epoch = int(sys.argv[10])
+cursor_values = sys.argv[11:14]
+server_id, port_id, pin_path = sys.argv[14:17]
+
+source_attachments = source_state.get("attachments")
+target_attachments = target_state.get("attachments")
+if not isinstance(source_attachments, dict) or port_id not in source_attachments:
+    raise SystemExit("source Agent does not own the backend before migration")
+if not isinstance(target_attachments, dict) or port_id in target_attachments:
+    raise SystemExit("target Agent already owns the backend before migration")
+record = source_attachments[port_id]
+binding = record.get("binding") if isinstance(record, dict) else None
+if not isinstance(binding, dict) or {
+    "server_id": binding.get("server_id"),
+    "port_id": binding.get("port_id"),
+    "host": str(binding.get("host", "")).split(".", 1)[0],
+} != {"server_id": server_id, "port_id": port_id, "host": source_host}:
+    raise SystemExit("source Agent binding does not match the migration source")
+if (
+    record.get("healthy") is not True
+    or record.get("missing_pins") != []
+    or record.get("hook_ownership_verified") is not True
+    or record.get("program_ids") != record.get("current_program_ids")
+):
+    raise SystemExit("source Agent attachment is not healthy before migration")
+
+map_value = source_map[0] if isinstance(source_map, list) and len(source_map) == 1 else source_map
+if not isinstance(map_value, dict) or not isinstance(map_value.get("id"), int):
+    raise SystemExit("source runtime map identity is invalid")
+if str(field(server, "id")) != server_id or str(field(server, "status")).upper() != "ACTIVE":
+    raise SystemExit("backend server identity/status changed before migration")
+if str(field(server, "OS-EXT-SRV-ATTR:host", "host")).split(".", 1)[0] != source_host:
+    raise SystemExit("backend server is not on the declared source host")
+if str(field(port, "id")) != port_id or str(field(port, "device_id")) != server_id:
+    raise SystemExit("backend Neutron port identity changed before migration")
+if str(field(port, "status")).upper() != "ACTIVE":
+    raise SystemExit("backend Neutron port is not ACTIVE before migration")
+if str(field(port, "binding_host_id", "binding:host_id")).split(".", 1)[0] != source_host:
+    raise SystemExit("backend Neutron port is not bound to the source host")
+if str(field(port, "mac_address")).lower() != fingerprints["backend"]["mac"]:
+    raise SystemExit("backend Neutron MAC changed before migration")
+
+
+def cursor(value):
+    device, inode, offset = (int(item) for item in value.split(":"))
+    return {"device": device, "inode": inode, "offset": offset}
+
+
+result = {
+    "schema": 1,
+    "phase": phase,
+    "source_host": source_host,
+    "target_host": target_host,
+    "after_epoch": after_epoch,
+    "coordinator": cursor(cursor_values[0]),
+    "source_agent": cursor(cursor_values[1]),
+    "target_agent": cursor(cursor_values[2]),
+    "source_runtime_map": {"host": source_host, "path": pin_path, "id": map_value["id"]},
+    "target_pin_present": False,
+    "topology": {"server_id": server_id, "port_id": port_id, "mac": fingerprints["backend"]["mac"]},
+}
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+wait_migration_transition() {
+  local phase="$1" source_host="$2" target_host="$3" after_epoch="$4"
+  local baseline="${out_dir}/migration/${phase}/baseline.json"
+  local cursor_values result range_values start end count
+  cursor_values="$("${python_bin}" - "${baseline}" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))["coordinator"]
+print(value["device"], value["inode"], value["offset"])
+PY
+)" || return 1
+  read -r audit_device audit_inode audit_offset <<<"${cursor_values}"
+  result="$(local_sudo /usr/bin/python3 "${coordinator_script}" wait-transition \
+    --config "${coordinator_config}" \
+    --audit-log "${coordinator_audit_log}" \
+    --after-offset "${audit_offset}" \
+    --audit-device "${audit_device}" \
+    --audit-inode "${audit_inode}" \
+    --server-id "${backend_server_id}" \
+    --port-id "${backend_port_id}" \
+    --source-host "${source_host}" \
+    --after-epoch "${after_epoch}" \
+    --timeout "${migration_transition_timeout}" \
+    --interval 0.05)" || return 1
+  range_values="$("${python_bin}" -c \
+    'import json,sys; v=json.loads(sys.argv[1]); print(v["matched_byte_start"],v["matched_byte_end"])' \
+    "${result}")" || return 1
+  read -r start end <<<"${range_values}"
+  count=$((end - start))
+  (( count > 0 )) || return 1
+  local_sudo /usr/bin/dd if="${coordinator_audit_log}" bs=1 \
+    skip="${start}" count="${count}" status=none \
+    >"${out_dir}/migration/${phase}/coordinator-transition.jsonl" || return 1
+  printf '%s\n' "${result}"
+}
+
+wait_migration_attachment() {
+  local phase="$1" source_host="$2" target_host="$3"
+  local leg_dir="${out_dir}/migration/${phase}"
+  local baseline="${leg_dir}/baseline.json"
+  local source_cursor target_cursor source_result target_result
+  local source_range target_range source_start source_end target_start target_end
+  local pin_root="/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}"
+  local pin_path="${pin_root}/grpc/cache_runtime_control"
+  source_cursor="$("${python_bin}" - "${baseline}" source_agent <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]
+print(value["device"], value["inode"], value["offset"])
+PY
+)" || return 1
+  target_cursor="$("${python_bin}" - "${baseline}" target_agent <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))[sys.argv[2]]
+print(value["device"], value["inode"], value["offset"])
+PY
+)" || return 1
+  read -r source_device source_inode source_offset <<<"${source_cursor}"
+  read -r target_device target_inode target_offset <<<"${target_cursor}"
+
+  source_result="$(host_sudo_timeout "${migration_wait_outer_timeout}" \
+    "${source_host}" /usr/bin/python3 \
+    "${host_agent_script}" wait-reconcile \
+    --audit-log "${host_agent_audit_log}" \
+    --after-offset "${source_offset}" --audit-device "${source_device}" \
+    --audit-inode "${source_inode}" --server-id "${backend_server_id}" \
+    --port-id "${backend_port_id}" --action detach \
+    --reason binding_left_host --expected-host "${source_host}" \
+    --timeout "${migration_transition_timeout}" --interval 0.05)" || return 1
+  target_result="$(host_sudo_timeout "${migration_wait_outer_timeout}" \
+    "${target_host}" /usr/bin/python3 \
+    "${host_agent_script}" wait-reconcile \
+    --audit-log "${host_agent_audit_log}" \
+    --after-offset "${target_offset}" --audit-device "${target_device}" \
+    --audit-inode "${target_inode}" --server-id "${backend_server_id}" \
+    --port-id "${backend_port_id}" --action attach \
+    --reason binding_local --expected-host "${target_host}" \
+    --timeout "${migration_transition_timeout}" --interval 0.05)" || return 1
+  source_range="$("${python_bin}" -c \
+    'import json,sys; v=json.loads(sys.argv[1]); print(v["matched_byte_start"],v["matched_byte_end"])' \
+    "${source_result}")" || return 1
+  target_range="$("${python_bin}" -c \
+    'import json,sys; v=json.loads(sys.argv[1]); print(v["matched_byte_start"],v["matched_byte_end"])' \
+    "${target_result}")" || return 1
+  read -r source_start source_end <<<"${source_range}"
+  read -r target_start target_end <<<"${target_range}"
+  host_sudo "${source_host}" /usr/bin/dd if="${host_agent_audit_log}" bs=1 \
+    skip="${source_start}" count="$((source_end - source_start))" status=none \
+    >"${leg_dir}/source-agent-detach.jsonl" || return 1
+  host_sudo "${target_host}" /usr/bin/dd if="${host_agent_audit_log}" bs=1 \
+    skip="${target_start}" count="$((target_end - target_start))" status=none \
+    >"${leg_dir}/target-agent-attach.jsonl" || return 1
+
+  host_sudo "${source_host}" /usr/bin/cat "${host_agent_state_file}" \
+    >"${leg_dir}/source-agent-state-after.json" || return 1
+  host_sudo "${target_host}" /usr/bin/cat "${host_agent_state_file}" \
+    >"${leg_dir}/target-agent-state-after.json" || return 1
+  if host_sudo_probe "${source_host}" /usr/bin/test -e "${pin_root}"; then
+    echo "source host retained the backend pin tree after migration" >&2
+    return 1
+  fi
+  host_sudo "${target_host}" /usr/sbin/bpftool -j map show pinned "${pin_path}" \
+    >"${leg_dir}/target-runtime-map-after.json" || return 1
+
+  "${python_bin}" - \
+    "${leg_dir}/source-agent-state-after.json" \
+    "${leg_dir}/target-agent-state-after.json" \
+    "${leg_dir}/target-runtime-map-after.json" \
+    "${source_result}" "${target_result}" \
+    "${phase}" "${source_host}" "${target_host}" \
+    "${backend_server_id}" "${backend_port_id}" "${pin_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def load(path):
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(value, (dict, list)):
+        raise SystemExit(f"invalid attachment evidence: {path}")
+    return value
+
+
+source_state = load(sys.argv[1])
+target_state = load(sys.argv[2])
+target_map = load(sys.argv[3])
+source_event = json.loads(sys.argv[4])
+target_event = json.loads(sys.argv[5])
+phase, source_host, target_host, server_id, port_id, pin_path = sys.argv[6:12]
+source_attachments = source_state.get("attachments")
+target_attachments = target_state.get("attachments")
+if not isinstance(source_attachments, dict) or port_id in source_attachments:
+    raise SystemExit("source Agent still owns the backend after migration")
+if not isinstance(target_attachments, dict) or port_id not in target_attachments:
+    raise SystemExit("target Agent did not attach the backend after migration")
+record = target_attachments[port_id]
+binding = record.get("binding") if isinstance(record, dict) else None
+if not isinstance(binding, dict) or {
+    "server_id": binding.get("server_id"),
+    "port_id": binding.get("port_id"),
+    "host": str(binding.get("host", "")).split(".", 1)[0],
+} != {"server_id": server_id, "port_id": port_id, "host": target_host}:
+    raise SystemExit("target Agent binding does not match migrated placement")
+if (
+    not isinstance(binding.get("ifindex"), int)
+    or binding["ifindex"] <= 0
+    or record.get("healthy") is not True
+    or record.get("missing_pins") != []
+    or record.get("hook_ownership_verified") is not True
+    or record.get("program_ids") != record.get("current_program_ids")
+):
+    raise SystemExit("target Agent attachment is not healthy")
+map_value = target_map[0] if isinstance(target_map, list) and len(target_map) == 1 else target_map
+if not isinstance(map_value, dict) or not isinstance(map_value.get("id"), int):
+    raise SystemExit("target runtime map identity is invalid")
+result = {
+    "ready": True,
+    "phase": phase,
+    "source_host": source_host,
+    "target_host": target_host,
+    "source_detached": True,
+    "target_attached": True,
+    "source_event": source_event,
+    "target_event": target_event,
+    "target_runtime_map": {"host": target_host, "path": pin_path, "id": map_value["id"]},
+    "target_binding": binding,
+}
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+continuity_unit_name() {
+  printf 'vnet-dataplane-migration-continuity-%s-%s.service\n' \
+    "${continuity_run_id}" "$1"
+}
+
+continuity_phase_dir() {
+  printf '%s/%s/%s\n' "${continuity_remote_root}" \
+    "${continuity_run_id}" "$1"
+}
+
+wait_continuity_unit_absent() {
+  local unit="$1" raw="$2"
+  local attempt active_state="" load_state="" rc=0
+  : >"${raw}"
+  for attempt in $(seq 1 200); do
+    rc=0
+    load_state="$(remote_sudo_probe "${client_guest_host}" \
+      /usr/bin/systemctl show -p LoadState --value "${unit}" \
+      2>>"${raw}")" || rc=$?
+    printf 'attempt=%s load_state=%s rc=%s\n' \
+      "${attempt}" "${load_state}" "${rc}" >>"${raw}"
+    if [[ "${rc}" == 0 && "${load_state}" == not-found ]]; then
+      return 0
+    fi
+    active_state="$(remote_sudo_probe "${client_guest_host}" \
+      /usr/bin/systemctl show -p ActiveState --value "${unit}" \
+      2>>"${raw}")" || true
+    if [[ "${active_state}" != active && "${active_state}" != activating &&
+          "${active_state}" != deactivating ]]; then
+      remote_sudo_probe "${client_guest_host}" /usr/bin/systemctl \
+        reset-failed "${unit}" >>"${raw}" 2>&1 || true
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+remove_continuity_remote_tree() {
+  local phase="$1"
+  local run_root="${continuity_remote_root}/${continuity_run_id}"
+  local phase_dir
+  phase_dir="$(continuity_phase_dir "${phase}")"
+  [[ "${phase_dir}" == "${run_root}/${phase}" ]] || return 1
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -L \
+    "${continuity_remote_root}" || return 1
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -L \
+    "${run_root}" || return 1
+  if remote_sudo_probe "${client_guest_host}" /usr/bin/test -e \
+       "${phase_dir}"; then
+    remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -L \
+      "${phase_dir}" || return 1
+    local resolved
+    resolved="$(remote_sudo_probe "${client_guest_host}" \
+      /usr/bin/readlink -f -- "${phase_dir}")" || return 1
+    [[ "${resolved}" == "${phase_dir}" ]] || return 1
+    remote_sudo "${client_guest_host}" /usr/bin/rm -rf -- \
+      "${phase_dir}" || return 1
+  fi
+  if remote_sudo_probe "${client_guest_host}" /usr/bin/test -d \
+       "${run_root}"; then
+    remote_sudo "${client_guest_host}" /usr/bin/rmdir -- \
+      "${run_root}" || return 1
+  fi
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -e \
+    "${run_root}"
+}
+
+emit_continuity_result() {
+  local operation="$1" phase="$2" passed="$3" cleanup_passed="$4"
+  local evidence_complete="$5" probe_passed="$6" unit="$7"
+  local remote_dir="$8" summary_path="$9"
+  "${python_bin}" - "${operation}" "${phase}" "${passed}" \
+    "${cleanup_passed}" "${evidence_complete}" "${probe_passed}" \
+    "${unit}" "${remote_dir}" "${summary_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+
+def boolean(value):
+    return value == "true"
+
+
+summary_path = Path(sys.argv[9]) if sys.argv[9] else None
+summary = None
+if summary_path is not None and summary_path.is_file():
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+result = {
+    "schema": 1,
+    "operation": sys.argv[1],
+    "phase": sys.argv[2],
+    "passed": boolean(sys.argv[3]),
+    "cleanup_passed": boolean(sys.argv[4]),
+    "evidence_complete": boolean(sys.argv[5]),
+    "probe_passed": boolean(sys.argv[6]),
+    "unit": sys.argv[7],
+    "remote_dir": sys.argv[8],
+    "summary": summary,
+}
+print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+stop_continuity_probe() {
+  local operation="$1" phase="$2"
+  local evidence_dir="${out_dir}/migration/${phase}/continuity"
+  local unit remote_dir load_state="" active_state="" probe_passed=false
+  local unit_was_active=false
+  local cleanup_passed=true evidence_complete=true wrapper_passed=false
+  unit="$(continuity_unit_name "${phase}")"
+  remote_dir="$(continuity_phase_dir "${phase}")"
+  mkdir -p "${evidence_dir}"
+
+  load_state="$(remote_sudo_probe "${client_guest_host}" \
+    /usr/bin/systemctl show -p LoadState --value "${unit}" \
+    2>"${evidence_dir}/unit-stop.err")" || true
+  if [[ "${load_state}" != not-found ]]; then
+    active_state="$(remote_sudo_probe "${client_guest_host}" \
+      /usr/bin/systemctl show -p ActiveState --value "${unit}" \
+      2>>"${evidence_dir}/unit-stop.err")" || true
+    [[ "${active_state}" == active ]] && unit_was_active=true
+    printf 'load_state=%s active_state=%s\n' \
+      "${load_state}" "${active_state}" \
+      >"${evidence_dir}/unit-before-stop.txt"
+    remote_sudo "${client_guest_host}" /usr/bin/systemctl stop "${unit}" \
+      >"${evidence_dir}/systemctl-stop.txt" 2>&1 || true
+  else
+    printf 'load_state=not-found active_state=unknown\n' \
+      >"${evidence_dir}/unit-before-stop.txt"
+    printf 'unit already absent: %s\n' "${unit}" \
+      >"${evidence_dir}/systemctl-stop.txt"
+  fi
+  wait_continuity_unit_absent "${unit}" \
+    "${evidence_dir}/unit-absence.txt" || cleanup_passed=false
+  remote_sudo_probe "${client_guest_host}" /usr/bin/journalctl \
+    --no-pager -n 200 -u "${unit}" \
+    >"${evidence_dir}/journal.txt" 2>&1 || true
+
+  local name
+  for name in summary.json dns.jsonl grpc.jsonl; do
+    if remote_sudo_probe "${client_guest_host}" /usr/bin/test -f \
+         "${remote_dir}/${name}"; then
+      remote_sudo "${client_guest_host}" /usr/bin/cat \
+        "${remote_dir}/${name}" >"${evidence_dir}/${name}" || \
+        evidence_complete=false
+    else
+      evidence_complete=false
+    fi
+  done
+  if [[ -s "${evidence_dir}/summary.json" ]]; then
+    if ! probe_passed="$("${python_bin}" - \
+         "${evidence_dir}/summary.json" "${phase}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if value.get("schema_version") != 1 or value.get("phase") != sys.argv[2]:
+    raise SystemExit("continuity summary identity mismatch")
+for protocol in ("dns", "grpc"):
+    item = value.get(protocol)
+    if not isinstance(item, dict) or not isinstance(item.get("samples"), int):
+        raise SystemExit("continuity summary is incomplete")
+print("true" if value.get("passed") is True else "false")
+PY
+    )"; then
+      probe_passed=false
+      evidence_complete=false
+    fi
+  else
+    evidence_complete=false
+  fi
+
+  remove_continuity_remote_tree "${phase}" || cleanup_passed=false
+  capture_process_absent_remote "${client_guest_host}" \
+    '[m]igration_continuity_probe.py' \
+    "${evidence_dir}/process-absence.txt" || cleanup_passed=false
+
+  if [[ "${operation}" == abort ]]; then
+    [[ "${cleanup_passed}" == true ]] && wrapper_passed=true
+  elif [[ "${unit_was_active}" == true &&
+          "${cleanup_passed}" == true &&
+          "${evidence_complete}" == true &&
+          "${probe_passed}" == true ]]; then
+    wrapper_passed=true
+  fi
+  emit_continuity_result "${operation}" "${phase}" "${wrapper_passed}" \
+    "${cleanup_passed}" "${evidence_complete}" "${probe_passed}" \
+    "${unit}" "${remote_dir}" "${evidence_dir}/summary.json"
+  [[ "${cleanup_passed}" == true ]]
+}
+
+start_continuity_probe() {
+  local phase="$1"
+  local evidence_dir="${out_dir}/migration/${phase}/continuity"
+  local run_root="${continuity_remote_root}/${continuity_run_id}"
+  local unit remote_dir active_state="" attempt first_samples_ready=0
+  unit="$(continuity_unit_name "${phase}")"
+  remote_dir="$(continuity_phase_dir "${phase}")"
+  mkdir -p "${evidence_dir}"
+
+  remote_sudo "${client_guest_host}" /usr/bin/install -d \
+    -o root -g root -m 0700 "${continuity_remote_root}"
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -L \
+    "${continuity_remote_root}"
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -L \
+    "${run_root}"
+  remote_sudo_probe "${client_guest_host}" /usr/bin/test ! -e \
+    "${run_root}"
+  remote_sudo "${client_guest_host}" /usr/bin/install -d \
+    -o root -g root -m 0700 "${run_root}"
+
+  if ! remote_sudo "${client_guest_host}" /usr/bin/systemd-run --quiet \
+       --unit="${unit}" --collect \
+       --property=Type=exec --property=KillMode=mixed \
+       --property="TimeoutStopSec=${continuity_stop_timeout}s" \
+       --property="RuntimeMaxSec=${continuity_max_duration}s" \
+       /usr/bin/python3 \
+       /opt/vnet-dataplane/linux_accel/bench/migration_continuity_probe.py \
+       --phase "${phase}" --backend-ip "${backend_ip}" \
+       --dns-harness \
+       /opt/vnet-dataplane/linux_accel/build/openstack_dns_harness \
+       --grpc-harness \
+       /opt/vnet-dataplane/linux_accel/build/openstack_grpc_harness \
+       --output-dir "${remote_dir}" --interval "${continuity_interval}" \
+       --command-timeout "${continuity_command_timeout}" \
+       --min-samples "${continuity_min_samples}" \
+       >"${evidence_dir}/systemd-run.txt" 2>&1; then
+    stop_continuity_probe abort "${phase}" \
+      >"${evidence_dir}/start-rollback.json" 2>&1 || true
+    return 1
+  fi
+
+  for attempt in $(seq 1 200); do
+    active_state="$(remote_sudo_probe "${client_guest_host}" \
+      /usr/bin/systemctl is-active "${unit}" 2>/dev/null)" || true
+    if [[ "${active_state}" == active ]] &&
+       remote_sudo_probe "${client_guest_host}" /usr/bin/test -s \
+         "${remote_dir}/dns.jsonl" &&
+       remote_sudo_probe "${client_guest_host}" /usr/bin/test -s \
+         "${remote_dir}/grpc.jsonl"; then
+      remote_sudo_probe "${client_guest_host}" /usr/bin/head -n 1 \
+        "${remote_dir}/dns.jsonl" >"${evidence_dir}/start-dns.json"
+      remote_sudo_probe "${client_guest_host}" /usr/bin/head -n 1 \
+        "${remote_dir}/grpc.jsonl" >"${evidence_dir}/start-grpc.json"
+      if "${python_bin}" - "${evidence_dir}/start-dns.json" \
+           "${evidence_dir}/start-grpc.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for path in sys.argv[1:]:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    if value.get("success") is not True:
+        raise SystemExit("continuity start sample failed")
+PY
+      then
+        first_samples_ready=1
+      fi
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "${active_state}" != active || "${first_samples_ready}" != 1 ]]; then
+    remote_sudo_probe "${client_guest_host}" /usr/bin/journalctl \
+      --no-pager -n 200 -u "${unit}" \
+      >"${evidence_dir}/start-failure-journal.txt" 2>&1 || true
+    stop_continuity_probe abort "${phase}" \
+      >"${evidence_dir}/start-rollback.json" 2>&1 || true
+    return 1
+  fi
+  remote_sudo_probe "${client_guest_host}" /usr/bin/systemctl show \
+    -p LoadState -p ActiveState -p SubState -p MainPID "${unit}" \
+    >"${evidence_dir}/unit-start.txt"
+  continuity_unit="${unit}"
+  continuity_remote_dir="${remote_dir}"
+  emit_continuity_result start "${phase}" true true false false \
+    "${unit}" "${remote_dir}" ""
+}
+
+manage_continuity_probe() {
+  local operation="$1" phase="$2"
+  [[ "${phase}" == forward || "${phase}" == reverse ]] || {
+    echo "unsupported continuity phase: ${phase}" >&2
+    return 2
+  }
+  case "${operation}" in
+    start)
+      start_continuity_probe "${phase}"
+      ;;
+    stop|abort)
+      stop_continuity_probe "${operation}" "${phase}"
+      ;;
+    *)
+      echo "unsupported continuity operation: ${operation}" >&2
       return 2
       ;;
   esac
@@ -1706,7 +2862,7 @@ assert_unit_inactive_remote() {
   local host="$1"
   local unit="$2"
   local state
-  state="$(remote_sudo_probe "${host}" /usr/bin/systemctl show \
+  state="$(remote_sudo_probe "$(remote_service_target "${host}")" /usr/bin/systemctl show \
     -p LoadState -p ActiveState -p SubState -p Result "${unit}")" || return 1
   grep -q '^LoadState=loaded$' <<<"${state}" &&
     grep -q '^ActiveState=inactive$' <<<"${state}" &&
@@ -1732,12 +2888,13 @@ assert_no_process_remote() {
 }
 
 audit_tc_cleanup() {
-  local tap="$1"
+  local host="$1"
+  local tap="$2"
   local ingress="${out_dir}/systemd/${tap}.tc-ingress.txt"
   local egress="${out_dir}/systemd/${tap}.tc-egress.txt"
   local status=0
-  local_sudo /usr/sbin/tc filter show dev "${tap}" ingress >"${ingress}" || status=1
-  local_sudo /usr/sbin/tc filter show dev "${tap}" egress >"${egress}" || status=1
+  host_sudo "${host}" /usr/sbin/tc filter show dev "${tap}" ingress >"${ingress}" || status=1
+  host_sudo "${host}" /usr/sbin/tc filter show dev "${tap}" egress >"${egress}" || status=1
   if grep -Eq 'handle 0x1 |handle 0x2 ' "${ingress}" "${egress}"; then
     echo "run-owned TC hook remains on ${tap}" >&2
     status=1
@@ -1745,8 +2902,8 @@ audit_tc_cleanup() {
   if [[ "${require_netmig_tc}" == 1 ]]; then
     local ingress_identity="${out_dir}/systemd/${tap}.netmig-ingress-after.json"
     local egress_identity="${out_dir}/systemd/${tap}.netmig-egress-after.json"
-    capture_tc_identity "${tap}" ingress 0x65 "${ingress_identity}" || status=1
-    capture_tc_identity "${tap}" egress 0x66 "${egress_identity}" || status=1
+    capture_tc_identity "${host}" "${tap}" ingress 0x65 "${ingress_identity}" || status=1
+    capture_tc_identity "${host}" "${tap}" egress 0x66 "${egress_identity}" || status=1
     if ! cmp -s \
       "${out_dir}/systemd/${tap}.netmig-ingress-before.json" \
       "${ingress_identity}"; then
@@ -1779,13 +2936,35 @@ capture_unit_inactive_remote() {
   local host="$1"
   local unit="$2"
   local raw="$3"
-  remote_sudo_probe "${host}" /usr/bin/systemctl show \
+  remote_sudo_probe "$(remote_service_target "${host}")" /usr/bin/systemctl show \
     -p LoadState -p ActiveState -p SubState -p Result "${unit}" \
     >"${raw}" 2>&1 || return 1
   grep -q '^LoadState=loaded$' "${raw}" &&
     grep -q '^ActiveState=inactive$' "${raw}" &&
     grep -q '^SubState=dead$' "${raw}" &&
     grep -q '^Result=success$' "${raw}"
+}
+
+capture_unit_inactive_compute() {
+  local host="$1"
+  local unit="$2"
+  local raw="$3"
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    capture_unit_inactive_local "${unit}" "${raw}"
+  else
+    capture_unit_inactive_remote "${host}" "${unit}" "${raw}"
+  fi
+}
+
+capture_unit_absent_remote() {
+  local host="$1"
+  local unit="$2"
+  local raw="$3"
+  remote_sudo_probe "$(remote_service_target "${host}")" /usr/bin/systemctl show \
+    -p LoadState -p ActiveState -p SubState -p Result "${unit}" \
+    >"${raw}" 2>&1 || return 1
+  grep -q '^LoadState=not-found$' "${raw}"
 }
 
 capture_path_absent_local() {
@@ -1807,7 +2986,7 @@ capture_path_absent_remote() {
   local path="$2"
   local raw="$3"
   local rc=0
-  if remote_sudo_probe "${host}" /usr/bin/test ! -e "${path}"; then
+  if remote_sudo_probe "$(remote_service_target "${host}")" /usr/bin/test ! -e "${path}"; then
     printf 'absent\t%s\t%s\n' "${host}" "${path}" >"${raw}"
     return 0
   else
@@ -1816,6 +2995,18 @@ capture_path_absent_remote() {
   printf 'not-absent-or-probe-error=%s\t%s\t%s\n' \
     "${rc}" "${host}" "${path}" >"${raw}"
   return "${rc}"
+}
+
+capture_path_absent_compute() {
+  local host="$1"
+  local path="$2"
+  local raw="$3"
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    capture_path_absent_local "${path}" "${raw}"
+  else
+    capture_path_absent_remote "${host}" "${path}" "${raw}"
+  fi
 }
 
 capture_process_absent_local() {
@@ -1836,7 +3027,7 @@ capture_process_absent_remote() {
   local pattern="$2"
   local raw="$3"
   local rc=0
-  remote_sudo_probe "${host}" /usr/bin/pgrep -af "${pattern}" \
+  remote_sudo_probe "$(remote_service_target "${host}")" /usr/bin/pgrep -af "${pattern}" \
     >"${raw}" 2>&1 || rc=$?
   if (( rc == 1 )); then
     printf '%s\n' 'no matching process' >>"${raw}"
@@ -1844,6 +3035,18 @@ capture_process_absent_remote() {
   fi
   (( rc == 0 )) && return 1
   return "${rc}"
+}
+
+capture_process_absent_compute() {
+  local host="$1"
+  local pattern="$2"
+  local raw="$3"
+  if [[ "${source_compute_remote}" == 0 &&
+        "${host}" == "${expected_compute_host}" ]]; then
+    capture_process_absent_local "${pattern}" "${raw}"
+  else
+    capture_process_absent_remote "${host}" "${pattern}" "${raw}"
+  fi
 }
 
 write_cleanup_evidence() {
@@ -1875,6 +3078,7 @@ required = {
     "xdp_detached",
     "listeners_absent",
     "tc_cleanup",
+    "continuity_absent",
 }
 if set(checks) != required:
     raise SystemExit("cleanup check set is incomplete")
@@ -1942,6 +3146,7 @@ required = {
     "xdp_detached",
     "listeners_absent",
     "tc_cleanup",
+    "continuity_absent",
 }
 checks = evidence.get("checks")
 if evidence.get("schema") != 1 or evidence.get("passed") is not True:
@@ -1971,28 +3176,28 @@ if execution_mode == "real":
     raw_names = {
         "master-coordinator.systemctl.txt",
         "master-metrics.systemctl.txt",
-        "master-agent.systemctl.txt",
-        "compute2-agent.systemctl.txt",
+        "source-compute-agent.systemctl.txt",
+        "target-compute-agent.systemctl.txt",
         "client-guest-agent.systemctl.txt",
         "backend-guest-agent.systemctl.txt",
         "backend-dns.systemctl.txt",
         "backend-grpc.systemctl.txt",
-        "master-client-pin.txt",
-        "master-backend-pin.txt",
-        "compute2-client-pin.txt",
-        "compute2-backend-pin.txt",
+        "source-compute-client-pin.txt",
+        "source-compute-backend-pin.txt",
+        "target-compute-client-pin.txt",
+        "target-compute-backend-pin.txt",
         "client-guest-pin.txt",
         "backend-guest-pin.txt",
-        "master-client-quiesce.txt",
-        "master-backend-quiesce.txt",
-        "compute2-client-quiesce.txt",
-        "compute2-backend-quiesce.txt",
+        "source-compute-client-quiesce.txt",
+        "source-compute-backend-quiesce.txt",
+        "target-compute-client-quiesce.txt",
+        "target-compute-backend-quiesce.txt",
         "client-guest-quiesce.txt",
         "backend-guest-quiesce.txt",
-        "master-agent.pgrep.txt",
+        "source-compute-agent.pgrep.txt",
         "master-coordinator.pgrep.txt",
         "master-metrics.pgrep.txt",
-        "compute2-agent.pgrep.txt",
+        "target-compute-agent.pgrep.txt",
         "client-guest-agent.pgrep.txt",
         "backend-guest-agent.pgrep.txt",
         "client-grpc-cache.pgrep.txt",
@@ -2002,12 +3207,16 @@ if execution_mode == "real":
         "backend-dns-harness.pgrep.txt",
         "client-grpc-harness.pgrep.txt",
         "backend-grpc-harness.pgrep.txt",
-        "master-client-tap.ip-link.txt",
-        "master-backend-tap.ip-link.txt",
+        "source-compute-client-interface.ip-link.txt",
+        "source-compute-backend-interface.ip-link.txt",
         "backend-guest-ens3.ip-link.txt",
         "backend-guest.ss-udp.txt",
         "backend-guest.ss-tcp.txt",
         "client-guest.ss-tcp.txt",
+        "client-continuity-forward.systemctl.txt",
+        "client-continuity-reverse.systemctl.txt",
+        "client-continuity-run-dir.txt",
+        "client-continuity-probe.pgrep.txt",
     }
     expected = {f"cleanup/raw/{name}" for name in raw_names}
     for tap in (client_tap, backend_tap):
@@ -2036,39 +3245,39 @@ audit_cleanup() {
   local checks_file="${out_dir}/cleanup/checks.tsv"
   local units_inactive=true pins_removed=true quiesce_removed=true
   local processes_absent=true xdp_detached=true listeners_absent=true
-  local tc_cleanup=true
+  local tc_cleanup=true continuity_absent=true
   mkdir -p "${raw_dir}"
 
   capture_unit_inactive_local "${coordinator_unit}" "${raw_dir}/master-coordinator.systemctl.txt" || units_inactive=false
   capture_unit_inactive_local "${metrics_unit}" "${raw_dir}/master-metrics.systemctl.txt" || units_inactive=false
-  capture_unit_inactive_local "${host_agent_unit}" "${raw_dir}/master-agent.systemctl.txt" || units_inactive=false
-  capture_unit_inactive_remote "${compute2_host}" "${host_agent_unit}" "${raw_dir}/compute2-agent.systemctl.txt" || units_inactive=false
+  capture_unit_inactive_compute "${expected_compute_host}" "${host_agent_unit}" "${raw_dir}/source-compute-agent.systemctl.txt" || units_inactive=false
+  capture_unit_inactive_compute "${compute2_host}" "${host_agent_unit}" "${raw_dir}/target-compute-agent.systemctl.txt" || units_inactive=false
   capture_unit_inactive_remote "${client_guest_host}" "${guest_agent_unit}" "${raw_dir}/client-guest-agent.systemctl.txt" || units_inactive=false
   capture_unit_inactive_remote "${backend_guest_host}" "${guest_agent_unit}" "${raw_dir}/backend-guest-agent.systemctl.txt" || units_inactive=false
   capture_unit_inactive_remote "${backend_guest_host}" "${dns_backend_unit}" "${raw_dir}/backend-dns.systemctl.txt" || units_inactive=false
   capture_unit_inactive_remote "${backend_guest_host}" "${grpc_backend_unit}" "${raw_dir}/backend-grpc.systemctl.txt" || units_inactive=false
   [[ "${units_inactive}" == true ]] || status=1
 
-  capture_path_absent_local "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}" "${raw_dir}/master-client-pin.txt" || pins_removed=false
-  capture_path_absent_local "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}" "${raw_dir}/master-backend-pin.txt" || pins_removed=false
-  capture_path_absent_remote "${compute2_host}" "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}" "${raw_dir}/compute2-client-pin.txt" || pins_removed=false
-  capture_path_absent_remote "${compute2_host}" "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}" "${raw_dir}/compute2-backend-pin.txt" || pins_removed=false
+  capture_path_absent_compute "${expected_compute_host}" "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}" "${raw_dir}/source-compute-client-pin.txt" || pins_removed=false
+  capture_path_absent_compute "${expected_compute_host}" "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}" "${raw_dir}/source-compute-backend-pin.txt" || pins_removed=false
+  capture_path_absent_compute "${compute2_host}" "/sys/fs/bpf/vnet-dataplane-agent/${client_port_id}" "${raw_dir}/target-compute-client-pin.txt" || pins_removed=false
+  capture_path_absent_compute "${compute2_host}" "/sys/fs/bpf/vnet-dataplane-agent/${backend_port_id}" "${raw_dir}/target-compute-backend-pin.txt" || pins_removed=false
   capture_path_absent_remote "${client_guest_host}" "/sys/fs/bpf/vnet-dataplane-guest/${client_port_id}" "${raw_dir}/client-guest-pin.txt" || pins_removed=false
   capture_path_absent_remote "${backend_guest_host}" "/sys/fs/bpf/vnet-dataplane-guest/${backend_port_id}" "${raw_dir}/backend-guest-pin.txt" || pins_removed=false
   [[ "${pins_removed}" == true ]] || status=1
 
-  capture_path_absent_local "/run/vnet-dataplane-policy/vnet-dataplane-${client_port_id}.quiesce" "${raw_dir}/master-client-quiesce.txt" || quiesce_removed=false
-  capture_path_absent_local "/run/vnet-dataplane-policy/vnet-dataplane-${backend_port_id}.quiesce" "${raw_dir}/master-backend-quiesce.txt" || quiesce_removed=false
-  capture_path_absent_remote "${compute2_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${client_port_id}.quiesce" "${raw_dir}/compute2-client-quiesce.txt" || quiesce_removed=false
-  capture_path_absent_remote "${compute2_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${backend_port_id}.quiesce" "${raw_dir}/compute2-backend-quiesce.txt" || quiesce_removed=false
+  capture_path_absent_compute "${expected_compute_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${client_port_id}.quiesce" "${raw_dir}/source-compute-client-quiesce.txt" || quiesce_removed=false
+  capture_path_absent_compute "${expected_compute_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${backend_port_id}.quiesce" "${raw_dir}/source-compute-backend-quiesce.txt" || quiesce_removed=false
+  capture_path_absent_compute "${compute2_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${client_port_id}.quiesce" "${raw_dir}/target-compute-client-quiesce.txt" || quiesce_removed=false
+  capture_path_absent_compute "${compute2_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${backend_port_id}.quiesce" "${raw_dir}/target-compute-backend-quiesce.txt" || quiesce_removed=false
   capture_path_absent_remote "${client_guest_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${client_port_id}.quiesce" "${raw_dir}/client-guest-quiesce.txt" || quiesce_removed=false
   capture_path_absent_remote "${backend_guest_host}" "/run/vnet-dataplane-policy/vnet-dataplane-${backend_port_id}.quiesce" "${raw_dir}/backend-guest-quiesce.txt" || quiesce_removed=false
   [[ "${quiesce_removed}" == true ]] || status=1
 
-  capture_process_absent_local '[o]penstack_dataplane_agent.py' "${raw_dir}/master-agent.pgrep.txt" || processes_absent=false
+  capture_process_absent_compute "${expected_compute_host}" '[o]penstack_dataplane_agent.py' "${raw_dir}/source-compute-agent.pgrep.txt" || processes_absent=false
   capture_process_absent_local '[o]penstack_epoch_coordinator.py' "${raw_dir}/master-coordinator.pgrep.txt" || processes_absent=false
   capture_process_absent_local '[o]penstack_metrics_bridge.py' "${raw_dir}/master-metrics.pgrep.txt" || processes_absent=false
-  capture_process_absent_remote "${compute2_host}" '[o]penstack_dataplane_agent.py' "${raw_dir}/compute2-agent.pgrep.txt" || processes_absent=false
+  capture_process_absent_compute "${compute2_host}" '[o]penstack_dataplane_agent.py' "${raw_dir}/target-compute-agent.pgrep.txt" || processes_absent=false
   capture_process_absent_remote "${client_guest_host}" '[o]penstack_guest_endpoint_agent.py' "${raw_dir}/client-guest-agent.pgrep.txt" || processes_absent=false
   capture_process_absent_remote "${backend_guest_host}" '[o]penstack_guest_endpoint_agent.py' "${raw_dir}/backend-guest-agent.pgrep.txt" || processes_absent=false
   capture_process_absent_remote "${client_guest_host}" '[g]rpc_fast_cache' "${raw_dir}/client-grpc-cache.pgrep.txt" || processes_absent=false
@@ -2080,15 +3289,15 @@ audit_cleanup() {
   capture_process_absent_remote "${backend_guest_host}" '[o]penstack_grpc_harness' "${raw_dir}/backend-grpc-harness.pgrep.txt" || processes_absent=false
   [[ "${processes_absent}" == true ]] || status=1
 
-  if ! local_sudo /usr/sbin/ip -details link show dev "${client_tap}" >"${raw_dir}/master-client-tap.ip-link.txt" 2>&1; then
+  if ! host_sudo "${expected_compute_host}" /usr/sbin/ip -details link show dev "${client_tap}" >"${raw_dir}/source-compute-client-interface.ip-link.txt" 2>&1; then
     xdp_detached=false
-  elif grep -q 'prog/xdp' "${raw_dir}/master-client-tap.ip-link.txt"; then
+  elif grep -q 'prog/xdp' "${raw_dir}/source-compute-client-interface.ip-link.txt"; then
     echo "client host XDP hook remains after cleanup" >&2
     xdp_detached=false
   fi
-  if ! local_sudo /usr/sbin/ip -details link show dev "${backend_tap}" >"${raw_dir}/master-backend-tap.ip-link.txt" 2>&1; then
+  if ! host_sudo "${expected_compute_host}" /usr/sbin/ip -details link show dev "${backend_tap}" >"${raw_dir}/source-compute-backend-interface.ip-link.txt" 2>&1; then
     xdp_detached=false
-  elif grep -q 'prog/xdp' "${raw_dir}/master-backend-tap.ip-link.txt"; then
+  elif grep -q 'prog/xdp' "${raw_dir}/source-compute-backend-interface.ip-link.txt"; then
     echo "backend host XDP hook remains after cleanup" >&2
     xdp_detached=false
   fi
@@ -2121,8 +3330,24 @@ audit_cleanup() {
   fi
   [[ "${listeners_absent}" == true ]] || status=1
 
-  audit_tc_cleanup "${client_tap}" || tc_cleanup=false
-  audit_tc_cleanup "${backend_tap}" || tc_cleanup=false
+  capture_unit_absent_remote "${client_guest_host}" \
+    "$(continuity_unit_name forward)" \
+    "${raw_dir}/client-continuity-forward.systemctl.txt" || \
+    continuity_absent=false
+  capture_unit_absent_remote "${client_guest_host}" \
+    "$(continuity_unit_name reverse)" \
+    "${raw_dir}/client-continuity-reverse.systemctl.txt" || \
+    continuity_absent=false
+  capture_path_absent_remote "${client_guest_host}" \
+    "${continuity_remote_root}/${continuity_run_id}" \
+    "${raw_dir}/client-continuity-run-dir.txt" || continuity_absent=false
+  capture_process_absent_remote "${client_guest_host}" \
+    '[m]igration_continuity_probe.py' \
+    "${raw_dir}/client-continuity-probe.pgrep.txt" || continuity_absent=false
+  [[ "${continuity_absent}" == true ]] || status=1
+
+  audit_tc_cleanup "${expected_compute_host}" "${client_tap}" || tc_cleanup=false
+  audit_tc_cleanup "${expected_compute_host}" "${backend_tap}" || tc_cleanup=false
   [[ "${tc_cleanup}" == true ]] || status=1
 
   {
@@ -2133,6 +3358,7 @@ audit_cleanup() {
     printf 'xdp_detached\t%s\n' "${xdp_detached}"
     printf 'listeners_absent\t%s\n' "${listeners_absent}"
     printf 'tc_cleanup\t%s\n' "${tc_cleanup}"
+    printf 'continuity_absent\t%s\n' "${continuity_absent}"
   } >"${checks_file}"
   write_cleanup_evidence "${checks_file}" || status=1
   return "${status}"
@@ -2153,7 +3379,8 @@ production_action() {
       if [[ "${scope}" == local ]]; then
         systemctl_local "${operation}" "${unit}"
       else
-        systemctl_remote "${node}" "${operation}" "${unit}"
+        systemctl_remote "$(remote_service_target "${node}")" \
+          "${operation}" "${unit}"
       fi
       ;;
     audit-running)
@@ -2167,6 +3394,21 @@ production_action() {
       ;;
     workload)
       run_workload "$1"
+      ;;
+    migration-baseline)
+      capture_migration_baseline "$@"
+      ;;
+    wait-transition)
+      wait_migration_transition "$@"
+      ;;
+    wait-attachment)
+      wait_migration_attachment "$@"
+      ;;
+    continuity)
+      manage_continuity_probe "$@"
+      ;;
+    migration)
+      run_migration_leg "$@"
       ;;
     snapshot)
       snapshot_metrics "$1"
@@ -2194,7 +3436,11 @@ stop_services() {
   action service local master stop "${coordinator_unit}" || status=1
   action service local master stop "${metrics_unit}" || status=1
   action service remote "${compute2_host}" stop "${host_agent_unit}" || status=1
-  action service local master stop "${host_agent_unit}" || status=1
+  if [[ "${source_compute_remote}" == 1 ]]; then
+    action service remote "${expected_compute_host}" stop "${host_agent_unit}" || status=1
+  else
+    action service local master stop "${host_agent_unit}" || status=1
+  fi
   action service remote "${client_guest_host}" stop "${guest_agent_unit}" || status=1
   action service remote "${backend_guest_host}" stop "${guest_agent_unit}" || status=1
   action service remote "${backend_guest_host}" stop "${grpc_backend_unit}" || status=1
@@ -2208,11 +3454,33 @@ start_services() {
   action service remote "${backend_guest_host}" start "${guest_agent_unit}"
   action service remote "${client_guest_host}" start "${guest_agent_unit}"
   action service remote "${compute2_host}" start "${host_agent_unit}"
-  action service local master start "${host_agent_unit}"
+  if [[ "${source_compute_remote}" == 1 ]]; then
+    action service remote "${expected_compute_host}" start "${host_agent_unit}"
+  else
+    action service local master start "${host_agent_unit}"
+  fi
   action audit-running
   action service local master start "${metrics_unit}"
+  if [[ "${execution_mode}" == real ]]; then
+    metrics_invocation_id="$(local_sudo /usr/bin/systemctl show \
+      --property InvocationID --value "${metrics_unit}")"
+    [[ "${metrics_invocation_id}" =~ ^[0-9a-f]{32}$ ]] || {
+      echo "metrics service returned an invalid InvocationID" >&2
+      return 1
+    }
+  fi
   coordinator_started=1
   action service local master start "${coordinator_unit}"
+}
+
+capture_metrics_journal() {
+  [[ "${execution_mode}" == real ]] || return 0
+  [[ "${metrics_invocation_id}" =~ ^[0-9a-f]{32}$ ]] || return 1
+  mkdir -p "${out_dir}/systemd"
+  local_sudo /usr/bin/journalctl --no-pager -o short-iso \
+    "_SYSTEMD_INVOCATION_ID=${metrics_invocation_id}" \
+    >"${out_dir}/systemd/master-metrics.journal.txt"
+  test -s "${out_dir}/systemd/master-metrics.journal.txt"
 }
 
 json_epoch() {
@@ -2295,11 +3563,251 @@ PY
 
 write_summary() {
   local status="$1"
-  printf '{"status":"%s","execution_mode":"%s","preflight_only":%s,"cleanup_audit_only":%s,"experiment_executed":%s,"formal_rounds":0,"baseline_epoch":%s,"bypass_epoch":%s,"server_epoch":%s,"dns_backend_suppressed":%s,"dns_acceleration":"guest_xdp_server_cache","grpc_acceleration":"guest_userspace_h2c_fast_cache","grpc_kernel_response":false,"host_tc_role":"observation_and_coexistence","cleanup_status":%s}\n' \
+  printf '{"status":"%s","execution_mode":"%s","preflight_only":%s,"cleanup_audit_only":%s,"experiment_executed":%s,"formal_rounds":0,"baseline_epoch":%s,"bypass_epoch":%s,"server_epoch":%s,"dns_backend_suppressed":%s,"dns_acceleration":"guest_xdp_server_cache","grpc_acceleration":"guest_userspace_h2c_fast_cache","grpc_kernel_response":false,"host_tc_role":"observation_and_coexistence","migration_mode":"%s","migration_roundtrip_completed":%s,"cleanup_status":%s}\n' \
     "${status}" "${execution_mode}" "${preflight_only}" "${cleanup_audit_only}" "${experiment_executed}" \
     "${baseline_epoch}" "${bypass_epoch}" "${server_epoch}" \
-    "${dns_backend_suppressed}" "${cleanup_status}" \
+    "${dns_backend_suppressed}" "${migration_mode}" \
+    "${migration_roundtrip_completed}" "${cleanup_status}" \
     >"${out_dir}/result-summary.json"
+}
+
+write_roundtrip_artifact() {
+  mkdir -p "${out_dir}/migration"
+  printf '{"schema":1,"completed":%s,"final_host":"%s","recovery_attempted":%s,"recovery_completed":%s}\n' \
+    "${migration_roundtrip_completed}" "${backend_current_host}" \
+    "${migration_recovery_attempted}" "${migration_recovery_completed}" \
+    >"${out_dir}/migration/roundtrip.json"
+}
+
+validate_migration_artifact() {
+  local path="$1" expected_phase="$2" expected_source="$3"
+  local expected_target="$4" evidence_dir="$5"
+  "${python_bin}" - "${path}" "${expected_phase}" "${expected_source}" \
+    "${expected_target}" "${backend_server_id}" "${backend_port_id}" \
+    "${evidence_dir}" "${execution_mode}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+phase, expected_source, expected_target = sys.argv[2:5]
+server_id, port_id = sys.argv[5:7]
+evidence_dir = Path(sys.argv[7])
+execution_mode = sys.argv[8]
+if not isinstance(value, dict) or value.get("schema") != 1:
+    raise SystemExit("migration artifact has unsupported schema")
+if value.get("phase") != phase or value.get("status") != "completed":
+    raise SystemExit("migration artifact does not prove completion")
+expected = {
+    "server_id": server_id,
+    "port_id": port_id,
+    "target_host": expected_target,
+    "final_host": expected_target,
+    "requested_source_host": expected_source,
+}
+if any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit("migration artifact identity does not match the requested leg")
+if phase != "restore" and value.get("source_host") != expected_source:
+    raise SystemExit("migration artifact has an unexpected source host")
+if not isinstance(value.get("source_host"), str) or not value["source_host"]:
+    raise SystemExit("migration artifact has no effective source host")
+outcome = value.get("outcome")
+migration_id = value.get("migration_id")
+if phase != "restore" or outcome == "completed":
+    if not isinstance(migration_id, str) or not migration_id:
+        raise SystemExit("migration artifact has no migration ID")
+elif outcome == "already_on_target":
+    if migration_id is not None:
+        raise SystemExit("idempotent restore unexpectedly has a migration ID")
+else:
+    raise SystemExit("restore artifact has an unsupported outcome")
+
+if execution_mode == "real":
+    raw_summary = json.loads(
+        (evidence_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    if raw_summary != value:
+        raise SystemExit("migration stdout and raw summary differ")
+    events = [
+        json.loads(line)
+        for line in (evidence_dir / "events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if line.strip()
+    ]
+    event_name = (
+        "migration_already_on_target"
+        if outcome == "already_on_target"
+        else "migration_completed"
+    )
+    completions = [item for item in events if item.get("event") == event_name]
+    if not completions:
+        raise SystemExit("migration events have no matching completion record")
+    completion = completions[-1]
+    for key in (
+        "phase",
+        "server_id",
+        "port_id",
+        "source_host",
+        "target_host",
+        "final_host",
+        "migration_id",
+    ):
+        if completion.get(key) != value.get(key):
+            raise SystemExit(f"migration completion event differs at {key}")
+PY
+}
+
+validate_migration_baseline() {
+  local path="$1" expected_phase="$2" source_host="$3"
+  local target_host="$4" after_epoch="$5"
+  "${python_bin}" - "${path}" "${expected_phase}" "${source_host}" \
+    "${target_host}" "${after_epoch}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "schema": 1,
+    "phase": sys.argv[2],
+    "source_host": sys.argv[3],
+    "target_host": sys.argv[4],
+    "after_epoch": int(sys.argv[5]),
+}
+if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit("migration baseline does not match the requested leg")
+for name in ("coordinator", "source_agent", "target_agent"):
+    cursor = value.get(name)
+    if not isinstance(cursor, dict):
+        raise SystemExit(f"migration baseline cursor is missing: {name}")
+    for field in ("device", "inode", "offset"):
+        item = cursor.get(field)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise SystemExit(f"migration baseline cursor is invalid: {name}/{field}")
+PY
+}
+
+validate_transition_artifact() {
+  local path="$1" after_epoch="$2"
+  "${python_bin}" - "${path}" "${after_epoch}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+epoch = value.get("epoch") if isinstance(value, dict) else None
+if value.get("ready") is not True:
+    raise SystemExit("migration transition is not ready")
+if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= int(sys.argv[2]):
+    raise SystemExit("migration transition epoch is not fresh")
+if value.get("outcome") not in {
+    "migration_forced_bypass",
+    "migration_frozen_in_bypass",
+    "gate_changed_bypass_recovered",
+}:
+    raise SystemExit("migration transition outcome is invalid")
+PY
+}
+
+validate_attachment_artifact() {
+  local path="$1" expected_phase="$2" source_host="$3" target_host="$4"
+  "${python_bin}" - "${path}" "${expected_phase}" "${source_host}" \
+    "${target_host}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "ready": True,
+    "phase": sys.argv[2],
+    "source_host": sys.argv[3],
+    "target_host": sys.argv[4],
+    "source_detached": True,
+    "target_attached": True,
+}
+if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
+    raise SystemExit("migration attachment proof is incomplete")
+PY
+}
+
+validate_continuity_artifact() {
+  local path="$1" operation="$2" phase="$3"
+  "${python_bin}" - "${path}" "${operation}" "${phase}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not isinstance(value, dict) or value.get("schema") != 1:
+    raise SystemExit("continuity artifact has unsupported schema")
+if value.get("operation") != sys.argv[2] or value.get("phase") != sys.argv[3]:
+    raise SystemExit("continuity artifact does not match the requested action")
+if value.get("passed") is not True:
+    raise SystemExit("continuity probe did not pass")
+PY
+}
+
+run_migration_sequence() {
+  local phase="$1" source_host="$2" target_host="$3"
+  local fence_epoch="${server_epoch}"
+  local leg_dir="${out_dir}/migration/${phase}"
+  mkdir -p "${leg_dir}"
+
+  action migration-baseline "${phase}" "${source_host}" "${target_host}" \
+    "${fence_epoch}" >"${leg_dir}/baseline.json"
+  validate_migration_baseline "${leg_dir}/baseline.json" "${phase}" \
+    "${source_host}" "${target_host}" "${fence_epoch}"
+
+  continuity_active=1
+  continuity_phase="${phase}"
+  action continuity start "${phase}" >"${leg_dir}/continuity-start.json"
+  validate_continuity_artifact "${leg_dir}/continuity-start.json" start "${phase}"
+
+  if ! action migration "${phase}" "${backend_server_id}" \
+       "${source_host}" "${target_host}" \
+       >"${out_dir}/migration/${phase}.json" \
+       2>"${out_dir}/migration/${phase}.err"; then
+    printf '%s migration action failed\n' "${phase}" \
+      >>"${out_dir}/migration/${phase}.err"
+    return 1
+  fi
+  backend_current_host="${target_host}"
+  validate_migration_artifact "${out_dir}/migration/${phase}.json" \
+    "${phase}" "${source_host}" "${target_host}" \
+    "${out_dir}/migration/${phase}/openstack" || return 1
+  write_roundtrip_artifact
+
+  action wait-transition "${phase}" "${source_host}" "${target_host}" \
+    "${fence_epoch}" >"${leg_dir}/transition.json"
+  validate_transition_artifact "${leg_dir}/transition.json" "${fence_epoch}"
+  local transition_epoch
+  transition_epoch="$(json_epoch "${leg_dir}/transition.json")"
+
+  action wait-attachment "${phase}" "${source_host}" "${target_host}" \
+    >"${leg_dir}/attachment.json"
+  validate_attachment_artifact "${leg_dir}/attachment.json" "${phase}" \
+    "${source_host}" "${target_host}"
+
+  action wait-committed server "${transition_epoch}" \
+    >"${leg_dir}/committed-server.json"
+  server_epoch="$(json_epoch "${leg_dir}/committed-server.json")"
+
+  action continuity stop "${phase}" >"${leg_dir}/continuity-stop.json"
+  continuity_active=0
+  continuity_phase=""
+  validate_continuity_artifact "${leg_dir}/continuity-stop.json" stop "${phase}"
+}
+
+run_roundtrip_migration() {
+  mkdir -p "${out_dir}/migration"
+  migration_started=1
+  write_roundtrip_artifact
+  run_migration_sequence forward "${expected_compute_host}" "${compute2_host}"
+  run_migration_sequence reverse "${compute2_host}" "${expected_compute_host}"
+  migration_roundtrip_completed=true
+  write_roundtrip_artifact
 }
 
 generate_manifest() {
@@ -2332,6 +3840,37 @@ cleanup() {
   set +e
 
   if (( mutated != 0 )); then
+    if (( continuity_active != 0 )); then
+      if action continuity abort "${continuity_phase}" \
+           >"${out_dir}/migration/${continuity_phase}/continuity-abort.json" \
+           2>"${out_dir}/migration/${continuity_phase}/continuity-abort.err" &&
+         validate_continuity_artifact \
+           "${out_dir}/migration/${continuity_phase}/continuity-abort.json" \
+           abort "${continuity_phase}"; then
+        continuity_active=0
+      else
+        cleanup_status=1
+      fi
+    fi
+    if [[ "${migration_mode}" == roundtrip &&
+          "${migration_started}" == 1 &&
+          "${migration_roundtrip_completed}" != true ]]; then
+      migration_recovery_attempted=true
+      if action migration restore "${backend_server_id}" \
+           "${backend_current_host}" "${expected_compute_host}" \
+           >"${out_dir}/migration/recovery.json" \
+           2>"${out_dir}/migration/recovery.err" &&
+         validate_migration_artifact "${out_dir}/migration/recovery.json" \
+           restore "${backend_current_host}" "${expected_compute_host}" \
+           "${out_dir}/migration/restore/openstack"; then
+        backend_current_host="${expected_compute_host}"
+        migration_recovery_completed=true
+      else
+        cleanup_status=1
+      fi
+      write_roundtrip_artifact
+    fi
+    capture_metrics_journal || cleanup_status=1
     action service local master stop "${coordinator_unit}" || cleanup_status=1
     action service local master stop "${metrics_unit}" || cleanup_status=1
     if (( coordinator_started != 0 )); then
@@ -2343,7 +3882,11 @@ cleanup() {
         2>"${out_dir}/committed-final-bypass.err" || cleanup_status=1
     fi
     action service remote "${compute2_host}" stop "${host_agent_unit}" || cleanup_status=1
-    action service local master stop "${host_agent_unit}" || cleanup_status=1
+    if [[ "${source_compute_remote}" == 1 ]]; then
+      action service remote "${expected_compute_host}" stop "${host_agent_unit}" || cleanup_status=1
+    else
+      action service local master stop "${host_agent_unit}" || cleanup_status=1
+    fi
     action service remote "${client_guest_host}" stop "${guest_agent_unit}" || cleanup_status=1
     action service remote "${backend_guest_host}" stop "${guest_agent_unit}" || cleanup_status=1
     action service remote "${backend_guest_host}" stop "${grpc_backend_unit}" || cleanup_status=1
@@ -2372,6 +3915,9 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+if [[ "${source_compute_remote}" == 1 && "${skip_shared_preflight}" == 0 ]]; then
+  run_shared_cluster_preflight
+fi
 action preflight
 if [[ "${cleanup_audit_only}" == 1 ]]; then
   if ! action audit-cleanup >"${out_dir}/cleanup-audit.txt" 2>&1; then
@@ -2424,6 +3970,10 @@ done
   exit 1
 }
 server_epoch="$(json_epoch "${out_dir}/committed-server.json")"
+
+if [[ "${migration_mode}" == roundtrip ]]; then
+  run_roundtrip_migration
+fi
 
 action snapshot before >"${out_dir}/snapshot-before.json"
 action workload dns measured >"${out_dir}/measured-dns.txt"

@@ -154,6 +154,11 @@ python3 -m py_compile "${ROOT_DIR}/tests/grpc_h2_stream_replay.py"
     tests.test_openstack_epoch_coordinator \
     tests.test_openstack_guest_endpoint_agent \
     tests.test_openstack_metrics_bridge \
+    tests.test_openstack_migration_leg \
+    tests.test_migration_continuity_probe \
+    tests.test_openstack_shared_cluster_preflight \
+    tests.test_render_openstack_shared_bundle \
+    tests.test_stage_openstack_shared_deployment \
     tests.test_monitor_initial_runtime_bypass)
 
 echo "Built ${BUILD_DIR}/dns_monitor.bpf.o"
@@ -189,4 +194,9 @@ echo "Passed ${ROOT_DIR}/tests/test_openstack_epoch_gate.py"
 echo "Passed ${ROOT_DIR}/tests/test_openstack_epoch_coordinator.py"
 echo "Passed ${ROOT_DIR}/tests/test_openstack_guest_endpoint_agent.py"
 echo "Passed ${ROOT_DIR}/tests/test_openstack_metrics_bridge.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_migration_leg.py"
+echo "Passed ${ROOT_DIR}/tests/test_migration_continuity_probe.py"
+echo "Passed ${ROOT_DIR}/tests/test_openstack_shared_cluster_preflight.py"
+echo "Passed ${ROOT_DIR}/tests/test_render_openstack_shared_bundle.py"
+echo "Passed ${ROOT_DIR}/tests/test_stage_openstack_shared_deployment.py"
 echo "Passed ${ROOT_DIR}/tests/test_monitor_initial_runtime_bypass.py"

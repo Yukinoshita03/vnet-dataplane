@@ -1,0 +1,28 @@
+[Unit]
+Description=VNet host gRPC client cache endpoint for %i
+Wants=network-online.target vnet-dataplane-agent.service
+After=network-online.target vnet-dataplane-agent.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+ExecStartPre=/usr/bin/test -x /opt/vnet-dataplane/linux_accel/build/grpc_fast_cache
+ExecStartPre=/usr/bin/test -e /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/grpc_policy_map
+ExecStartPre=/usr/bin/test -e /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/grpc_response_cache
+ExecStartPre=/usr/bin/test -e /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/cache_runtime_control
+ExecStartPre=/usr/bin/mkdir -p /var/log/vnet-dataplane-agent/%i
+ExecStart=/opt/vnet-dataplane/linux_accel/build/grpc_fast_cache --grpc-map /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/grpc_policy_map --grpc-response-map /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/grpc_response_cache --runtime-control-map /sys/fs/bpf/vnet-dataplane-agent/%i/grpc/cache_runtime_control --cache-role client --listen 127.0.0.1:15052 --backend 127.0.0.1:16052 --method /vnet.Probe/Check
+Restart=always
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=10
+StandardOutput=append:/var/log/vnet-dataplane-agent/%i/grpc-fast-cache.log
+StandardError=journal
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

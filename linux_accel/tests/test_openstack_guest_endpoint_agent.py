@@ -347,13 +347,31 @@ class CommandGenerationTest(unittest.TestCase):
 
 
 class SystemDriverCommandTest(unittest.TestCase):
-    def _driver(self, paths, role="client"):
+    def _driver(self, paths, role="client", secure_lock_root=True):
+        paths.lock_root.mkdir(parents=True, exist_ok=True)
+        if secure_lock_root and os.name != "nt":
+            paths.lock_root.chmod(0o700)
         with patch.object(SystemEndpointDriver, "_validate_inputs"):
             return SystemEndpointDriver(
                 endpoint_config(role),
                 tool_paths(),
                 paths,
             )
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are required")
+    def test_enter_quiesce_rejects_world_writable_lock_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = endpoint_paths(Path(temp))
+            paths.lock_root.mkdir(parents=True)
+            paths.lock_root.chmod(0o777)
+            driver = self._driver(paths, secure_lock_root=False)
+
+            with self.assertRaisesRegex(
+                GuestEndpointError, "writable by other users"
+            ):
+                driver.enter_quiesce()
+
+            self.assertFalse(paths.quiesce_file.exists())
 
     def test_enter_quiesce_rejects_symlink_without_touching_target(self):
         with tempfile.TemporaryDirectory() as temp:

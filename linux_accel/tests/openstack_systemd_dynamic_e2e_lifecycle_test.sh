@@ -16,6 +16,9 @@ test -x "${runner}"
 bash -n "${runner}"
 grep -q "wait-committed" "${runner}"
 grep -q -- '--require-shutdown' "${runner}"
+grep -Fq 'value.get("schema_version") != 2' "${runner}"
+grep -Fq 'client endpoint port allowlist does not match CLIENT_PORT_ID' "${runner}"
+grep -Eq 'client[[:space:]]+"127\.0\.0\.1"[[:space:]]+50053' "${runner}"
 if grep -nE '(^|[;&|[:space:]])sleep[[:space:]]+[1-9][0-9]*(\.[0-9]+)?([;&|[:space:]]|$)' "${runner}"; then
   echo "fixed multi-second publication sleep is forbidden" >&2
   exit 1
@@ -47,7 +50,7 @@ case "${action}" in
       printf '%s\n' 'fake cleanup observation' \
         >"${OUT_DIR}/cleanup/raw/fake-observation.txt"
       printf '%s\n' \
-        '{"schema":1,"passed":true,"checks":{"units_inactive":true,"pins_removed":true,"quiesce_removed":true,"processes_absent":true,"xdp_detached":true,"listeners_absent":true,"tc_cleanup":true},"netmig_baseline_scope":"test_driver","raw_files":["cleanup/raw/fake-observation.txt"]}' \
+        '{"schema":1,"passed":true,"checks":{"units_inactive":true,"pins_removed":true,"quiesce_removed":true,"processes_absent":true,"xdp_detached":true,"listeners_absent":true,"tc_cleanup":true,"continuity_absent":true},"netmig_baseline_scope":"test_driver","raw_files":["cleanup/raw/fake-observation.txt"]}' \
         >"${OUT_DIR}/cleanup-evidence.json"
     fi
     ;;
@@ -65,21 +68,66 @@ case "${action}" in
         [[ "${VNET_E2E_NEVER_COMMIT:-0}" == 0 ]] || exit 1
         convergence_count="$(cat "${VNET_E2E_DRIVER_STATE:?}" 2>/dev/null || printf 0)"
         (( convergence_count >= 3 )) || exit 1
-        printf '%s\n' '{"ready":true,"mode":"server","epoch":74,"present_readbacks":4}'
+        committed_epoch="$((${2:?after epoch} + 1))"
+        printf '%s\n' "${committed_epoch}" \
+          >"${VNET_E2E_DRIVER_STATE}.epoch"
+        printf '{"ready":true,"mode":"server","epoch":%s,"present_readbacks":4}\n' \
+          "${committed_epoch}"
         ;;
       *)
         exit 2
         ;;
     esac
     ;;
+  migration-baseline)
+    printf '{"schema":1,"phase":"%s","source_host":"%s","target_host":"%s","after_epoch":%s,"coordinator":{"device":1,"inode":2,"offset":100},"source_agent":{"device":3,"inode":4,"offset":200},"target_agent":{"device":5,"inode":6,"offset":300}}\n' \
+      "${1:?phase}" "${2:?source}" "${3:?target}" "${4:?after epoch}"
+    ;;
+  wait-transition)
+    printf '{"ready":true,"outcome":"migration_forced_bypass","epoch":%s,"matched_byte_start":100,"matched_byte_end":200}\n' \
+      "$((${4:?after epoch} + 1))"
+    ;;
+  wait-attachment)
+    printf '{"ready":true,"phase":"%s","source_host":"%s","target_host":"%s","source_detached":true,"target_attached":true}\n' \
+      "${1:?phase}" "${2:?source}" "${3:?target}"
+    ;;
+  continuity)
+    printf '{"schema":1,"operation":"%s","phase":"%s","passed":true}\n' \
+      "${1:?operation}" "${2:?phase}"
+    ;;
+  migration)
+    phase="${1:?migration phase}"
+    server_id="${2:?server id}"
+    source_host="${3:?source host}"
+    target_host="${4:?target host}"
+    port_id="${BACKEND_PORT_ID:?backend port id}"
+    host_file="${VNET_E2E_DRIVER_STATE:?}.host"
+    current_host="$(cat "${host_file}" 2>/dev/null || printf master)"
+    if [[ "${phase}" == restore && "${current_host}" == "${target_host}" ]]; then
+      outcome=already_on_target
+      migration_id=null
+    else
+      [[ "${current_host}" == "${source_host}" ]] || exit 43
+      printf '%s\n' "${target_host}" >"${host_file}"
+      outcome=completed
+      migration_id="\"fake-${phase}\""
+    fi
+    printf '{"schema":1,"phase":"%s","status":"completed","outcome":"%s","server_id":"%s","port_id":"%s","source_host":"%s","requested_source_host":"%s","target_host":"%s","final_host":"%s","migration_id":%s}\n' \
+      "${phase}" "${outcome}" "${server_id}" "${port_id}" \
+      "${source_host}" "${source_host}" "${target_host}" "${target_host}" \
+      "${migration_id}"
+    ;;
   snapshot)
+    runtime_epoch="$(cat "${VNET_E2E_DRIVER_STATE:?}.epoch" 2>/dev/null || printf 74)"
     case "${1:?snapshot phase}" in
       before)
-        printf '%s\n' '{"dns_backend_count":50,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":50,"dns_policy_bypass":50,"grpc_accepted":200,"grpc_cache_hit":100,"grpc_serving_cache_hit":100,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":74}'
+        printf '{"dns_backend_count":50,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":50,"dns_policy_bypass":50,"grpc_accepted":200,"grpc_cache_hit":100,"grpc_serving_cache_hit":100,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":%s}\n' \
+          "${runtime_epoch}"
         ;;
       after)
         if [[ "${VNET_E2E_NEVER_CONVERGE:-0}" == 1 ]]; then
-          printf '%s\n' '{"dns_backend_count":100,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":100,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":74}'
+          printf '{"dns_backend_count":100,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":100,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":%s}\n' \
+            "${runtime_epoch}"
           exit 0
         fi
         if [[ "${VNET_E2E_DELAY_METRICS:-0}" == 1 ]]; then
@@ -87,11 +135,13 @@ case "${action}" in
           after_count="$(cat "${after_count_file}" 2>/dev/null || printf 0)"
           printf '%s\n' "$((after_count + 1))" >"${after_count_file}"
           if (( after_count == 0 )); then
-            printf '%s\n' '{"dns_backend_count":100,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":100,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":74}'
+            printf '{"dns_backend_count":100,"dns_cache_hit":100,"dns_cache_tx":100,"dns_cache_miss":100,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":%s}\n' \
+              "${runtime_epoch}"
             exit 0
           fi
         fi
-        printf '%s\n' '{"dns_backend_count":50,"dns_cache_hit":150,"dns_cache_tx":150,"dns_cache_miss":50,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":74}'
+        printf '{"dns_backend_count":50,"dns_cache_hit":150,"dns_cache_tx":150,"dns_cache_miss":50,"dns_policy_bypass":50,"grpc_accepted":250,"grpc_cache_hit":150,"grpc_serving_cache_hit":150,"grpc_fallback":100,"grpc_fallback_error":0,"grpc_parse_error":0,"grpc_policy_bypass":100,"grpc_tx_error":0,"grpc_runtime_epoch":%s}\n' \
+          "${runtime_epoch}"
         ;;
       *)
         exit 2
@@ -221,6 +271,190 @@ test "$(grep -c '^wait-committed server 73$' "${action_log}")" -eq 3
 third_wait_line="$(grep -n '^wait-committed server 73$' "${action_log}" | tail -n 1 | cut -d: -f1)"
 measured_line="$(grep -n '^workload dns measured$' "${action_log}" | cut -d: -f1)"
 (( measured_line > third_wait_line ))
+
+remote_source_out="${tmp_dir}/remote-source"
+: >"${action_log}"
+run_smoke "${remote_source_out}" \
+  SOURCE_COMPUTE_REMOTE=1 \
+  EXPECTED_COMPUTE_HOST=compute2 \
+  COMPUTE2_HOST=compute3 \
+  SOURCE_COMPUTE_SSH_TARGET=ubuntu@172.25.6.13 \
+  TARGET_COMPUTE_SSH_TARGET=ubuntu@172.25.6.14 \
+  CLIENT_HOST_INTERFACE=tap2200c160-c0 \
+  BACKEND_HOST_INTERFACE=tap8ddb7d32-92 \
+  DEPLOY_PROFILE=shared-yoga \
+  VNET_KNOWN_HOSTS=/etc/vnet-dataplane-shared/known_hosts \
+  REQUIRE_NETMIG_TC=0 \
+  SHARED_CLUSTER_INVENTORY=/etc/vnet-dataplane-shared/inventory.json \
+  SHARED_SSH_IDENTITY_FILE=/etc/vnet-dataplane-shared/id_ed25519 \
+  VNET_E2E_SKIP_SHARED_PREFLIGHT=1 \
+  DEPLOY_ARTIFACTS=0
+assert_ordered_subsequence "${action_log}" \
+  "service remote compute3 stop vnet-dataplane-agent.service" \
+  "service remote compute2 stop vnet-dataplane-agent.service" \
+  "deploy" \
+  "service remote compute3 start vnet-dataplane-agent.service" \
+  "service remote compute2 start vnet-dataplane-agent.service" \
+  "service local master start vnet-dataplane-metrics-controller.service" \
+  "service local master start vnet-dataplane-epoch-coordinator.service" \
+  "service remote compute3 stop vnet-dataplane-agent.service" \
+  "service remote compute2 stop vnet-dataplane-agent.service" \
+  "audit-cleanup"
+if grep -q '^service local compute2 .*vnet-dataplane-agent.service$' "${action_log}"; then
+  echo "remote source compute was incorrectly managed as a local service" >&2
+  exit 1
+fi
+if grep -q '^service local master .*vnet-dataplane-agent.service$' "${action_log}"; then
+  echo "controller incorrectly managed a Compute Agent in remote-source mode" >&2
+  exit 1
+fi
+grep -q '"status":"passed"' "${remote_source_out}/result-summary.json"
+assert_manifest_valid "${remote_source_out}"
+
+unsafe_remote_out="${tmp_dir}/unsafe-remote-source"
+: >"${action_log}"
+if run_smoke "${unsafe_remote_out}" \
+    SOURCE_COMPUTE_REMOTE=1 \
+    EXPECTED_COMPUTE_HOST=compute2 \
+    COMPUTE2_HOST=compute3 \
+    VNET_E2E_SKIP_SHARED_PREFLIGHT=1 \
+    >"${unsafe_remote_out}.log" 2>&1; then
+  echo "remote source run without explicit transport/interface scope was accepted" >&2
+  exit 1
+fi
+grep -q 'requires explicit SOURCE_COMPUTE_SSH_TARGET' "${unsafe_remote_out}.log"
+test ! -s "${action_log}"
+
+unsafe_deploy_out="${tmp_dir}/unsafe-remote-deploy"
+: >"${action_log}"
+if run_smoke "${unsafe_deploy_out}" \
+    SOURCE_COMPUTE_REMOTE=1 \
+    EXPECTED_COMPUTE_HOST=compute2 \
+    COMPUTE2_HOST=compute3 \
+    SOURCE_COMPUTE_SSH_TARGET=ubuntu@172.25.6.13 \
+    TARGET_COMPUTE_SSH_TARGET=ubuntu@172.25.6.14 \
+    CLIENT_HOST_INTERFACE=tap2200c160-c0 \
+    BACKEND_HOST_INTERFACE=tap8ddb7d32-92 \
+    DEPLOY_PROFILE=shared-yoga \
+    VNET_KNOWN_HOSTS=/etc/vnet-dataplane-shared/known_hosts \
+    REQUIRE_NETMIG_TC=0 \
+    SHARED_CLUSTER_INVENTORY=/etc/vnet-dataplane-shared/inventory.json \
+    SHARED_SSH_IDENTITY_FILE=/etc/vnet-dataplane-shared/id_ed25519 \
+    VNET_E2E_SKIP_SHARED_PREFLIGHT=1 \
+    DEPLOY_ARTIFACTS=1 \
+    >"${unsafe_deploy_out}.log" 2>&1; then
+  echo "remote source run was allowed to overwrite deployment artifacts" >&2
+  exit 1
+fi
+grep -q 'requires pre-staged artifacts' "${unsafe_deploy_out}.log"
+test ! -s "${action_log}"
+
+roundtrip_out="${tmp_dir}/roundtrip"
+: >"${action_log}"
+run_smoke "${roundtrip_out}" MIGRATION_MODE=roundtrip
+
+assert_ordered_subsequence "${action_log}" \
+  "wait-committed server 73" \
+  "migration-baseline forward master compute2 74" \
+  "continuity start forward" \
+  "migration forward 383d55a1-2d78-4ec2-927e-0575312ccc0d master compute2" \
+  "wait-transition forward master compute2 74" \
+  "wait-attachment forward master compute2" \
+  "wait-committed server 75" \
+  "continuity stop forward" \
+  "migration-baseline reverse compute2 master 76" \
+  "continuity start reverse" \
+  "migration reverse 383d55a1-2d78-4ec2-927e-0575312ccc0d compute2 master" \
+  "wait-transition reverse compute2 master 76" \
+  "wait-attachment reverse compute2 master" \
+  "wait-committed server 77" \
+  "continuity stop reverse" \
+  "snapshot before" \
+  "service local master stop vnet-dataplane-epoch-coordinator.service" \
+  "audit-cleanup"
+if grep -q '^migration restore ' "${action_log}"; then
+  echo "successful roundtrip unexpectedly ran recovery migration" >&2
+  exit 1
+fi
+"${test_python}" - \
+  "${roundtrip_out}/migration/forward.json" \
+  "${roundtrip_out}/migration/reverse.json" \
+  "${roundtrip_out}/migration/roundtrip.json" \
+  "${roundtrip_out}/result-summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+forward, reverse, roundtrip, summary = (
+    json.loads(Path(path).read_text(encoding="utf-8"))
+    for path in sys.argv[1:]
+)
+assert forward["schema"] == 1
+assert forward["phase"] == "forward"
+assert forward["status"] == "completed"
+assert forward["final_host"] == "compute2"
+assert reverse["schema"] == 1
+assert reverse["phase"] == "reverse"
+assert reverse["status"] == "completed"
+assert reverse["final_host"] == "master"
+assert roundtrip["schema"] == 1
+assert roundtrip["completed"] is True
+assert roundtrip["final_host"] == "master"
+assert roundtrip["recovery_attempted"] is False
+assert summary["status"] == "passed"
+assert summary["migration_mode"] == "roundtrip"
+assert summary["migration_roundtrip_completed"] is True
+assert summary["formal_rounds"] == 0
+PY
+assert_manifest_valid "${roundtrip_out}"
+
+reverse_failure_out="${tmp_dir}/roundtrip-reverse-failure"
+: >"${action_log}"
+if run_smoke "${reverse_failure_out}" \
+    MIGRATION_MODE=roundtrip \
+    VNET_E2E_FAIL_ACTION="migration reverse 383d55a1-2d78-4ec2-927e-0575312ccc0d compute2 master"; then
+  echo "failed reverse migration was incorrectly accepted" >&2
+  exit 1
+fi
+assert_ordered_subsequence "${action_log}" \
+  "migration forward 383d55a1-2d78-4ec2-927e-0575312ccc0d master compute2" \
+  "continuity stop forward" \
+  "continuity start reverse" \
+  "migration reverse 383d55a1-2d78-4ec2-927e-0575312ccc0d compute2 master" \
+  "continuity abort reverse" \
+  "migration restore 383d55a1-2d78-4ec2-927e-0575312ccc0d compute2 master" \
+  "service local master stop vnet-dataplane-epoch-coordinator.service" \
+  "audit-cleanup"
+test -s "${reverse_failure_out}/migration/reverse.err"
+"${test_python}" - \
+  "${reverse_failure_out}/migration/forward.json" \
+  "${reverse_failure_out}/migration/recovery.json" \
+  "${reverse_failure_out}/migration/roundtrip.json" \
+  "${reverse_failure_out}/result-summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+forward, recovery, roundtrip, summary = (
+    json.loads(Path(path).read_text(encoding="utf-8"))
+    for path in sys.argv[1:]
+)
+assert forward["status"] == "completed"
+assert forward["final_host"] == "compute2"
+assert recovery["phase"] == "restore"
+assert recovery["status"] == "completed"
+assert recovery["final_host"] == "master"
+assert roundtrip["completed"] is False
+assert roundtrip["recovery_attempted"] is True
+assert roundtrip["recovery_completed"] is True
+assert roundtrip["final_host"] == "master"
+assert summary["status"] == "failed"
+assert summary["migration_mode"] == "roundtrip"
+assert summary["migration_roundtrip_completed"] is False
+assert summary["cleanup_status"] == 0
+PY
+grep -q '"passed":true' "${reverse_failure_out}/cleanup-evidence.json"
+assert_manifest_valid "${reverse_failure_out}"
 
 delayed_metrics_out="${tmp_dir}/delayed-metrics"
 : >"${action_log}"

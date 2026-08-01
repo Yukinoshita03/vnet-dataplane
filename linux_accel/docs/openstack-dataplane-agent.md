@@ -193,6 +193,11 @@ Compute 部署时把 `agent.env`、`openstack.env` 和 `endpoints.json` 放到
 `metrics-bridge.env` 与 `metrics-bridge.json`。Compute 和 Guest supervisor 都按
 程序 ID、PID 和 pin 所有权清理；没有通配符式的 TC/XDP 删除命令。
 
+Compute `endpoints.json` 使用 schema `2`。每个 endpoint 必须显式提供非空、规范化
+且全局不重复的 `port_ids`；生产 watch 只允许这些端口。若声明端口缺失、未处于
+本机 `ACTIVE` OVS 绑定，或同一实例出现未声明的本机 ACTIVE OVS 端口，Agent 会
+清空该实例的发现结果并记录 `port_policy_blocked`，不会尝试挂载。
+
 ## 跨主机 epoch 门控
 
 `agent/openstack_epoch_coordinator.py` 聚合各 Compute 的 schema 3 状态以及两个
@@ -267,11 +272,10 @@ bridge 送入 `dynamic_cache_controller` stdin 的格式严格为九列：
 timestamp_ms,dns_hits,dns_misses,dns_p95_us,grpc_hits,grpc_misses,grpc_p95_us,backend_qps,error_rate
 ```
 
-- DNS hit/miss 来自 client DNS monitor 当前窗口的 cache 与 shadow 计数，DNS p95
-  取所选 DNS 指标中的最大值。
-- gRPC hit/miss 来自 client `grpc_fast_cache` 累计计数的窗口增量，gRPC p95 取所选
-  gRPC TC monitor 中的最大值。
-- `backend_qps` 由 server DNS miss 与 server gRPC fallback 的窗口量计算。
+- DNS hit/miss 与 gRPC hit/miss 都由 monitor 输出累计计数，再由 bridge 对同一指标源的
+  相邻 generation 求窗口增量；切换指标源后的首个快照只建立 baseline，不产生策略样本。
+  DNS p95 取所选 DNS 指标中的最大值，gRPC p95 取所选 gRPC TC monitor 中的最大值。
+- `backend_qps` 由 server DNS miss 与 server gRPC fallback 的累计计数窗口增量计算。
 - `error_rate` 汇总 monitor timeout/unmatched/ring-buffer drop，以及 fast-cache
   `fallback_error`/`tx_error`，并限制在 `[0, 1]`。
 
@@ -382,8 +386,9 @@ NetMig `0x65/0x66` 保留。因此 `master -> compute2 -> master` 往返迁移�
 当前工作树还在 `master`、`compute2` 同时部署相同端点配置，完成了固定在 `master`
 的多宿主 systemd 补充验收。master 为 client DNS、client gRPC 和 backend gRPC
 observer 建立三个互不相同的 runtime map；compute2 发布 schema 3、一致且无 attachment
-的 idle 快照。真实 `systemctl stop` 后，两端 Agent 自有 pin、quiesce、进程和 hook 均
-消失，NetMig `0x65/0x66` 身份不变。随后动态策略发布
+的 idle 快照。真实 `systemctl stop` 后两端均无 Agent 残留；master 已挂载的 pin、
+quiesce、进程和 hook 被移除，compute2 保持 idle，NetMig `0x65/0x66` 身份不变。
+随后动态策略发布
 `BYPASS -> SERVER_CACHE -> BYPASS`，DNS guest XDP 与 gRPC guest userspace fast-cache
 各命中 50 次并再次完整清理。该结果仍不等同于无人干预的迁移闭环；
 `master -> compute2 -> master` 期间的 freeze、目标端重挂载、恢复发布、故障注入和

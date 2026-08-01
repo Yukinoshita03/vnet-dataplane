@@ -33,6 +33,7 @@ def dns_line(
     cache_miss=4,
     shadow_hit=2,
     shadow_miss=1,
+    map_read_ok=1,
     p95="1.250ms",
 ):
     return (
@@ -42,8 +43,32 @@ def dns_line(
         f"cache_miss={cache_miss} cache_expired=0 cache_tx=0 "
         f"cache_learned=0 learn_rejected=0 pending_expired=0 "
         f"policy_bypass=0 shadow_hit={shadow_hit} shadow_miss={shadow_miss} "
-        "alerts=none"
+        f"map_read_ok={map_read_ok} alerts=none"
     )
+
+
+def dns_line_with_totals(
+    line,
+    *,
+    query_total,
+    timeout_total=0,
+    unmatched_total=0,
+    ringbuf_drop_total=0,
+    cache_hit_total=0,
+    cache_miss_total=0,
+    shadow_hit_total=0,
+    shadow_miss_total=0,
+):
+    totals = (
+        f"query_total={query_total} timeout_total={timeout_total} "
+        f"unmatched_total={unmatched_total} "
+        f"ringbuf_drop_total={ringbuf_drop_total} "
+        f"cache_hit_total={cache_hit_total} "
+        f"cache_miss_total={cache_miss_total} "
+        f"shadow_hit_total={shadow_hit_total} "
+        f"shadow_miss_total={shadow_miss_total}"
+    )
+    return line.replace(" alerts=none", f" {totals} alerts=none")
 
 
 def grpc_line(
@@ -262,6 +287,14 @@ class MetricsParsingTests(unittest.TestCase):
         self.assertEqual(grpc["p95_us"], 350.0)
         self.assertEqual(cache["fallback"], 12)
 
+    def test_dns_map_read_failure_is_not_accepted_as_zero_counters(self):
+        with self.assertRaisesRegex(bridge.MetricParseError, "map read"):
+            bridge.parse_metric_line(
+                dns_line("client", map_read_ok=0),
+                "dns_metrics",
+                "client",
+                "dns",
+            )
     def test_role_mismatch_and_malformed_numeric_field_fail(self):
         with self.assertRaisesRegex(bridge.MetricParseError, "role"):
             bridge.parse_metric_line(
@@ -274,6 +307,15 @@ class MetricsParsingTests(unittest.TestCase):
                 "client",
                 "cache",
             )
+        with self.assertRaisesRegex(bridge.MetricParseError, "incomplete DNS"):
+            bridge.parse_metric_line(
+                dns_line("client").replace(
+                    " alerts=none", " query_total=100 alerts=none"
+                ),
+                "dns_metrics",
+                "client",
+                "dns",
+            )
 
     def test_metric_sample_is_strict_nine_column_csv(self):
         sample = bridge.MetricSample(1, 2, 3, 4.0, 5, 6, 7.0, 8.0, 0.25)
@@ -281,6 +323,17 @@ class MetricsParsingTests(unittest.TestCase):
         self.assertEqual(len(fields), 9)
         self.assertEqual(fields, ["1", "2", "3", "4.000000", "5", "6",
                                   "7.000000", "8.000000", "0.250000"])
+
+
+class DeploymentUnitTests(unittest.TestCase):
+    def test_controller_metrics_unit_does_not_depend_on_local_compute_agent(self):
+        unit = (
+            LINUX_ACCEL
+            / "deploy"
+            / "systemd"
+            / "vnet-dataplane-metrics-controller.service"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("vnet-dataplane-agent.service", unit)
 
 
 class CollectorTests(unittest.TestCase):
@@ -418,6 +471,102 @@ class CollectorTests(unittest.TestCase):
 
         self.assertEqual((reset.sample.grpc_hits, reset.sample.grpc_misses), (4, 3))
         self.assertEqual(reset.sample.backend_qps, 10.0)
+
+    def test_dns_totals_preserve_a_hot_window_followed_by_an_idle_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            values = self._initial_values()
+            values["dns-client-new"] = snapshot(
+                "dns-client-new",
+                dns_line_with_totals(
+                    dns_line(
+                        "client",
+                        qps=0,
+                        cache_hit=0,
+                        cache_miss=0,
+                        shadow_hit=0,
+                        shadow_miss=0,
+                    ),
+                    query_total=100,
+                ),
+                NOW_NS - 1_000_000_000,
+            )
+            values["dns-server"] = snapshot(
+                "dns-server",
+                dns_line_with_totals(
+                    dns_line(
+                        "server",
+                        qps=0,
+                        cache_hit=0,
+                        cache_miss=0,
+                        shadow_hit=0,
+                        shadow_miss=0,
+                    ),
+                    query_total=100,
+                ),
+                NOW_NS - 500_000_000,
+            )
+            values["grpc-monitor"] = snapshot(
+                "grpc-monitor",
+                grpc_line(reqps=0, timeout=0, unmatched=0, ringbuf_drop=0),
+                NOW_NS - 400_000_000,
+            )
+            collector = self._collector(Path(temp), values)
+            baseline = collector.prepare(NOW_NS, 1.0)
+            baseline.commit()
+
+            for name, current in tuple(values.items()):
+                values[name] = regenerate(current, NOW_NS + 1_000_000_000)
+            hot = dns_line_with_totals(
+                dns_line(
+                    "client",
+                    qps=50,
+                    cache_hit=0,
+                    cache_miss=0,
+                    shadow_hit=49,
+                    shadow_miss=1,
+                ),
+                query_total=150,
+                shadow_hit_total=49,
+                shadow_miss_total=1,
+            )
+            idle = dns_line_with_totals(
+                dns_line(
+                    "client",
+                    qps=0,
+                    cache_hit=0,
+                    cache_miss=0,
+                    shadow_hit=0,
+                    shadow_miss=0,
+                ),
+                query_total=150,
+                shadow_hit_total=49,
+                shadow_miss_total=1,
+            )
+            values["dns-client-new"] = snapshot(
+                "dns-client-new",
+                hot + "\n" + idle,
+                NOW_NS + 1_000_000_000,
+            )
+            values["dns-server"] = snapshot(
+                "dns-server",
+                dns_line_with_totals(
+                    dns_line(
+                        "server",
+                        qps=0,
+                        cache_hit=0,
+                        cache_miss=0,
+                        shadow_hit=0,
+                        shadow_miss=0,
+                    ),
+                    query_total=150,
+                ),
+                NOW_NS + 1_000_000_000,
+            )
+
+            prepared = collector.prepare(NOW_NS + 2_000_000_000, 2.0)
+
+        self.assertEqual((prepared.sample.dns_hits, prepared.sample.dns_misses), (49, 1))
+        self.assertAlmostEqual(prepared.sample.error_rate, 0.0)
 
     def test_parse_fallback_noise_does_not_raise_error_rate(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -728,6 +877,23 @@ class ConfigAndSnapshotTests(unittest.TestCase):
         ]
         self.assertTrue(grpc_observers)
         self.assertTrue(all(not source.error_authoritative for source in grpc_observers))
+        compute2_observer = next(
+            source
+            for source in grpc_observers
+            if source.name == "compute2-grpc-observer-monitor"
+        )
+        self.assertEqual(compute2_observer.role, "server")
+        self.assertFalse(compute2_observer.error_authoritative)
+        self.assertIsNotNone(compute2_observer.command)
+        command = compute2_observer.command or ()
+        self.assertEqual(command[0], "/usr/bin/ssh")
+        self.assertIn("REPLACE_COMPUTE2_HOST", command)
+        path_index = command.index("--path")
+        self.assertIn("REPLACE_SERVER_PORT", command[path_index + 1])
+        self.assertIn(
+            "grpc-REPLACE_COMPUTE2_BACKEND_TAP.log",
+            command[path_index + 1],
+        )
         server_dns_observers = [
             source
             for source in loaded.sources
@@ -974,6 +1140,8 @@ class ControllerAndFailSafeTests(unittest.TestCase):
         session.stop()
 
         self.assertEqual(decision.mode, "client")
+        self.assertIn("window_ready=1", decision.raw_line)
+        self.assertIn("reason=test", decision.raw_line)
         self.assertIsInstance(calls[0][0], list)
         self.assertIs(calls[0][1]["shell"], False)
         self.assertIs(calls[0][1]["stdin"], subprocess.PIPE)

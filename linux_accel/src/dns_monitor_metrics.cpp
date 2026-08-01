@@ -206,22 +206,29 @@ void collect_timeouts(ReaderState *state)
     }
 }
 
-uint64_t read_percpu_counter_total(int map_fd, __u32 key)
+bool try_read_percpu_counter_total(int map_fd, __u32 key, uint64_t *total)
 {
-    if (map_fd < 0)
-        return 0;
+    if (map_fd < 0 || !total)
+        return false;
 
     int cpu_count = libbpf_num_possible_cpus();
     if (cpu_count <= 0)
-        return 0;
+        return false;
 
     std::vector<__u64> values(cpu_count);
     if (bpf_map_lookup_elem(map_fd, &key, values.data()) != 0)
-        return 0;
+        return false;
 
-    uint64_t total = 0;
+    *total = 0;
     for (__u64 value : values)
-        total += value;
+        *total += value;
+    return true;
+}
+
+uint64_t read_percpu_counter_total(int map_fd, __u32 key)
+{
+    uint64_t total = 0;
+    try_read_percpu_counter_total(map_fd, key, &total);
     return total;
 }
 
@@ -273,49 +280,73 @@ void print_metrics(ReaderState *state)
 {
     collect_timeouts(state);
 
-    uint64_t drop_total = read_dropped_events_total(state->dropped_events_fd);
-    state->current.ringbuf_drop_delta =
-        drop_total >= state->last_drop_total ? drop_total - state->last_drop_total : 0;
-    state->last_drop_total = drop_total;
+    uint64_t drop_total = 0;
+    bool map_read_ok = try_read_percpu_counter_total(
+        state->dropped_events_fd, 0, &drop_total);
+    state->query_total += state->current.query_count;
+    state->timeout_total += state->current.timeout_count;
+    state->unmatched_total += state->current.unmatched_response_count;
 
-    uint64_t cache_hits = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_HIT);
-    uint64_t cache_misses = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_MISS);
-    uint64_t cache_expired = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_EXPIRED);
-    uint64_t cache_tx = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_TX);
-    uint64_t cache_learned = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_LEARNED);
-    uint64_t cache_learn_rejected = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_LEARN_REJECTED);
-    uint64_t cache_pending_expired = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_PENDING_EXPIRED);
-    uint64_t cache_policy_bypass = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_POLICY_BYPASS);
-    uint64_t cache_shadow_hit = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_SHADOW_HIT);
-    uint64_t cache_shadow_miss = read_percpu_counter_total(
-        state->cache_stats_fd, DNS_CACHE_STAT_SHADOW_MISS);
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
+    uint64_t cache_expired = 0;
+    uint64_t cache_tx = 0;
+    uint64_t cache_learned = 0;
+    uint64_t cache_learn_rejected = 0;
+    uint64_t cache_pending_expired = 0;
+    uint64_t cache_policy_bypass = 0;
+    uint64_t cache_shadow_hit = 0;
+    uint64_t cache_shadow_miss = 0;
+    const auto read_cache_counter = [&](const __u32 key, uint64_t *value) {
+        if (!try_read_percpu_counter_total(state->cache_stats_fd, key, value))
+            map_read_ok = false;
+    };
+    read_cache_counter(DNS_CACHE_STAT_HIT, &cache_hits);
+    read_cache_counter(DNS_CACHE_STAT_MISS, &cache_misses);
+    read_cache_counter(DNS_CACHE_STAT_EXPIRED, &cache_expired);
+    read_cache_counter(DNS_CACHE_STAT_TX, &cache_tx);
+    read_cache_counter(DNS_CACHE_STAT_LEARNED, &cache_learned);
+    read_cache_counter(DNS_CACHE_STAT_LEARN_REJECTED, &cache_learn_rejected);
+    read_cache_counter(DNS_CACHE_STAT_PENDING_EXPIRED, &cache_pending_expired);
+    read_cache_counter(DNS_CACHE_STAT_POLICY_BYPASS, &cache_policy_bypass);
+    read_cache_counter(DNS_CACHE_STAT_SHADOW_HIT, &cache_shadow_hit);
+    read_cache_counter(DNS_CACHE_STAT_SHADOW_MISS, &cache_shadow_miss);
 
-    uint64_t cache_hit_delta = counter_delta(cache_hits, &state->last_cache_hits);
-    uint64_t cache_miss_delta = counter_delta(cache_misses, &state->last_cache_misses);
-    uint64_t cache_expired_delta =
-        counter_delta(cache_expired, &state->last_cache_expired);
-    uint64_t cache_tx_delta = counter_delta(cache_tx, &state->last_cache_tx);
-    uint64_t cache_learned_delta =
-        counter_delta(cache_learned, &state->last_cache_learned);
-    uint64_t cache_learn_rejected_delta = counter_delta(
-        cache_learn_rejected, &state->last_cache_learn_rejected);
-    uint64_t cache_pending_expired_delta = counter_delta(
-        cache_pending_expired, &state->last_cache_pending_expired);
-    uint64_t cache_policy_bypass_delta = counter_delta(
-        cache_policy_bypass, &state->last_cache_policy_bypass);
-    uint64_t cache_shadow_hit_delta = counter_delta(
-        cache_shadow_hit, &state->last_cache_shadow_hit);
-    uint64_t cache_shadow_miss_delta = counter_delta(
-        cache_shadow_miss, &state->last_cache_shadow_miss);
+    uint64_t cache_hit_delta = 0;
+    uint64_t cache_miss_delta = 0;
+    uint64_t cache_expired_delta = 0;
+    uint64_t cache_tx_delta = 0;
+    uint64_t cache_learned_delta = 0;
+    uint64_t cache_learn_rejected_delta = 0;
+    uint64_t cache_pending_expired_delta = 0;
+    uint64_t cache_policy_bypass_delta = 0;
+    uint64_t cache_shadow_hit_delta = 0;
+    uint64_t cache_shadow_miss_delta = 0;
+    if (map_read_ok) {
+        state->current.ringbuf_drop_delta = drop_total >= state->last_drop_total
+            ? drop_total - state->last_drop_total
+            : 0;
+        state->last_drop_total = drop_total;
+        cache_hit_delta = counter_delta(cache_hits, &state->last_cache_hits);
+        cache_miss_delta = counter_delta(cache_misses, &state->last_cache_misses);
+        cache_expired_delta = counter_delta(
+            cache_expired, &state->last_cache_expired);
+        cache_tx_delta = counter_delta(cache_tx, &state->last_cache_tx);
+        cache_learned_delta = counter_delta(
+            cache_learned, &state->last_cache_learned);
+        cache_learn_rejected_delta = counter_delta(
+            cache_learn_rejected, &state->last_cache_learn_rejected);
+        cache_pending_expired_delta = counter_delta(
+            cache_pending_expired, &state->last_cache_pending_expired);
+        cache_policy_bypass_delta = counter_delta(
+            cache_policy_bypass, &state->last_cache_policy_bypass);
+        cache_shadow_hit_delta = counter_delta(
+            cache_shadow_hit, &state->last_cache_shadow_hit);
+        cache_shadow_miss_delta = counter_delta(
+            cache_shadow_miss, &state->last_cache_shadow_miss);
+    } else {
+        state->current.ringbuf_drop_delta = 0;
+    }
 
     double avg_ms = average_ms(state->current.latency_samples_ns);
     double p95_ms = percentile_ms(state->current.latency_samples_ns, 95.0);
@@ -357,6 +388,15 @@ void print_metrics(ReaderState *state)
                << " policy_bypass=" << cache_policy_bypass_delta
                << " shadow_hit=" << cache_shadow_hit_delta
                << " shadow_miss=" << cache_shadow_miss_delta
+               << " query_total=" << state->query_total
+               << " timeout_total=" << state->timeout_total
+               << " unmatched_total=" << state->unmatched_total
+               << " ringbuf_drop_total=" << drop_total
+               << " cache_hit_total=" << cache_hits
+               << " cache_miss_total=" << cache_misses
+               << " shadow_hit_total=" << cache_shadow_hit
+               << " shadow_miss_total=" << cache_shadow_miss
+               << " map_read_ok=" << (map_read_ok ? 1 : 0)
                << " alerts=" << alerts << "\n"
                << std::flush;
 

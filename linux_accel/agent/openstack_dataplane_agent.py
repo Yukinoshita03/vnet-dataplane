@@ -19,7 +19,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 try:
     import fcntl
@@ -28,12 +28,13 @@ except ImportError:
 
 
 AGENT_STATE_SCHEMA_VERSION = 3
-ENDPOINT_CONFIG_SCHEMA_VERSION = 1
+ENDPOINT_CONFIG_SCHEMA_VERSION = 2
 GRPC_CAPABILITY = "tc_observability"
 DNS_CLIENT_CAPABILITY = "xdp_client_cache"
 DNS_OBSERVER_CAPABILITY = "tc_observability"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 10.0
 DEFAULT_ATTACH_READY_TIMEOUT_SECONDS = 10.0
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 240.0
 ATTACH_READY_POLL_SECONDS = 0.05
 TC_PRIORITY = 1
 DNS_TC_HANDLE = 1
@@ -68,6 +69,7 @@ class PortInventory:
 class DiscoveryResult:
     bindings: tuple[Binding, ...]
     port_inventory: tuple[PortInventory, ...]
+    policy_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class EndpointConfig:
     accel_role: str
     grpc_observe_port: int
     guest_grpc_listen_port: int
+    port_ids: tuple[str, ...]
     trusted_dns: tuple[str, ...] = ()
     dns_cache_file: str | None = None
 
@@ -108,6 +111,7 @@ class AttachmentConfig:
 def _endpoint_config_state(config: EndpointConfig) -> dict[str, Any]:
     record: dict[str, Any] = {
         "server_id": config.server_id,
+        "port_ids": list(config.port_ids),
         "accel_role": config.accel_role,
         "grpc_observe_port": config.grpc_observe_port,
         "guest_grpc_listen_port": config.guest_grpc_listen_port,
@@ -132,6 +136,33 @@ def _endpoint_port(record: dict[str, Any], field: str, label: str) -> int:
     return value
 
 
+def _canonical_port_id(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise AgentError(f"{label} must be a canonical UUID")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as error:
+        raise AgentError(f"{label} must be a canonical UUID") from error
+    canonical = str(parsed)
+    if value != canonical:
+        raise AgentError(f"{label} must be a canonical UUID")
+    return canonical
+
+
+def _canonical_port_ids(value: Any, label: str) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise AgentError(f"{label} must be a non-empty UUID array")
+    port_ids: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        port_id = _canonical_port_id(item, f"{label}[{index}]")
+        if port_id in seen:
+            raise AgentError(f"{label} has duplicate port ID: {port_id}")
+        seen.add(port_id)
+        port_ids.append(port_id)
+    return tuple(port_ids)
+
+
 def _reject_legacy_grpc_port_fields(value: Any, source: str) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -152,8 +183,10 @@ def _parse_endpoint_records(value: Any, source: str) -> tuple[EndpointConfig, ..
 
     configs: list[EndpointConfig] = []
     seen_servers: set[str] = set()
+    seen_ports: dict[str, str] = {}
     allowed_keys = {
         "server_id",
+        "port_ids",
         "accel_role",
         "grpc_observe_port",
         "guest_grpc_listen_port",
@@ -175,6 +208,19 @@ def _parse_endpoint_records(value: Any, source: str) -> tuple[EndpointConfig, ..
         if server_id in seen_servers:
             raise AgentError(f"{source} has duplicate server_id: {server_id}")
         seen_servers.add(server_id)
+
+        port_ids = _canonical_port_ids(
+            record.get("port_ids"),
+            f"{label} port_ids",
+        )
+        for port_id in port_ids:
+            previous_server = seen_ports.get(port_id)
+            if previous_server is not None:
+                raise AgentError(
+                    f"{source} has duplicate port ID {port_id} for servers "
+                    f"{previous_server} and {server_id}"
+                )
+            seen_ports[port_id] = server_id
 
         accel_role = record.get("accel_role")
         if accel_role not in {"client", "observer", "server"}:
@@ -227,6 +273,7 @@ def _parse_endpoint_records(value: Any, source: str) -> tuple[EndpointConfig, ..
                     accel_role=accel_role,
                     grpc_observe_port=grpc_observe_port,
                     guest_grpc_listen_port=guest_grpc_listen_port,
+                    port_ids=port_ids,
                     trusted_dns=tuple(trusted_dns),
                 )
             )
@@ -243,6 +290,7 @@ def _parse_endpoint_records(value: Any, source: str) -> tuple[EndpointConfig, ..
                     accel_role=accel_role,
                     grpc_observe_port=grpc_observe_port,
                     guest_grpc_listen_port=guest_grpc_listen_port,
+                    port_ids=port_ids,
                 )
             )
             continue
@@ -262,6 +310,7 @@ def _parse_endpoint_records(value: Any, source: str) -> tuple[EndpointConfig, ..
                 accel_role=accel_role,
                 grpc_observe_port=grpc_observe_port,
                 guest_grpc_listen_port=guest_grpc_listen_port,
+                port_ids=port_ids,
                 dns_cache_file=cache_value,
             )
         )
@@ -361,23 +410,36 @@ class CommandRunner:
         ):
             raise AgentError("command timeout seconds must be positive")
         self._timeout_seconds = float(timeout_seconds)
+        self._deadline: float | None = None
+
+    def set_deadline(self, deadline: float) -> None:
+        self._deadline = deadline
+
+    def _timeout(self) -> float:
+        if self._deadline is None:
+            return self._timeout_seconds
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentError("shutdown deadline expired before external command")
+        return min(self._timeout_seconds, remaining)
 
     def run(self, args: Sequence[str]) -> str:
         command = list(args)
         if not command:
             raise AgentError("external command must not be empty")
+        timeout_seconds = self._timeout()
         try:
             result = subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=self._timeout_seconds,
+                timeout=timeout_seconds,
             )
         except subprocess.TimeoutExpired as error:
             raise AgentError(
                 "command timed out after "
-                f"{self._timeout_seconds:g}s: {' '.join(command)}"
+                f"{timeout_seconds:g}s: {' '.join(command)}"
             ) from error
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
@@ -438,10 +500,30 @@ class OpenStackOvsResolver:
         )
         self._ip_command = _external_command(ip_command, "IP")
 
-    def discover(self, server_id: str) -> list[Binding]:
-        return list(self.discover_with_inventory(server_id).bindings)
+    def discover(
+        self,
+        server_id: str,
+        allowed_port_ids: Sequence[str] | None = None,
+    ) -> list[Binding]:
+        return list(
+            self.discover_with_inventory(server_id, allowed_port_ids).bindings
+        )
 
-    def discover_with_inventory(self, server_id: str) -> DiscoveryResult:
+    def discover_with_inventory(
+        self,
+        server_id: str,
+        allowed_port_ids: Sequence[str] | None = None,
+    ) -> DiscoveryResult:
+        allowed = (
+            None
+            if allowed_port_ids is None
+            else frozenset(
+                _canonical_port_ids(
+                    allowed_port_ids,
+                    f"server {server_id} allowed port IDs",
+                )
+            )
+        )
         port_rows = self._json(
             [
                 self._openstack_command,
@@ -455,12 +537,17 @@ class OpenStackOvsResolver:
                 "ID",
             ]
         )
-        bindings: list[Binding] = []
         inventory: list[PortInventory] = []
+        seen_ports: set[str] = set()
         for row in port_rows:
             port_id = str(_field(row, "id") or "")
             if not port_id:
                 raise AgentError("OpenStack port list returned a row without ID")
+            if port_id in seen_ports:
+                raise AgentError(
+                    f"OpenStack port list returned duplicate port {port_id}"
+                )
+            seen_ports.add(port_id)
             port = self._json_object(
                 [
                     self._openstack_command,
@@ -503,33 +590,81 @@ class OpenStackOvsResolver:
                     revision_number=revision_number,
                 )
             )
-            if status != "ACTIVE":
-                continue
-            if _short_host(binding_host) != self._local_host:
-                continue
-            if vif_type != "ovs":
-                raise AgentError(
-                    f"port {port_id} is local but VIF type is not ovs"
+
+        policy_errors: list[str] = []
+        inventory_by_port = {item.port_id: item for item in inventory}
+        if allowed is not None:
+            for port_id in sorted(allowed - inventory_by_port.keys()):
+                policy_errors.append(
+                    f"server {server_id} declared port is missing from "
+                    f"Neutron inventory: {port_id}"
                 )
-            interface = self._ovs_interface(port_id)
-            ifindex = self._ifindex(interface)
-            bindings.append(
-                Binding(
-                    server_id=server_id,
-                    port_id=port_id,
-                    host=binding_host,
-                    interface=interface,
-                    ifindex=ifindex,
-                )
+            for port_id in sorted(allowed & inventory_by_port.keys()):
+                item = inventory_by_port[port_id]
+                binding_host = _short_host(item.binding_host)
+                if binding_host != self._local_host:
+                    continue
+                if item.status != "ACTIVE":
+                    policy_errors.append(
+                        f"server {server_id} declared port is not ACTIVE: "
+                        f"{port_id} status={item.status}"
+                    )
+                elif item.vif_type != "ovs":
+                    policy_errors.append(
+                        f"server {server_id} declared port VIF type is not ovs: "
+                        f"{port_id} vif_type={item.vif_type}"
+                    )
+            extra_local_ports = sorted(
+                item.port_id
+                for item in inventory
+                if item.port_id not in allowed
+                and item.status == "ACTIVE"
+                and _short_host(item.binding_host) == self._local_host
+                and item.vif_type == "ovs"
             )
+            for port_id in extra_local_ports:
+                policy_errors.append(
+                    f"server {server_id} has undeclared ACTIVE local OVS port: "
+                    f"{port_id}"
+                )
+
+        bindings: list[Binding] = []
+        if not policy_errors:
+            for item in inventory:
+                if item.status != "ACTIVE":
+                    continue
+                if _short_host(item.binding_host) != self._local_host:
+                    continue
+                if item.vif_type != "ovs":
+                    raise AgentError(
+                        f"port {item.port_id} is local but VIF type is not ovs"
+                    )
+                if allowed is not None and item.port_id not in allowed:
+                    continue
+                interface = self._ovs_interface(item.port_id)
+                ifindex = self._ifindex(interface)
+                bindings.append(
+                    Binding(
+                        server_id=server_id,
+                        port_id=item.port_id,
+                        host=item.binding_host,
+                        interface=interface,
+                        ifindex=ifindex,
+                    )
+                )
         return DiscoveryResult(
             bindings=tuple(sorted(bindings, key=lambda item: item.port_id)),
             port_inventory=tuple(
                 sorted(inventory, key=lambda item: (item.server_id, item.port_id))
             ),
+            policy_errors=tuple(policy_errors),
         )
 
-    def discover_many(self, server_ids: Sequence[str]) -> list[Binding]:
+    def discover_many(
+        self,
+        server_ids: Sequence[str],
+        allowed_port_ids_by_server: Mapping[str, Sequence[str]] | None = None,
+    ) -> list[Binding]:
         bindings: list[Binding] = []
         seen_servers: set[str] = set()
         seen_ports: set[str] = set()
@@ -540,7 +675,24 @@ class OpenStackOvsResolver:
             if normalized in seen_servers:
                 continue
             seen_servers.add(normalized)
-            for binding in self.discover(normalized):
+            allowed_port_ids = (
+                None
+                if allowed_port_ids_by_server is None
+                else allowed_port_ids_by_server.get(normalized)
+            )
+            if (
+                allowed_port_ids_by_server is not None
+                and allowed_port_ids is None
+            ):
+                raise AgentError(
+                    f"no allowed port IDs declared for server {normalized}"
+                )
+            discovered = (
+                self.discover(normalized)
+                if allowed_port_ids is None
+                else self.discover(normalized, allowed_port_ids)
+            )
+            for binding in discovered:
                 if binding.port_id in seen_ports:
                     raise AgentError(
                         f"port {binding.port_id} belongs to multiple requested servers"
@@ -550,10 +702,13 @@ class OpenStackOvsResolver:
         return sorted(bindings, key=lambda item: (item.server_id, item.port_id))
 
     def discover_many_with_inventory(
-        self, server_ids: Sequence[str]
+        self,
+        server_ids: Sequence[str],
+        allowed_port_ids_by_server: Mapping[str, Sequence[str]] | None = None,
     ) -> DiscoveryResult:
         bindings: list[Binding] = []
         inventory: list[PortInventory] = []
+        policy_errors: list[str] = []
         seen_servers: set[str] = set()
         seen_ports: set[str] = set()
         for server_id in server_ids:
@@ -563,7 +718,23 @@ class OpenStackOvsResolver:
             if normalized in seen_servers:
                 continue
             seen_servers.add(normalized)
-            result = self.discover_with_inventory(normalized)
+            allowed_port_ids = (
+                None
+                if allowed_port_ids_by_server is None
+                else allowed_port_ids_by_server.get(normalized)
+            )
+            if (
+                allowed_port_ids_by_server is not None
+                and allowed_port_ids is None
+            ):
+                raise AgentError(
+                    f"no allowed port IDs declared for server {normalized}"
+                )
+            result = (
+                self.discover_with_inventory(normalized)
+                if allowed_port_ids is None
+                else self.discover_with_inventory(normalized, allowed_port_ids)
+            )
             for item in result.port_inventory:
                 if item.port_id in seen_ports:
                     raise AgentError(
@@ -572,6 +743,7 @@ class OpenStackOvsResolver:
                 seen_ports.add(item.port_id)
                 inventory.append(item)
             bindings.extend(result.bindings)
+            policy_errors.extend(result.policy_errors)
         return DiscoveryResult(
             bindings=tuple(
                 sorted(bindings, key=lambda item: (item.server_id, item.port_id))
@@ -579,6 +751,7 @@ class OpenStackOvsResolver:
             port_inventory=tuple(
                 sorted(inventory, key=lambda item: (item.server_id, item.port_id))
             ),
+            policy_errors=tuple(policy_errors),
         )
 
     def _ovs_interface(self, port_id: str) -> str:
@@ -634,8 +807,16 @@ class OpenStackOvsResolver:
 def _sample_discovery(
     resolver: OpenStackOvsResolver,
     server_ids: Sequence[str],
+    allowed_port_ids_by_server: Mapping[str, Sequence[str]] | None = None,
 ) -> DiscoverySample:
-    result = resolver.discover_many_with_inventory(server_ids)
+    result = (
+        resolver.discover_many_with_inventory(server_ids)
+        if allowed_port_ids_by_server is None
+        else resolver.discover_many_with_inventory(
+            server_ids,
+            allowed_port_ids_by_server,
+        )
+    )
     return DiscoverySample(
         result=result,
         completed_ms=int(time.time() * 1000),
@@ -646,6 +827,8 @@ def _assert_discovery_consistent(
     sampled: DiscoveryResult,
     revalidated: DiscoveryResult,
 ) -> None:
+    if sampled.policy_errors != revalidated.policy_errors:
+        raise AgentError("port policy errors changed before publication")
     sampled_inventory = {
         (item.server_id, item.port_id): item
         for item in sampled.port_inventory
@@ -897,7 +1080,22 @@ class ProcessAttachmentDriver:
         self._residual: dict[str, _ResidualAttachment] = {}
         self._quiesce_fds: dict[str, int] = {}
         self._quiesce_identities: dict[str, tuple[int, int]] = {}
+        self._shutdown_deadline: float | None = None
         self._validate_config()
+
+    def begin_shutdown(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+        set_deadline = getattr(self._runner, "set_deadline", None)
+        if callable(set_deadline):
+            set_deadline(deadline)
+
+    def _remaining_timeout(self, maximum: float) -> float:
+        if self._shutdown_deadline is None:
+            return maximum
+        remaining = self._shutdown_deadline - time.monotonic()
+        if remaining <= 0:
+            raise AgentError("shutdown deadline expired during attachment cleanup")
+        return min(maximum, remaining)
 
     def attach(self, binding: Binding) -> None:
         if (
@@ -1506,6 +1704,9 @@ class ProcessAttachmentDriver:
         if allow_all_missing:
             common.append("--allow-all-missing")
         try:
+            force_timeout = self._remaining_timeout(
+                self._config.command_timeout_seconds
+            )
             force = subprocess.run(
                 [
                     *common,
@@ -1519,7 +1720,10 @@ class ProcessAttachmentDriver:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=self._config.command_timeout_seconds,
+                timeout=force_timeout,
+            )
+            observed_timeout = self._remaining_timeout(
+                self._config.command_timeout_seconds
             )
             observed = subprocess.run(
                 [
@@ -1534,7 +1738,7 @@ class ProcessAttachmentDriver:
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=self._config.command_timeout_seconds,
+                timeout=observed_timeout,
             )
         except subprocess.TimeoutExpired as error:
             raise AgentError(
@@ -1704,6 +1908,11 @@ class ProcessAttachmentDriver:
                 f"server DNS role for {binding.server_id} must be managed "
                 "by a guest-side agent"
             )
+        if binding.port_id not in endpoint.port_ids:
+            raise AgentError(
+                f"port {binding.port_id} is not declared for server "
+                f"{binding.server_id}"
+            )
         return endpoint
 
     def _runtime_control_maps(self, binding: Binding) -> list[Path]:
@@ -1783,8 +1992,7 @@ class ProcessAttachmentDriver:
 
             opened_lock = os.fstat(lock_descriptor)
             self._validate_policy_lock_status(opened_lock)
-            if fcntl is not None:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            self._acquire_policy_lock(lock_descriptor)
 
             opened_lock = os.fstat(lock_descriptor)
             self._validate_policy_lock_status(opened_lock)
@@ -1826,6 +2034,30 @@ class ProcessAttachmentDriver:
     @staticmethod
     def _file_identity(status: os.stat_result) -> tuple[int, int]:
         return status.st_dev, status.st_ino
+
+    def _acquire_policy_lock(self, descriptor: int) -> None:
+        if fcntl is None:
+            return
+        while True:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                return
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+            deadline = self._shutdown_deadline
+            if deadline is None:
+                time.sleep(ATTACH_READY_POLL_SECONDS)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgentError(
+                    "shutdown deadline expired waiting for policy lock"
+                )
+            time.sleep(min(ATTACH_READY_POLL_SECONDS, remaining))
 
     @staticmethod
     def _validate_policy_root_status(status: os.stat_result) -> None:
@@ -2012,8 +2244,7 @@ class ProcessAttachmentDriver:
                 start_new_session=True,
             )
 
-    @staticmethod
-    def _stop(process: subprocess.Popen[bytes]) -> bool:
+    def _stop(self, process: subprocess.Popen[bytes]) -> bool:
         if process.poll() is not None:
             return True
         for sig, timeout, cleanup_confirmed in (
@@ -2026,9 +2257,14 @@ class ProcessAttachmentDriver:
             except ProcessLookupError:
                 return cleanup_confirmed and process.poll() is not None
             try:
-                process.wait(timeout=timeout)
+                process.wait(timeout=self._remaining_timeout(timeout))
                 return cleanup_confirmed
-            except subprocess.TimeoutExpired:
+            except (AgentError, subprocess.TimeoutExpired):
+                if (
+                    self._shutdown_deadline is not None
+                    and time.monotonic() >= self._shutdown_deadline
+                ):
+                    return False
                 continue
         return False
 
@@ -2066,17 +2302,45 @@ class Reconciler:
         self,
         driver: AttachmentDriver,
         missing_grace_cycles: int = 2,
+        *,
+        allowed_port_ids_by_server: Mapping[str, Sequence[str]] | None = None,
     ):
         if missing_grace_cycles < 1:
             raise AgentError("missing grace cycles must be positive")
         self._driver = driver
         self._missing_grace_cycles = missing_grace_cycles
+        self._allowed_port_ids_by_server = (
+            None
+            if allowed_port_ids_by_server is None
+            else {
+                server_id: frozenset(
+                    _canonical_port_ids(
+                        port_ids,
+                        f"server {server_id} allowed port IDs",
+                    )
+                )
+                for server_id, port_ids in allowed_port_ids_by_server.items()
+            }
+        )
         self._current: dict[str, Binding] = {}
         self._cleanup_debt: dict[str, Binding] = {}
         self._missing: dict[str, int] = {}
         self._port_health: dict[str, PortHealth] = {}
 
     def reconcile(self, desired: Sequence[Binding]) -> list[ReconcileEvent]:
+        if self._allowed_port_ids_by_server is not None:
+            for binding in desired:
+                allowed_port_ids = self._allowed_port_ids_by_server.get(
+                    binding.server_id
+                )
+                if (
+                    allowed_port_ids is None
+                    or binding.port_id not in allowed_port_ids
+                ):
+                    raise AgentError(
+                        f"port {binding.port_id} is not declared for server "
+                        f"{binding.server_id}"
+                    )
         desired_by_port = {binding.port_id: binding for binding in desired}
         if len(desired_by_port) != len(desired):
             raise AgentError("desired bindings contain duplicate port IDs")
@@ -2375,6 +2639,11 @@ def _binding_state(
         raise AgentError(
             f"binding references unconfigured server {binding.server_id}"
         )
+    if binding.port_id not in endpoint.port_ids:
+        raise AgentError(
+            f"binding port {binding.port_id} is not declared for server "
+            f"{binding.server_id}"
+        )
     return {
         **asdict(binding),
         "accel_role": endpoint.accel_role,
@@ -2400,6 +2669,11 @@ def _port_health_state(
             raise AgentError(
                 f"port health references unconfigured server "
                 f"{item.binding.server_id}"
+            )
+        if item.binding.port_id not in endpoint.port_ids:
+            raise AgentError(
+                f"port health references undeclared port "
+                f"{item.binding.port_id} for server {item.binding.server_id}"
             )
         record.update(
             {
@@ -2608,6 +2882,7 @@ def _add_external_command_args(parser: argparse.ArgumentParser) -> None:
 def _add_discovery_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--server-id", action="append")
     parser.add_argument("--server-id-file", type=Path)
+    parser.add_argument("--endpoint-config", type=Path)
     parser.add_argument("--local-host")
     _add_external_command_args(parser)
 
@@ -2658,6 +2933,11 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_ATTACH_READY_TIMEOUT_SECONDS,
     )
     watch.add_argument(
+        "--shutdown-timeout-seconds",
+        type=float,
+        default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    watch.add_argument(
         "--verbose-events",
         action="store_true",
         help="emit per-packet monitor events for debugging",
@@ -2669,6 +2949,28 @@ def _parser() -> argparse.ArgumentParser:
     health.add_argument("--server-id", action="append")
     health.add_argument("--server-id-file", type=Path)
     health.add_argument("--max-age-seconds", type=float, default=10.0)
+
+    wait_reconcile = subparsers.add_parser(
+        "wait-reconcile",
+        help="wait for a matching reconcile audit record",
+    )
+    wait_reconcile.add_argument("--audit-log", required=True, type=Path)
+    wait_reconcile.add_argument("--after-offset", required=True, type=int)
+    wait_reconcile.add_argument("--audit-device", required=True, type=int)
+    wait_reconcile.add_argument("--audit-inode", required=True, type=int)
+    wait_reconcile.add_argument("--port-id", required=True)
+    wait_reconcile.add_argument("--server-id", required=True)
+    wait_reconcile.add_argument(
+        "--action", required=True, choices=("detach", "attach")
+    )
+    wait_reconcile.add_argument(
+        "--reason",
+        required=True,
+        choices=("binding_left_host", "binding_local"),
+    )
+    wait_reconcile.add_argument("--expected-host", required=True)
+    wait_reconcile.add_argument("--timeout", type=float, default=30.0)
+    wait_reconcile.add_argument("--interval", type=float, default=0.1)
     return parser
 
 
@@ -2696,14 +2998,48 @@ def _discover(args: argparse.Namespace) -> int:
         ),
         ip_command=getattr(args, "ip_command", "ip"),
     )
-    server_ids = _configured_server_ids(args)
-    discovery = resolver.discover_many_with_inventory(server_ids)
+    endpoint_config_path = getattr(args, "endpoint_config", None)
+    allowed_port_ids_by_server: dict[str, tuple[str, ...]] | None = None
+    if endpoint_config_path is None:
+        server_ids = _configured_server_ids(args)
+    else:
+        endpoint_configs = _load_endpoint_configs(endpoint_config_path)
+        allowed_port_ids_by_server = {
+            config.server_id: config.port_ids for config in endpoint_configs
+        }
+        has_server_filter = bool(
+            getattr(args, "server_id", None)
+            or getattr(args, "server_id_file", None)
+        )
+        server_ids = (
+            _configured_server_ids(args)
+            if has_server_filter
+            else list(allowed_port_ids_by_server)
+        )
+        undeclared_servers = sorted(
+            set(server_ids) - set(allowed_port_ids_by_server)
+        )
+        if undeclared_servers:
+            raise AgentError(
+                "server IDs are absent from endpoint config: "
+                + ", ".join(undeclared_servers)
+            )
+    discovery = (
+        resolver.discover_many_with_inventory(server_ids)
+        if allowed_port_ids_by_server is None
+        else resolver.discover_many_with_inventory(
+            server_ids,
+            allowed_port_ids_by_server,
+        )
+    )
     print(
         json.dumps(
             {
                 "server_id": server_ids[0] if len(server_ids) == 1 else None,
                 "server_ids": server_ids,
                 "local_host": host,
+                "port_policy_enforced": allowed_port_ids_by_server is not None,
+                "policy_errors": list(discovery.policy_errors),
                 "port_inventory": [
                     asdict(item) for item in discovery.port_inventory
                 ],
@@ -2713,7 +3049,7 @@ def _discover(args: argparse.Namespace) -> int:
             sort_keys=True,
         )
     )
-    return 0
+    return 2 if discovery.policy_errors else 0
 
 
 def _watch(args: argparse.Namespace) -> int:
@@ -2721,12 +3057,27 @@ def _watch(args: argparse.Namespace) -> int:
         raise AgentError("watch must run as root")
     if args.interval <= 0:
         raise AgentError("interval must be positive")
+    shutdown_timeout_seconds = getattr(
+        args,
+        "shutdown_timeout_seconds",
+        DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    if (
+        isinstance(shutdown_timeout_seconds, bool)
+        or not isinstance(shutdown_timeout_seconds, (int, float))
+        or not math.isfinite(shutdown_timeout_seconds)
+        or shutdown_timeout_seconds <= 0
+    ):
+        raise AgentError("shutdown timeout seconds must be positive")
     if args.policy_lock_root != POLICY_LOCK_ROOT:
         raise AgentError(
             f"watch policy lock root must be exactly {POLICY_LOCK_ROOT}"
         )
     endpoint_configs = _load_endpoint_configs(args.endpoint_config)
     server_ids = [config.server_id for config in endpoint_configs]
+    allowed_port_ids_by_server = {
+        config.server_id: config.port_ids for config in endpoint_configs
+    }
     command_timeout_seconds = getattr(
         args,
         "command_timeout_seconds",
@@ -2771,12 +3122,19 @@ def _watch(args: argparse.Namespace) -> int:
         verbose_events=args.verbose_events,
     )
     driver = ProcessAttachmentDriver(config, runner)
-    reconciler = Reconciler(driver, args.missing_grace_cycles)
+    reconciler = Reconciler(
+        driver,
+        args.missing_grace_cycles,
+        allowed_port_ids_by_server=allowed_port_ids_by_server,
+    )
     audit = JsonAudit(args.audit_log)
     stopping = threading.Event()
 
     def request_stop(_signum: int, _frame: Any) -> None:
-        stopping.set()
+        if not stopping.is_set():
+            deadline = time.monotonic() + shutdown_timeout_seconds
+            driver.begin_shutdown(deadline)
+            stopping.set()
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
@@ -2797,16 +3155,34 @@ def _watch(args: argparse.Namespace) -> int:
     port_inventory: tuple[PortInventory, ...] = ()
     sample_completed_ms = 0
     snapshot_error: str | None = "discovery_not_completed"
+    shutdown_cleanup_failed = False
     try:
         while not stopping.is_set():
             try:
-                sampled = _sample_discovery(resolver, server_ids)
+                sampled = _sample_discovery(
+                    resolver,
+                    server_ids,
+                    allowed_port_ids_by_server,
+                )
             except Exception as error:
                 snapshot_error = f"discovery_failed:{error}"
                 audit.emit("discovery_failed", error=str(error))
             else:
                 port_inventory = sampled.result.port_inventory
                 sample_completed_ms = sampled.completed_ms
+                policy_snapshot_error = (
+                    "port_policy_blocked:" + " | ".join(
+                        sampled.result.policy_errors
+                    )
+                    if sampled.result.policy_errors
+                    else None
+                )
+                if sampled.result.policy_errors:
+                    audit.emit(
+                        "port_policy_blocked",
+                        errors=list(sampled.result.policy_errors),
+                    )
+                snapshot_error = policy_snapshot_error
                 try:
                     events = reconciler.reconcile(sampled.result.bindings)
                 except Exception as error:
@@ -2827,7 +3203,9 @@ def _watch(args: argparse.Namespace) -> int:
                         )
                     try:
                         revalidated = _sample_discovery(
-                            resolver, server_ids
+                            resolver,
+                            server_ids,
+                            allowed_port_ids_by_server,
                         )
                     except Exception as error:
                         snapshot_error = (
@@ -2854,7 +3232,7 @@ def _watch(args: argparse.Namespace) -> int:
                                 error=str(error),
                             )
                         else:
-                            snapshot_error = None
+                            snapshot_error = policy_snapshot_error
             _write_state(
                 args.state_file,
                 server_ids,
@@ -2871,7 +3249,11 @@ def _watch(args: argparse.Namespace) -> int:
                 break
             stopping.wait(args.interval)
     finally:
-        for event in reconciler.close():
+        close_events = reconciler.close()
+        shutdown_cleanup_failed = any(
+            event.action == "error" for event in close_events
+        )
+        for event in close_events:
             audit.emit(
                 "reconcile",
                 action=event.action,
@@ -2902,8 +3284,9 @@ def _watch(args: argparse.Namespace) -> int:
             },
             grpc_capability=GRPC_CAPABILITY,
             local_host=host,
+            cleanup_succeeded=not shutdown_cleanup_failed,
         )
-    return 0
+    return 1 if shutdown_cleanup_failed else 0
 
 
 def _server_ids(values: Sequence[str]) -> list[str]:
@@ -2937,6 +3320,171 @@ def _configured_server_ids(args: argparse.Namespace) -> list[str]:
             if line.strip() and not line.lstrip().startswith("#")
         )
     return _server_ids(values)
+
+
+@dataclass(frozen=True)
+class _ReconcileWaitMatch:
+    byte_start: int
+    byte_end: int
+    binding: dict[str, Any]
+
+
+def _read_audit_after_offset(
+    path: Path,
+    after_offset: int,
+    audit_device: int,
+    audit_inode: int,
+) -> list[tuple[dict[str, Any], int, int]]:
+    with path.open("rb") as stream:
+        identity = os.fstat(stream.fileno())
+        if (identity.st_dev, identity.st_ino) != (
+            audit_device,
+            audit_inode,
+        ):
+            raise AgentError(
+                "audit log identity changed: "
+                f"{identity.st_dev}:{identity.st_ino}!="
+                f"{audit_device}:{audit_inode}"
+            )
+        if identity.st_size < after_offset:
+            raise AgentError(
+                "audit log truncated below after-offset: "
+                f"{identity.st_size}:{after_offset}"
+            )
+        stream.seek(after_offset)
+        data = stream.read()
+
+    records: list[tuple[dict[str, Any], int, int]] = []
+    cursor = after_offset
+    for line in data.splitlines(keepends=True):
+        byte_start = cursor
+        cursor += len(line)
+        if not line.endswith((b"\n", b"\r")):
+            break
+        payload = line.rstrip(b"\r\n")
+        if not payload.strip():
+            continue
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AgentError(
+                f"audit log contains invalid JSON after offset {byte_start}"
+            ) from error
+        if not isinstance(value, dict):
+            raise AgentError("audit log record must be an object")
+        records.append((value, byte_start, cursor))
+    return records
+
+
+def _reconcile_binding(
+    value: Any,
+    server_id: str,
+    port_id: str,
+    expected_host: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    interface = value.get("interface")
+    ifindex = value.get("ifindex")
+    host = value.get("host")
+    if (
+        value.get("server_id") != server_id
+        or value.get("port_id") != port_id
+        or not isinstance(host, str)
+        or not _short_host(host)
+        or _short_host(host) != expected_host
+        or not isinstance(interface, str)
+        or not interface.strip()
+        or isinstance(ifindex, bool)
+        or not isinstance(ifindex, int)
+        or ifindex <= 0
+    ):
+        return None
+    return {
+        "server_id": server_id,
+        "port_id": port_id,
+        "host": host,
+        "interface": interface,
+        "ifindex": ifindex,
+    }
+
+
+def _find_reconcile_match(
+    records: Sequence[tuple[dict[str, Any], int, int]],
+    *,
+    server_id: str,
+    port_id: str,
+    action: str,
+    reason: str,
+    expected_host: str,
+) -> _ReconcileWaitMatch | None:
+    for record, byte_start, byte_end in records:
+        if (
+            record.get("event") != "reconcile"
+            or record.get("action") != action
+            or record.get("port_id") != port_id
+            or record.get("reason") != reason
+        ):
+            continue
+        matched_binding = _reconcile_binding(
+            record.get("binding"),
+            server_id,
+            port_id,
+            expected_host,
+        )
+        if matched_binding is not None:
+            return _ReconcileWaitMatch(
+                byte_start,
+                byte_end,
+                matched_binding,
+            )
+    return None
+
+
+def _wait_reconcile(args: argparse.Namespace) -> int:
+    expected_host = _short_host(args.expected_host)
+    if not expected_host:
+        raise AgentError("expected-host must not be empty")
+    deadline = time.monotonic() + args.timeout
+    while True:
+        records = _read_audit_after_offset(
+            args.audit_log,
+            args.after_offset,
+            args.audit_device,
+            args.audit_inode,
+        )
+        matched = _find_reconcile_match(
+            records,
+            server_id=args.server_id,
+            port_id=args.port_id,
+            action=args.action,
+            reason=args.reason,
+            expected_host=expected_host,
+        )
+        if matched is not None:
+            print(
+                json.dumps(
+                    {
+                        "ready": True,
+                        "matched_byte_start": matched.byte_start,
+                        "matched_byte_end": matched.byte_end,
+                        "binding": matched.binding,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                "openstack_dataplane_agent: wait-reconcile timeout: "
+                "audit_has_no_matching_reconcile",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(args.interval, remaining))
 
 
 def _health(args: argparse.Namespace) -> int:
@@ -3059,6 +3607,14 @@ def _health(args: argparse.Namespace) -> int:
             raise AgentError(
                 f"agent port_health[{index}] references unconfigured server"
             )
+        port_id = binding_value.get("port_id")
+        if (
+            item.get("port_id") != port_id
+            or port_id not in endpoint.port_ids
+        ):
+            raise AgentError(
+                f"agent port_health[{index}] references an undeclared port"
+            )
         if (
             item.get("accel_role") != endpoint.accel_role
             or binding_value.get("accel_role") != endpoint.accel_role
@@ -3149,6 +3705,26 @@ def main() -> int:
             return _discover(args)
         if args.command == "health":
             return _health(args)
+        if args.command == "wait-reconcile":
+            if args.after_offset < 0:
+                raise AgentError("after-offset must be non-negative")
+            if args.audit_device < 0 or args.audit_inode < 0:
+                raise AgentError(
+                    "audit-device and audit-inode must be non-negative"
+                )
+            if args.timeout <= 0:
+                raise AgentError("timeout must be positive")
+            if args.interval <= 0:
+                raise AgentError("interval must be positive")
+            expected_reason = {
+                "detach": "binding_left_host",
+                "attach": "binding_local",
+            }[args.action]
+            if args.reason != expected_reason:
+                raise AgentError(
+                    f"{args.action} requires reason {expected_reason}"
+                )
+            return _wait_reconcile(args)
         return _watch(args)
     except (AgentError, json.JSONDecodeError, OSError) as error:
         print(f"openstack_dataplane_agent: {error}", file=sys.stderr)

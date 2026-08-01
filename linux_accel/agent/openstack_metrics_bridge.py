@@ -61,6 +61,16 @@ _SOURCE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _METRIC_PREFIX_RE = {
     kind: re.compile(rf"(?<!\S)({re.escape(kind)})\s+") for kind in METRIC_KINDS
 }
+_DNS_TOTAL_FIELDS = (
+    "query_total",
+    "timeout_total",
+    "unmatched_total",
+    "ringbuf_drop_total",
+    "cache_hit_total",
+    "cache_miss_total",
+    "shadow_hit_total",
+    "shadow_miss_total",
+)
 
 
 class BridgeError(RuntimeError):
@@ -166,6 +176,7 @@ class MetricSample:
 class ControllerDecision:
     timestamp_ms: int
     mode: str
+    raw_line: str = ""
 
 
 @dataclass
@@ -712,6 +723,10 @@ def parse_metric_line(
     if kind == "dns_metrics":
         if fields.get("role") != role:
             raise MetricParseError(f"{source_name} DNS role does not match config")
+        map_read_ok = _parse_uint(fields, "map_read_ok", source_name)
+        if map_read_ok != 1:
+            raise MetricParseError(f"{source_name} DNS map read is unhealthy")
+        parsed["map_read_ok"] = map_read_ok
         for key in (
             "qps",
             "rps",
@@ -724,6 +739,14 @@ def parse_metric_line(
             "shadow_miss",
         ):
             parsed[key] = _parse_uint(fields, key, source_name)
+        total_fields_present = [key in fields for key in _DNS_TOTAL_FIELDS]
+        if any(total_fields_present) and not all(total_fields_present):
+            raise MetricParseError(
+                f"{source_name} has an incomplete DNS cumulative counter set"
+            )
+        if all(total_fields_present):
+            for key in _DNS_TOTAL_FIELDS:
+                parsed[key] = _parse_uint(fields, key, source_name)
         parsed["p95_us"] = _parse_latency_us(fields, "p95", source_name)
     elif kind == "grpc_metrics":
         for key in ("reqps", "resps", "timeout", "unmatched", "ringbuf_drop"):
@@ -864,6 +887,17 @@ class MetricsCollector:
             return 0
         return current - previous if current >= previous else current
 
+    def _dns_delta_or_window(
+        self,
+        metric: ParsedMetric,
+        window_field: str,
+        total_field: str,
+        updates: dict[tuple[str, str], int],
+    ) -> int:
+        if total_field in metric.fields:
+            return self._delta(metric, total_field, updates)
+        return int(metric.fields[window_field])
+
     def prepare(
         self, now_ns: int, elapsed_seconds: float
     ) -> PreparedWindow | None:
@@ -903,11 +937,15 @@ class MetricsCollector:
         grpc_server = by_group[("grpc_fast_cache", "server")]
         updates: dict[tuple[str, str], int] = {}
 
-        dns_hits = int(dns_client.fields["cache_hit"]) + int(
-            dns_client.fields["shadow_hit"]
+        dns_hits = self._dns_delta_or_window(
+            dns_client, "cache_hit", "cache_hit_total", updates
+        ) + self._dns_delta_or_window(
+            dns_client, "shadow_hit", "shadow_hit_total", updates
         )
-        dns_misses = int(dns_client.fields["cache_miss"]) + int(
-            dns_client.fields["shadow_miss"]
+        dns_misses = self._dns_delta_or_window(
+            dns_client, "cache_miss", "cache_miss_total", updates
+        ) + self._dns_delta_or_window(
+            dns_client, "shadow_miss", "shadow_miss_total", updates
         )
         grpc_hits = self._delta(grpc_client, "cache_hit", updates) + self._delta(
             grpc_client, "shadow_hit", updates
@@ -917,8 +955,10 @@ class MetricsCollector:
             + self._delta(grpc_client, "response_cache_miss", updates)
             + self._delta(grpc_client, "shadow_miss", updates)
         )
-        server_dns_misses = int(dns_server.fields["cache_miss"]) + int(
-            dns_server.fields["shadow_miss"]
+        server_dns_misses = self._dns_delta_or_window(
+            dns_server, "cache_miss", "cache_miss_total", updates
+        ) + self._dns_delta_or_window(
+            dns_server, "shadow_miss", "shadow_miss_total", updates
         )
         server_grpc_fallback = self._delta(grpc_server, "fallback", updates)
 
@@ -929,11 +969,22 @@ class MetricsCollector:
         for metric in metrics:
             if metric.kind == "dns_metrics":
                 if metric.error_authoritative:
-                    request_count += int(metric.fields["qps"])
+                    request_count += self._dns_delta_or_window(
+                        metric, "qps", "query_total", updates
+                    )
                     error_count += (
-                        int(metric.fields["timeout"])
-                        + int(metric.fields["unmatched"])
-                        + int(metric.fields["ringbuf_drop"])
+                        self._dns_delta_or_window(
+                            metric, "timeout", "timeout_total", updates
+                        )
+                        + self._dns_delta_or_window(
+                            metric, "unmatched", "unmatched_total", updates
+                        )
+                        + self._dns_delta_or_window(
+                            metric,
+                            "ringbuf_drop",
+                            "ringbuf_drop_total",
+                            updates,
+                        )
                     )
                 dns_p95_us = max(dns_p95_us, float(metric.fields["p95_us"]))
             elif metric.kind == "grpc_metrics":
@@ -1163,7 +1214,11 @@ def parse_controller_decision(
         raise ControllerError("controller decision has invalid mode")
     if fields.get("publish_failed") not in {"0", "false"}:
         raise ControllerError("controller reported a publication failure")
-    return ControllerDecision(timestamp_ms, _DECISION_MODES[raw_mode])
+    return ControllerDecision(
+        timestamp_ms,
+        _DECISION_MODES[raw_mode],
+        line.strip(),
+    )
 
 
 _CONTROLLER_EOF = object()
@@ -1427,6 +1482,12 @@ class MetricsBridge:
             self._degrade(self._wall_time_ns())
             raise
         prepared.commit()
+        decision_detail = decision.raw_line or f"mode={decision.mode}"
+        print(
+            "openstack_metrics_bridge: "
+            f"sample={prepared.sample.to_csv()} decision={decision_detail}",
+            flush=True,
+        )
         self._window_anchor = self._monotonic()
         return True
 

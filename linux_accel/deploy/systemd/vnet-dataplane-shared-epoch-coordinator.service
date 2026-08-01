@@ -1,0 +1,29 @@
+[Unit]
+Description=VNet shared-cluster health-gated epoch coordinator
+Wants=network-online.target vnet-dataplane-shared-metrics-controller.service
+After=network-online.target vnet-dataplane-shared-metrics-controller.service
+RefuseManualStart=yes
+ConditionPathExists=/run/vnet-dataplane-shared-activation/approved
+
+[Service]
+Type=simple
+User=root
+UMask=0077
+Environment=VNET_COORDINATOR_INTERVAL=2
+Environment=VNET_COORDINATOR_SHUTDOWN_TIMEOUT=100
+EnvironmentFile=/etc/vnet-dataplane-shared/coordinator.env
+ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/vnet-dataplane-policy
+StateDirectory=vnet-dataplane-shared-epoch
+StateDirectoryMode=0700
+LogsDirectory=vnet-dataplane-shared-epoch
+LogsDirectoryMode=0700
+ExecStartPre=/usr/bin/test -r ${VNET_COORDINATOR_SCRIPT}
+ExecStartPre=/usr/bin/test -r ${VNET_COORDINATOR_CONFIG}
+ExecStart=/usr/bin/python3 ${VNET_COORDINATOR_SCRIPT} watch --config ${VNET_COORDINATOR_CONFIG} --state-file /var/lib/vnet-dataplane-shared-epoch/state.json --desired-mode-file ${VNET_DESIRED_MODE_FILE} --audit-log /var/log/vnet-dataplane-shared-epoch/audit.jsonl --interval ${VNET_COORDINATOR_INTERVAL} --shutdown-timeout-seconds ${VNET_COORDINATOR_SHUTDOWN_TIMEOUT}
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

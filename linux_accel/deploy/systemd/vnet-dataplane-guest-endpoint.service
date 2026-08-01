@@ -11,6 +11,7 @@ Type=simple
 User=root
 UMask=0077
 Environment=VNET_GUEST_INTERVAL=2
+Environment=VNET_GUEST_SHUTDOWN_TIMEOUT=45
 EnvironmentFile=/etc/vnet-dataplane-guest/guest-endpoint.env
 RuntimeDirectory=vnet-dataplane-guest
 RuntimeDirectoryMode=0750
@@ -25,10 +26,10 @@ ExecStartPre=/usr/bin/test -x ${VNET_GUEST_GRPC_FAST_CACHE}
 ExecStartPre=/usr/bin/test -x ${VNET_GUEST_CACHE_POLICY_TXN}
 ExecStartPre=/usr/bin/test -x ${VNET_GUEST_BPFTOOL}
 ExecStartPre=/usr/bin/test -x ${VNET_GUEST_IP}
-ExecStart=/usr/bin/python3 ${VNET_GUEST_AGENT} run --config ${VNET_GUEST_CONFIG} --dns-monitor ${VNET_GUEST_DNS_MONITOR} --dns-server-bpf ${VNET_GUEST_DNS_SERVER_BPF} --grpc-fast-cache ${VNET_GUEST_GRPC_FAST_CACHE} --cache-policy-txn ${VNET_GUEST_CACHE_POLICY_TXN} --bpftool ${VNET_GUEST_BPFTOOL} --ip ${VNET_GUEST_IP} --state-file /run/vnet-dataplane-guest/state.json --interval ${VNET_GUEST_INTERVAL}
+ExecStart=/usr/bin/python3 ${VNET_GUEST_AGENT} run --config ${VNET_GUEST_CONFIG} --dns-monitor ${VNET_GUEST_DNS_MONITOR} --dns-server-bpf ${VNET_GUEST_DNS_SERVER_BPF} --grpc-fast-cache ${VNET_GUEST_GRPC_FAST_CACHE} --cache-policy-txn ${VNET_GUEST_CACHE_POLICY_TXN} --bpftool ${VNET_GUEST_BPFTOOL} --ip ${VNET_GUEST_IP} --state-file /run/vnet-dataplane-guest/state.json --interval ${VNET_GUEST_INTERVAL} --shutdown-timeout-seconds ${VNET_GUEST_SHUTDOWN_TIMEOUT}
 KillSignal=SIGINT
 KillMode=mixed
-TimeoutStopSec=20
+TimeoutStopSec=60
 Restart=on-failure
 RestartSec=2
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_RESOURCE

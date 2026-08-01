@@ -7,6 +7,7 @@ import argparse
 import errno
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover - Windows development host
 
 
 CONFIG_SCHEMA_VERSION = 1
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 45.0
 STATE_SCHEMA_VERSION = 1
 GRPC_CAPABILITY = "userspace_fast_cache"
 RUNTIME_MODE_MIN = 1
@@ -554,7 +556,26 @@ class SystemEndpointDriver:
         self._processes: dict[int, subprocess.Popen[bytes]] = {}
         self._quiesce_fd: int | None = None
         self._quiesce_identity: tuple[int, int] | None = None
+        self._shutdown_deadline: float | None = None
         self._validate_inputs()
+
+    def begin_shutdown(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+
+    def _remaining_timeout(self, maximum: float = 10.0) -> float:
+        if self._shutdown_deadline is None:
+            return maximum
+        remaining = self._shutdown_deadline - time.monotonic()
+        if remaining <= 0:
+            raise GuestEndpointError(
+                "shutdown deadline expired during guest cleanup"
+            )
+        return min(maximum, remaining)
+
+    def _run_command(
+        self, args: Sequence[str], timeout: float = 10.0
+    ) -> CommandResult:
+        return self.runner.run(args, timeout=self._remaining_timeout(timeout))
 
     def _validate_inputs(self) -> None:
         executables = [
@@ -639,8 +660,7 @@ class SystemEndpointDriver:
 
             opened_lock = os.fstat(lock_descriptor)
             self._validate_policy_lock_status(opened_lock)
-            if fcntl is not None:
-                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            self._acquire_policy_lock(lock_descriptor)
 
             opened_lock = os.fstat(lock_descriptor)
             self._validate_policy_lock_status(opened_lock)
@@ -675,6 +695,30 @@ class SystemEndpointDriver:
                 raise GuestEndpointError("policy lock has an unsafe owner")
             if stat.S_IMODE(status.st_mode) != 0o600:
                 raise GuestEndpointError("policy lock has unsafe permissions")
+
+    def _acquire_policy_lock(self, descriptor: int) -> None:
+        if fcntl is None:
+            return
+        while True:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                return
+            except OSError as error:
+                if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+            deadline = self._shutdown_deadline
+            if deadline is None:
+                time.sleep(0.05)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GuestEndpointError(
+                    "shutdown deadline expired waiting for policy lock"
+                )
+            time.sleep(min(0.05, remaining))
 
     def enter_quiesce(self) -> None:
         policy_descriptor = self._open_policy_lock()
@@ -825,7 +869,7 @@ class SystemEndpointDriver:
                 raise GuestEndpointError("quiesce file has unsafe permissions")
 
     def ensure_interface(self, interface: str) -> None:
-        result = self.runner.run(
+        result = self._run_command(
             [str(self.tools.ip), "-j", "link", "show", "dev", interface]
         )
         if result.returncode != 0:
@@ -840,7 +884,7 @@ class SystemEndpointDriver:
             raise GuestEndpointError(f"interface {interface} is not unique")
 
     def interface_ipv4(self, interface: str) -> tuple[str, ...]:
-        result = self.runner.run(
+        result = self._run_command(
             [str(self.tools.ip), "-j", "addr", "show", "dev", interface]
         )
         if result.returncode != 0:
@@ -881,7 +925,7 @@ class SystemEndpointDriver:
                 "gRPC runtime map path must not be a symlink"
             )
         if not self.paths.grpc_runtime_map.exists():
-            result = self.runner.run(
+            result = self._run_command(
                 [
                     str(self.tools.bpftool),
                     "map",
@@ -907,7 +951,7 @@ class SystemEndpointDriver:
         self._validate_runtime_map(self.paths.grpc_runtime_map)
 
     def _validate_runtime_map(self, path: Path) -> None:
-        result = self.runner.run(
+        result = self._run_command(
             [str(self.tools.bpftool), "-j", "map", "show", "pinned", str(path)]
         )
         if result.returncode != 0:
@@ -953,7 +997,7 @@ class SystemEndpointDriver:
             current = self._read_txn((path,), 1, require_committed=False)
             epochs.append(current["epoch"])
         epoch = max([1, *epochs])
-        force = self.runner.run(
+        force = self._run_command(
             build_txn_command(
                 self.tools, self.paths, "force-bypass", epoch, map_paths
             )
@@ -979,7 +1023,7 @@ class SystemEndpointDriver:
         epoch: int,
         require_committed: bool,
     ) -> dict[str, Any]:
-        result = self.runner.run(
+        result = self._run_command(
             build_txn_command(
                 self.tools, self.paths, "read-current", epoch, map_paths
             )
@@ -1097,15 +1141,20 @@ class SystemEndpointDriver:
                 self._processes.pop(pid, None)
                 return process.poll() is not None
             try:
-                process.wait(timeout=timeout)
+                process.wait(timeout=self._remaining_timeout(timeout))
                 self._processes.pop(pid, None)
                 return True
-            except subprocess.TimeoutExpired:
+            except (GuestEndpointError, subprocess.TimeoutExpired):
+                if (
+                    self._shutdown_deadline is not None
+                    and time.monotonic() >= self._shutdown_deadline
+                ):
+                    return False
                 continue
         return False
 
     def current_xdp_program_id(self, interface: str) -> int:
-        result = self.runner.run(
+        result = self._run_command(
             [
                 str(self.tools.ip),
                 "-j",
@@ -2086,6 +2135,11 @@ def _parser() -> argparse.ArgumentParser:
         default=Path("/run/vnet-dataplane-guest/state.json"),
     )
     run.add_argument("--interval", type=float, default=2.0)
+    run.add_argument(
+        "--shutdown-timeout-seconds",
+        type=float,
+        default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    )
 
     health = subparsers.add_parser("health", help="check a fresh state snapshot")
     health.add_argument("--config", required=True, type=Path)
@@ -2111,6 +2165,13 @@ def _run(args: argparse.Namespace) -> int:
         raise GuestEndpointError(
             "production lock root must be /run/vnet-dataplane-policy"
         )
+    if (
+        isinstance(args.shutdown_timeout_seconds, bool)
+        or not isinstance(args.shutdown_timeout_seconds, (int, float))
+        or not math.isfinite(args.shutdown_timeout_seconds)
+        or args.shutdown_timeout_seconds <= 0
+    ):
+        raise GuestEndpointError("shutdown timeout seconds must be positive")
     tools = ToolPaths(
         dns_monitor=args.dns_monitor,
         dns_server_bpf=args.dns_server_bpf,
@@ -2128,8 +2189,15 @@ def _run(args: argparse.Namespace) -> int:
     driver = SystemEndpointDriver(config, tools, paths)
     agent = GuestEndpointAgent(config, tools, paths, driver)
     supervisor = GuestEndpointSupervisor(agent, args.state_file, args.interval)
-    signal.signal(signal.SIGINT, supervisor.request_stop)
-    signal.signal(signal.SIGTERM, supervisor.request_stop)
+    def request_stop(signum: int, frame: Any) -> None:
+        if not supervisor.stop_event.is_set():
+            driver.begin_shutdown(
+                time.monotonic() + args.shutdown_timeout_seconds
+            )
+            supervisor.request_stop(signum, frame)
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
     return supervisor.run()
 
 

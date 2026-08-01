@@ -1,13 +1,14 @@
 [Unit]
 Description=VNet OpenStack health-gated epoch coordinator
-Wants=network-online.target vnet-dataplane-agent.service vnet-dataplane-metrics-controller.service
-After=network-online.target vnet-dataplane-agent.service vnet-dataplane-metrics-controller.service
+Wants=network-online.target vnet-dataplane-metrics-controller.service
+After=network-online.target vnet-dataplane-metrics-controller.service
 
 [Service]
 Type=simple
 User=root
 UMask=0077
 Environment=VNET_COORDINATOR_INTERVAL=2
+Environment=VNET_COORDINATOR_SHUTDOWN_TIMEOUT=100
 EnvironmentFile=/etc/vnet-dataplane-agent/coordinator.env
 ExecStartPre=/usr/bin/install -d -o root -g root -m 0700 /run/vnet-dataplane-policy
 StateDirectory=vnet-dataplane-epoch
@@ -16,11 +17,11 @@ LogsDirectory=vnet-dataplane-epoch
 LogsDirectoryMode=0700
 ExecStartPre=/usr/bin/test -r ${VNET_COORDINATOR_SCRIPT}
 ExecStartPre=/usr/bin/test -r ${VNET_COORDINATOR_CONFIG}
-ExecStart=/usr/bin/python3 ${VNET_COORDINATOR_SCRIPT} watch --config ${VNET_COORDINATOR_CONFIG} --state-file /var/lib/vnet-dataplane-epoch/state.json --desired-mode-file ${VNET_DESIRED_MODE_FILE} --audit-log /var/log/vnet-dataplane-epoch/audit.jsonl --interval ${VNET_COORDINATOR_INTERVAL}
+ExecStart=/usr/bin/python3 ${VNET_COORDINATOR_SCRIPT} watch --config ${VNET_COORDINATOR_CONFIG} --state-file /var/lib/vnet-dataplane-epoch/state.json --desired-mode-file ${VNET_DESIRED_MODE_FILE} --audit-log /var/log/vnet-dataplane-epoch/audit.jsonl --interval ${VNET_COORDINATOR_INTERVAL} --shutdown-timeout-seconds ${VNET_COORDINATOR_SHUTDOWN_TIMEOUT}
 Restart=on-failure
 RestartSec=2
 KillMode=mixed
-TimeoutStopSec=10
+TimeoutStopSec=120
 
 [Install]
 WantedBy=multi-user.target

@@ -206,6 +206,7 @@ def write_snapshot(
     guest_grpc_listen_port = 50053 if accel_role == "client" else 50052
     endpoint_config = {
         "server_id": SERVER_ID,
+        "port_ids": [PORT_ID],
         "accel_role": accel_role,
         "grpc_observe_port": 50052,
         "guest_grpc_listen_port": guest_grpc_listen_port,
@@ -1551,6 +1552,57 @@ class EpochCoordinatorTest(unittest.TestCase):
             (1, shutdown_epoch),
         )
 
+    def test_shutdown_barrier_accepts_fresh_bypass_during_migration_freeze(self):
+        now_ms = int(time.time() * 1000)
+        write_snapshot(
+            self.master_state,
+            "master",
+            "healthy",
+            updated_ms=now_ms,
+        )
+        write_snapshot(
+            self.compute_state,
+            "compute2",
+            "absent",
+            binding_host="master",
+            updated_ms=now_ms,
+        )
+        initial = self.coordinator.reconcile("server", now_ms)
+        write_snapshot(
+            self.master_state,
+            "master",
+            "transition",
+            binding_host="compute2",
+            updated_ms=now_ms,
+        )
+        audit_log = self.runtime_state.with_name("freeze-audit.jsonl")
+        stopping = threading.Event()
+        stopping.set()
+
+        exit_code = _run_watch_loop(
+            self.coordinator,
+            self.runtime_state.with_name("desired.json"),
+            audit_log,
+            0.01,
+            10_000,
+            stopping,
+        )
+
+        record = json.loads(audit_log.read_text(encoding="utf-8"))
+        assessment = coordinator_module._assess_committed_audit(
+            [record],
+            test_config(self.master_state, self.compute_state),
+            "bypass",
+            initial.state.epoch + 1,
+            2,
+            True,
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(record["outcome"], "migration_forced_bypass")
+        self.assertEqual(record["gate"]["action"], "freeze")
+        self.assertIs(record["shutdown"], True)
+        self.assertTrue(assessment.ready, assessment.reason)
+
     def test_watch_audit_failure_still_forces_bypass_before_error(self):
         desired = self.runtime_state.with_name("desired.json")
         desired.write_text(
@@ -1642,6 +1694,29 @@ class PublicationWaitCommandTest(unittest.TestCase):
             "map_readbacks": readbacks,
         }, len(active_actors)
 
+    def _fail_safe_shutdown_publication(self, epoch=76):
+        publication, present_count = self._publication(
+            epoch=epoch,
+            mode="bypass",
+            outcome="fail_safe_bypass_published",
+        )
+        publication.update(
+            {
+                "shutdown": True,
+                "requested_mode": "bypass",
+                "effective_mode": "bypass",
+                "exit_code": 2,
+                "state_input_error": "CoordinatorError:state journal missing",
+                "gate": {
+                    "action": "bypass",
+                    "force_bypass": True,
+                    "reason": "state_input_error:GateError:agent state missing",
+                },
+            }
+        )
+        del publication["desired_input_error"]
+        return publication, present_count
+
     @staticmethod
     def _write_desired(root, mode="server"):
         (root / "desired.json").write_text(
@@ -1703,6 +1778,281 @@ class PublicationWaitCommandTest(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def _run_transition_wait(
+        self,
+        root,
+        *,
+        after_offset,
+        audit_device,
+        audit_inode,
+        timeout="0.08",
+    ):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(Path(coordinator_module.__file__).resolve()),
+                "wait-transition",
+                "--config",
+                str(self._config_path()),
+                "--audit-log",
+                str(root / "audit.jsonl"),
+                "--after-offset",
+                str(after_offset),
+                "--audit-device",
+                str(audit_device),
+                "--audit-inode",
+                str(audit_inode),
+                "--server-id",
+                "REPLACE_BACKEND_SERVER_UUID",
+                "--port-id",
+                "REPLACE_BACKEND_PORT_UUID",
+                "--source-host",
+                "master",
+                "--after-epoch",
+                "8",
+                "--timeout",
+                timeout,
+                "--interval",
+                "0.01",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def _forced_transition(self, epoch=9):
+        transition, _present_count = self._publication(
+            epoch=epoch,
+            mode="bypass",
+            outcome="migration_forced_bypass",
+        )
+        transition.update(
+            {
+                "requested_mode": "server",
+                "effective_mode": "bypass",
+                "exit_code": 2,
+                "gate": {
+                    "action": "freeze",
+                    "reason": (
+                        "migration_transition:REPLACE_BACKEND_SERVER_UUID:"
+                        "REPLACE_BACKEND_PORT_UUID:master"
+                    ),
+                },
+            }
+        )
+        config = load_config(self._config_path())
+        transition["publications"] = [
+            {
+                "endpoint": publisher.name,
+                "operation": "force-bypass",
+                "mode": "bypass",
+                "epoch": epoch,
+                "returncode": 0,
+                "detail": "published",
+            }
+            for publisher in config.publishers
+        ]
+        return transition
+
+    def test_wait_transition_matches_forced_bypass_after_exact_offset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.write_bytes(b'{"outcome":"older"}\n')
+            after_offset = audit.stat().st_size
+            identity = audit.stat()
+            transition = self._forced_transition()
+            with audit.open("ab") as output:
+                output.write(
+                    json.dumps(
+                        transition, separators=(",", ":"), sort_keys=True
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            matched_end = audit.stat().st_size
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=after_offset,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {
+                    "epoch": 9,
+                    "matched_byte_end": matched_end,
+                    "matched_byte_start": after_offset,
+                    "outcome": "migration_forced_bypass",
+                    "ready": True,
+                },
+            )
+
+    def test_wait_transition_rejects_audit_identity_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.write_bytes(b'{"outcome":"older"}\n')
+            identity = audit.stat()
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=identity.st_size,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino + 1,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("audit log identity changed", result.stderr)
+
+    def test_wait_transition_rejects_truncation_below_offset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.write_bytes(b"{}\n")
+            identity = audit.stat()
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=identity.st_size + 1,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit log truncated below after-offset", result.stderr
+            )
+
+    def test_wait_transition_requires_the_exact_migration_reason(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            transition = self._forced_transition()
+            transition["gate"]["reason"] += ":unexpected"
+            audit.write_text(
+                json.dumps(transition) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_has_no_matching_transition", result.stderr
+            )
+
+    def test_wait_transition_requires_fresh_known_bypass_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            transition = self._forced_transition()
+            transition["state"]["known"] = False
+            audit.write_text(
+                json.dumps(transition) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_transition_state_not_fresh_known_bypass",
+                result.stderr,
+            )
+
+    def test_wait_transition_requires_every_forced_publisher(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            transition = self._forced_transition()
+            transition["publications"].pop()
+            audit.write_text(
+                json.dumps(transition) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_transition_force_set_mismatch", result.stderr
+            )
+
+    def test_wait_transition_requires_same_epoch_bypass_readback(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            transition = self._forced_transition()
+            present = next(
+                item
+                for item in transition["map_readbacks"]
+                if item["present"]
+            )
+            present["epoch"] = 10
+            audit.write_text(
+                json.dumps(transition) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_transition_readback_not_bypass", result.stderr
+            )
+
+    def test_wait_transition_accepts_already_frozen_known_bypass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audit = root / "audit.jsonl"
+            audit.touch()
+            identity = audit.stat()
+            transition = self._forced_transition()
+            transition["outcome"] = "migration_frozen_in_bypass"
+            transition["publications"] = []
+            audit.write_text(
+                json.dumps(transition) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_transition_wait(
+                root,
+                after_offset=0,
+                audit_device=identity.st_dev,
+                audit_inode=identity.st_ino,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = json.loads(result.stdout)
+            self.assertEqual(output["outcome"], "migration_frozen_in_bypass")
+            self.assertEqual(output["epoch"], 9)
 
     def test_waits_for_a_fresh_committed_epoch(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1829,6 +2179,227 @@ class PublicationWaitCommandTest(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("audit_shutdown_proof_missing", result.stderr)
+
+    def test_shutdown_barrier_accepts_committed_fail_safe_bypass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_state(root, "bypass", 76)
+            publication, present_count = (
+                self._fail_safe_shutdown_publication()
+            )
+            (root / "audit.jsonl").write_text(
+                json.dumps(publication) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_wait(
+                root,
+                present_count,
+                after_epoch="75",
+                target_mode="bypass",
+                require_shutdown=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {
+                    "epoch": 76,
+                    "mode": "bypass",
+                    "present_readbacks": present_count,
+                    "ready": True,
+                    "shutdown": True,
+                },
+            )
+
+    def test_regular_barrier_rejects_fail_safe_bypass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_desired(root, mode="bypass")
+            self._write_state(root, "bypass", 76)
+            publication, present_count = (
+                self._fail_safe_shutdown_publication()
+            )
+            (root / "audit.jsonl").write_text(
+                json.dumps(publication) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_wait(
+                root,
+                present_count,
+                after_epoch="75",
+                target_mode="bypass",
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_outcome_not_policy_published", result.stderr
+            )
+
+    def test_shutdown_fail_safe_barrier_requires_forced_bypass_gate(self):
+        invalid_gates = (
+            {
+                "action": "publish",
+                "force_bypass": True,
+                "reason": "state_input_error:GateError:agent state missing",
+            },
+            {
+                "action": "bypass",
+                "force_bypass": False,
+                "reason": "state_input_error:GateError:agent state missing",
+            },
+            {
+                "action": "bypass",
+                "force_bypass": True,
+                "reason": "   ",
+            },
+        )
+        for gate in invalid_gates:
+            with self.subTest(gate=gate), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                self._write_state(root, "bypass", 76)
+                publication, present_count = (
+                    self._fail_safe_shutdown_publication()
+                )
+                publication["gate"] = gate
+                (root / "audit.jsonl").write_text(
+                    json.dumps(publication) + "\n", encoding="utf-8"
+                )
+
+                result = self._run_wait(
+                    root,
+                    present_count,
+                    after_epoch="75",
+                    target_mode="bypass",
+                    require_shutdown=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "audit_shutdown_fail_safe_gate_invalid", result.stderr
+                )
+
+    def test_shutdown_fail_safe_barrier_requires_exact_result_fields(self):
+        invalid_fields = (
+            ("requested_mode", "server"),
+            ("effective_mode", "server"),
+            ("exit_code", 0),
+        )
+        for field, value in invalid_fields:
+            with (
+                self.subTest(field=field, value=value),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                self._write_state(root, "bypass", 76)
+                publication, present_count = (
+                    self._fail_safe_shutdown_publication()
+                )
+                publication[field] = value
+                (root / "audit.jsonl").write_text(
+                    json.dumps(publication) + "\n", encoding="utf-8"
+                )
+
+                result = self._run_wait(
+                    root,
+                    present_count,
+                    after_epoch="75",
+                    target_mode="bypass",
+                    require_shutdown=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "audit_shutdown_fail_safe_result_mismatch",
+                    result.stderr,
+                )
+
+    def test_shutdown_fail_safe_barrier_requires_typed_state_error(self):
+        invalid_inputs = (
+            ("state_input_error", None),
+            ("state_input_error", 1),
+            ("desired_input_error", "CoordinatorError:desired mode invalid"),
+        )
+        for field, value in invalid_inputs:
+            with (
+                self.subTest(field=field, value=value),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                root = Path(temp)
+                self._write_state(root, "bypass", 76)
+                publication, present_count = (
+                    self._fail_safe_shutdown_publication()
+                )
+                publication[field] = value
+                (root / "audit.jsonl").write_text(
+                    json.dumps(publication) + "\n", encoding="utf-8"
+                )
+
+                result = self._run_wait(
+                    root,
+                    present_count,
+                    after_epoch="75",
+                    target_mode="bypass",
+                    require_shutdown=True,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "audit_shutdown_fail_safe_input_invalid", result.stderr
+                )
+
+    def test_shutdown_barrier_rejects_unchanged_fail_safe_bypass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_state(root, "bypass", 76)
+            publication, present_count = (
+                self._fail_safe_shutdown_publication()
+            )
+            publication["outcome"] = "fail_safe_bypass_unchanged"
+            (root / "audit.jsonl").write_text(
+                json.dumps(publication) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_wait(
+                root,
+                present_count,
+                after_epoch="75",
+                target_mode="bypass",
+                require_shutdown=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "audit_outcome_not_policy_published", result.stderr
+            )
+
+    def test_shutdown_fail_safe_barrier_keeps_strict_readback_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self._write_state(root, "bypass", 76)
+            publication, present_count = (
+                self._fail_safe_shutdown_publication()
+            )
+            present = next(
+                item for item in publication["map_readbacks"] if item["present"]
+            )
+            present["flags"] = 0
+            (root / "audit.jsonl").write_text(
+                json.dumps(publication) + "\n", encoding="utf-8"
+            )
+
+            result = self._run_wait(
+                root,
+                present_count,
+                after_epoch="75",
+                target_mode="bypass",
+                require_shutdown=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                f"audit_present_readback_not_committed:{present['endpoint']}",
+                result.stderr,
+            )
 
     def test_non_bypass_policy_unchanged_never_satisfies_the_barrier(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1961,6 +2532,24 @@ class PublicationWaitCommandTest(unittest.TestCase):
 
 
 class CoordinatorConfigTest(unittest.TestCase):
+    def test_controller_unit_does_not_depend_on_a_local_compute_agent(self):
+        unit = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "systemd"
+            / "vnet-dataplane-epoch-coordinator.service"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("vnet-dataplane-agent.service", unit)
+
+    def test_controller_unit_allows_shutdown_bypass_publication_to_finish(self):
+        unit = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "systemd"
+            / "vnet-dataplane-epoch-coordinator.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("TimeoutStopSec=120", unit)
+
     def test_desired_mode_freshness_uses_atomic_payload_timestamp(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "desired.json"
@@ -2042,7 +2631,6 @@ class CoordinatorConfigTest(unittest.TestCase):
             for item in payload["publishers"]
             if item["name"] == "backend-host-caches"
         )
-        publisher["target_kind"] = "compute_port"
         with tempfile.TemporaryDirectory() as temp:
             config_path = Path(temp) / "coordinator.json"
             config_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -2104,6 +2692,35 @@ class CoordinatorConfigTest(unittest.TestCase):
             "UserKnownHostsFile=/etc/vnet-dataplane-agent/lab-known-hosts.p1",
             remote.command,
         )
+
+    def test_remote_publisher_can_separate_nova_host_from_ssh_destination(self):
+        payload = self._example_payload()
+        remote = next(
+            item for item in payload["publishers"] if item["host"] == "compute2"
+        )
+        remote["ssh_destination"] = "ubuntu@172.25.6.13"
+        remote["command"][9] = remote["ssh_destination"]
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "coordinator.json"
+            candidate.write_text(json.dumps(payload), encoding="utf-8")
+
+            config = load_config(candidate)
+
+        observed = next(item for item in config.publishers if item.name == remote["name"])
+        self.assertEqual(observed.host, "compute2")
+        self.assertEqual(observed.ssh_destination, "ubuntu@172.25.6.13")
+
+    def test_remote_publisher_rejects_mismatched_explicit_ssh_destination(self):
+        payload = self._example_payload()
+        remote = next(
+            item for item in payload["publishers"] if item["host"] == "compute2"
+        )
+        remote["ssh_destination"] = "ubuntu@172.25.6.13"
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory) / "coordinator.json"
+            candidate.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(CoordinatorError, "ssh destination"):
+                load_config(candidate)
 
     def test_remote_publisher_rejects_disabled_host_key_checking(self):
         config_path = (

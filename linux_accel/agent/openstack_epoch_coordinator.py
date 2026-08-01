@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import os
@@ -66,6 +67,7 @@ _PUBLISHER_SERVICES = {"dns", "grpc"}
 POLICY_LOCK_ROOT = "/run/vnet-dataplane-policy"
 SSH_KNOWN_HOSTS_ROOT = PurePosixPath("/etc/vnet-dataplane-agent")
 _AUDIT_TAIL_LIMIT = 4 * 1024 * 1024
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 100.0
 
 
 @dataclass(frozen=True)
@@ -93,15 +95,47 @@ class SubprocessRunner:
 
 
 class _CoordinatorLock:
-    def __init__(self, path: Path):
+    def __init__(
+        self,
+        path: Path,
+        deadline_provider: Any = None,
+    ):
         self._path = path
         self._file: Any = None
+        self._deadline_provider = deadline_provider
 
     def __enter__(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self._path.open("a+b")
         if fcntl is not None:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(
+                        self._file.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                        self._file.close()
+                        self._file = None
+                        raise
+                deadline = (
+                    self._deadline_provider()
+                    if self._deadline_provider is not None
+                    else None
+                )
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        self._file.close()
+                        self._file = None
+                        raise CoordinatorError(
+                            "shutdown deadline expired waiting for state lock"
+                        )
+                    time.sleep(min(0.05, remaining))
+                else:
+                    time.sleep(0.05)
 
     def __exit__(self, _type: Any, _value: Any, _traceback: Any) -> None:
         if self._file is None:
@@ -131,6 +165,7 @@ class PublisherEndpoint:
     target_kind: str = "compute_port"
     services: tuple[str, ...] = ("dns", "grpc")
     cache_role: str = "client"
+    ssh_destination: str = ""
 
 
 @dataclass(frozen=True)
@@ -232,24 +267,49 @@ class EpochCoordinator:
         self._state_file = state_file
         self._runner = runner or SubprocessRunner()
         self._initial_epoch = initial_epoch
+        self._shutdown_deadline: float | None = None
+        self._shutdown_reconcile = False
+
+    def request_shutdown(self, deadline: float) -> None:
+        self._shutdown_deadline = deadline
+
+    def _command_timeout(self) -> float:
+        if self._shutdown_deadline is None:
+            return self._config.command_timeout_seconds
+        if not self._shutdown_reconcile:
+            raise CoordinatorError("shutdown requested during normal reconcile")
+        remaining = self._shutdown_deadline - time.monotonic()
+        if remaining <= 0:
+            raise CoordinatorError("shutdown publication deadline expired")
+        return min(self._config.command_timeout_seconds, remaining)
 
     def reconcile(
         self, desired_mode: str, now_ms: int | None = None
     ) -> CoordinatorResult:
         desired = _normalize_mode(desired_mode)
         lock_file = self._state_file.with_name(self._state_file.name + ".lock")
-        with _CoordinatorLock(lock_file):
+        with _CoordinatorLock(
+            lock_file,
+            lambda: self._shutdown_deadline,
+        ):
             return self._reconcile_locked(desired, now_ms)
 
     def reconcile_shutdown(self, now_ms: int | None = None) -> CoordinatorResult:
         """Publish a fresh BYPASS epoch that can fence service shutdown."""
         lock_file = self._state_file.with_name(self._state_file.name + ".lock")
-        with _CoordinatorLock(lock_file):
-            return self._reconcile_locked(
-                "bypass",
-                now_ms,
-                force_bypass_epoch=True,
-            )
+        self._shutdown_reconcile = True
+        try:
+            with _CoordinatorLock(
+                lock_file,
+                lambda: self._shutdown_deadline,
+            ):
+                return self._reconcile_locked(
+                    "bypass",
+                    now_ms,
+                    force_bypass_epoch=True,
+                )
+        finally:
+            self._shutdown_reconcile = False
 
     def _reconcile_locked(
         self,
@@ -727,7 +787,7 @@ class EpochCoordinator:
             text = source.path.read_text(encoding="utf-8")
         else:
             result = self._runner.run(
-                source.command, self._config.command_timeout_seconds
+                source.command, self._command_timeout()
             )
             if result.returncode != 0:
                 raise CoordinatorError(
@@ -1102,7 +1162,7 @@ class EpochCoordinator:
             ]
             try:
                 return self._runner.run(
-                    command, self._config.command_timeout_seconds
+                    command, self._command_timeout()
                 )
             except (OSError, subprocess.TimeoutExpired) as error:
                 return error
@@ -1335,6 +1395,16 @@ def load_config(path: Path) -> CoordinatorConfig:
                 f"publisher {name} has unsupported protocol: {protocol}"
             )
         command = _command_list(item.get("command"), name)
+        ssh_destination_value = item.get("ssh_destination")
+        ssh_destination = (
+            ""
+            if ssh_destination_value is None
+            else _required_text(item, "ssh_destination")
+        )
+        if ssh_destination.startswith("-"):
+            raise CoordinatorError(
+                f"publisher {name} ssh_destination must not start with '-'"
+            )
         if "--dry-run" in command:
             raise CoordinatorError(f"publisher {name} must not be dry-run")
         if any(
@@ -1347,11 +1417,19 @@ def load_config(path: Path) -> CoordinatorConfig:
         _validate_publisher_command(
             name,
             host,
+            ssh_destination,
             port_id,
             command,
             policy_lock_root,
             services,
         )
+        resolved_ssh_destination = ssh_destination
+        if not resolved_ssh_destination:
+            resolved_ssh_destination = (
+                command[9]
+                if PurePosixPath(command[0]).name == "ssh"
+                else host
+            )
         publishers.append(
             PublisherEndpoint(
                 name,
@@ -1364,6 +1442,7 @@ def load_config(path: Path) -> CoordinatorConfig:
                 target_kind,
                 services,
                 cache_role,
+                resolved_ssh_destination,
             )
         )
 
@@ -1463,6 +1542,11 @@ def _parser() -> argparse.ArgumentParser:
         else:
             command.add_argument("--desired-mode-file", required=True, type=Path)
             command.add_argument("--interval", type=float, default=2.0)
+            command.add_argument(
+                "--shutdown-timeout-seconds",
+                type=float,
+                default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+            )
     wait = subparsers.add_parser("wait-committed")
     wait.add_argument("--config", required=True, type=Path)
     wait.add_argument("--desired-mode-file", required=True, type=Path)
@@ -1474,6 +1558,18 @@ def _parser() -> argparse.ArgumentParser:
     wait.add_argument("--timeout", type=float, default=30.0)
     wait.add_argument("--interval", type=float, default=0.1)
     wait.add_argument("--require-shutdown", action="store_true")
+    transition = subparsers.add_parser("wait-transition")
+    transition.add_argument("--config", required=True, type=Path)
+    transition.add_argument("--audit-log", required=True, type=Path)
+    transition.add_argument("--after-offset", required=True, type=int)
+    transition.add_argument("--audit-device", required=True, type=int)
+    transition.add_argument("--audit-inode", required=True, type=int)
+    transition.add_argument("--server-id", required=True)
+    transition.add_argument("--port-id", required=True)
+    transition.add_argument("--source-host", required=True)
+    transition.add_argument("--after-epoch", required=True, type=int)
+    transition.add_argument("--timeout", type=float, default=30.0)
+    transition.add_argument("--interval", type=float, default=0.1)
     return parser
 
 
@@ -1576,6 +1672,16 @@ class _CommitWaitAssessment:
     present_readbacks: int = 0
 
 
+@dataclass(frozen=True)
+class _TransitionWaitAssessment:
+    ready: bool
+    reason: str
+    matched_byte_start: int = 0
+    matched_byte_end: int = 0
+    outcome: str = ""
+    epoch: int = 0
+
+
 def _read_wait_runtime_state(path: Path) -> RuntimeState:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema_version") != 1:
@@ -1620,6 +1726,246 @@ def _read_audit_tail(path: Path) -> list[dict[str, Any]]:
             raise CoordinatorError("audit log record must be an object")
         records.append(value)
     return records
+
+
+def _read_audit_after_offset(
+    path: Path,
+    after_offset: int,
+    audit_device: int,
+    audit_inode: int,
+) -> list[tuple[dict[str, Any], int, int]]:
+    with path.open("rb") as stream:
+        stat = os.fstat(stream.fileno())
+        if (stat.st_dev, stat.st_ino) != (audit_device, audit_inode):
+            raise CoordinatorError(
+                "audit log identity changed: "
+                f"{stat.st_dev}:{stat.st_ino}!={audit_device}:{audit_inode}"
+            )
+        if stat.st_size < after_offset:
+            raise CoordinatorError(
+                "audit log truncated below after-offset: "
+                f"{stat.st_size}:{after_offset}"
+            )
+        stream.seek(after_offset)
+        data = stream.read()
+    records: list[tuple[dict[str, Any], int, int]] = []
+    cursor = after_offset
+    for line in data.splitlines(keepends=True):
+        line_start = cursor
+        cursor += len(line)
+        if not line.endswith((b"\n", b"\r")):
+            break
+        payload = line.rstrip(b"\r\n")
+        if not payload.strip():
+            continue
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise CoordinatorError(
+                f"audit log contains invalid JSON after offset {line_start}"
+            ) from error
+        if not isinstance(value, dict):
+            raise CoordinatorError("audit log record must be an object")
+        records.append((value, line_start, cursor))
+    return records
+
+
+def _forced_transition_proof_error(
+    record: dict[str, Any], config: CoordinatorConfig, epoch: int
+) -> str:
+    expected = {publisher.name: publisher for publisher in config.publishers}
+    publications = record.get("publications")
+    if not isinstance(publications, list) or not all(
+        isinstance(item, dict) for item in publications
+    ):
+        return "audit_transition_publications_invalid"
+    forced: dict[str, dict[str, Any]] = {}
+    for item in publications:
+        if item.get("operation") != "force-bypass":
+            continue
+        endpoint = item.get("endpoint")
+        if not isinstance(endpoint, str) or endpoint in forced:
+            return "audit_transition_force_set_mismatch"
+        forced[endpoint] = item
+    if set(forced) != set(expected):
+        return "audit_transition_force_set_mismatch"
+    for endpoint, item in forced.items():
+        item_epoch = item.get("epoch")
+        returncode = item.get("returncode")
+        if (
+            item.get("mode") != "bypass"
+            or isinstance(item_epoch, bool)
+            or not isinstance(item_epoch, int)
+            or item_epoch != epoch
+            or isinstance(returncode, bool)
+            or not isinstance(returncode, int)
+            or returncode != 0
+        ):
+            return f"audit_transition_force_invalid:{endpoint}"
+
+    readbacks = record.get("map_readbacks")
+    if not isinstance(readbacks, list) or not all(
+        isinstance(item, dict) for item in readbacks
+    ):
+        return "audit_transition_readbacks_invalid"
+    by_endpoint: dict[str, dict[str, Any]] = {}
+    for item in readbacks:
+        endpoint = item.get("endpoint")
+        if not isinstance(endpoint, str) or endpoint in by_endpoint:
+            return "audit_transition_readback_set_mismatch"
+        by_endpoint[endpoint] = item
+    if set(by_endpoint) != set(expected):
+        return "audit_transition_readback_set_mismatch"
+    present_count = 0
+    for endpoint, publisher in expected.items():
+        item = by_endpoint[endpoint]
+        if not _readback_contract_matches(item, publisher):
+            return f"audit_transition_readback_contract_mismatch:{endpoint}"
+        present = item.get("present")
+        maps = item.get("maps")
+        item_epoch = item.get("epoch")
+        mode = item.get("mode")
+        flags = item.get("flags")
+        if not isinstance(present, bool) or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (maps, item_epoch, mode, flags)
+        ):
+            return f"audit_transition_readback_fields_invalid:{endpoint}"
+        if present:
+            if (
+                maps != len(publisher.services)
+                or item_epoch != epoch
+                or mode != _MODE_VALUES["bypass"]
+                or flags != _COMMITTED_FLAG
+            ):
+                return f"audit_transition_readback_not_bypass:{endpoint}"
+            present_count += 1
+        elif (maps, item_epoch, mode, flags) != (0, 0, 0, 0):
+            return f"audit_transition_absent_readback_not_zero:{endpoint}"
+    if present_count == 0:
+        return "audit_transition_has_no_present_readback"
+    return ""
+
+
+def _assess_transition_records(
+    records: Sequence[tuple[dict[str, Any], int, int]],
+    config: CoordinatorConfig,
+    server_id: str,
+    port_id: str,
+    source_host: str,
+    after_epoch: int,
+) -> _TransitionWaitAssessment:
+    expected_reason = (
+        f"migration_transition:{server_id}:{port_id}:{source_host}"
+    )
+    last_reason = "audit_has_no_matching_transition"
+    forced_outcomes = {
+        "migration_forced_bypass",
+        "gate_changed_bypass_recovered",
+    }
+    accepted_outcomes = forced_outcomes | {"migration_frozen_in_bypass"}
+    for record, byte_start, byte_end in records:
+        gate = record.get("gate")
+        if not isinstance(gate, dict) or (
+            gate.get("action"), gate.get("reason")
+        ) != ("freeze", expected_reason):
+            continue
+        outcome = record.get("outcome")
+        if outcome not in accepted_outcomes:
+            last_reason = "audit_transition_outcome_invalid"
+            continue
+        state = record.get("state")
+        if not isinstance(state, dict):
+            last_reason = "audit_transition_state_invalid"
+            continue
+        epoch = state.get("epoch")
+        if (
+            state.get("mode") != "bypass"
+            or state.get("known") is not True
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch <= after_epoch
+            or record.get("effective_mode") != "bypass"
+        ):
+            last_reason = "audit_transition_state_not_fresh_known_bypass"
+            continue
+        if outcome in forced_outcomes:
+            proof_error = _forced_transition_proof_error(
+                record, config, epoch
+            )
+            if proof_error:
+                last_reason = proof_error
+                continue
+        return _TransitionWaitAssessment(
+            True,
+            "transition_observed",
+            byte_start,
+            byte_end,
+            outcome,
+            epoch,
+        )
+    return _TransitionWaitAssessment(False, last_reason)
+
+
+def _run_wait_transition(
+    config: CoordinatorConfig,
+    audit_log: Path,
+    after_offset: int,
+    audit_device: int,
+    audit_inode: int,
+    server_id: str,
+    port_id: str,
+    source_host: str,
+    after_epoch: int,
+    timeout: float,
+    interval: float,
+) -> int:
+    deadline = time.monotonic() + timeout
+    last = _TransitionWaitAssessment(False, "not_checked")
+    while True:
+        try:
+            records = _read_audit_after_offset(
+                audit_log,
+                after_offset,
+                audit_device,
+                audit_inode,
+            )
+        except FileNotFoundError:
+            last = _TransitionWaitAssessment(False, "audit_log_missing")
+        else:
+            last = _assess_transition_records(
+                records,
+                config,
+                server_id,
+                port_id,
+                source_host,
+                after_epoch,
+            )
+        if last.ready:
+            print(
+                json.dumps(
+                    {
+                        "ready": True,
+                        "outcome": last.outcome,
+                        "epoch": last.epoch,
+                        "matched_byte_start": last.matched_byte_start,
+                        "matched_byte_end": last.matched_byte_end,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                "openstack_epoch_coordinator: wait-transition timeout: "
+                f"{last.reason}",
+                file=sys.stderr,
+            )
+            return 1
+        time.sleep(min(interval, remaining))
 
 
 def _readback_contract_matches(
@@ -1705,28 +2051,61 @@ def _assess_committed_audit(
             last_reason = "audit_shutdown_proof_missing"
             continue
         outcome = record.get("outcome")
+        shutdown_forced_bypass = (
+            require_shutdown
+            and target_mode == "bypass"
+            and outcome
+            in {"fail_safe_bypass_published", "migration_forced_bypass"}
+        )
+        shutdown_migration_bypass = (
+            shutdown_forced_bypass and outcome == "migration_forced_bypass"
+        )
         bypass_rebase = (
             target_mode == "bypass" and outcome == "policy_unchanged"
         )
-        if outcome != "policy_published" and not bypass_rebase:
+        if (
+            outcome != "policy_published"
+            and not bypass_rebase
+            and not shutdown_forced_bypass
+        ):
             last_reason = "audit_outcome_not_policy_published"
             continue
-        if (
-            record.get("requested_mode") != target_mode
-            or record.get("effective_mode") != target_mode
-            or record.get("exit_code") != 0
-        ):
-            last_reason = "audit_publication_result_mismatch"
-            continue
-        desired_input_error = record.get("desired_input_error")
-        desired_error_present = (
-            desired_input_error not in (None, "")
-            if require_shutdown
-            else desired_input_error != ""
-        )
-        if desired_error_present or record.get("state_input_error") != "":
-            last_reason = "audit_input_error_present"
-            continue
+        if shutdown_forced_bypass:
+            if (
+                record.get("requested_mode") != "bypass"
+                or record.get("effective_mode") != "bypass"
+                or record.get("exit_code") != 2
+            ):
+                last_reason = "audit_shutdown_fail_safe_result_mismatch"
+                continue
+            desired_input_error = record.get("desired_input_error")
+            state_input_error = record.get("state_input_error")
+            invalid_inputs = (
+                desired_input_error not in (None, "")
+                or not isinstance(state_input_error, str)
+            )
+            if shutdown_migration_bypass:
+                invalid_inputs = invalid_inputs or state_input_error != ""
+            if invalid_inputs:
+                last_reason = "audit_shutdown_fail_safe_input_invalid"
+                continue
+        else:
+            if (
+                record.get("requested_mode") != target_mode
+                or record.get("effective_mode") != target_mode
+                or record.get("exit_code") != 0
+            ):
+                last_reason = "audit_publication_result_mismatch"
+                continue
+            desired_input_error = record.get("desired_input_error")
+            desired_error_present = (
+                desired_input_error not in (None, "")
+                if require_shutdown
+                else desired_input_error != ""
+            )
+            if desired_error_present or record.get("state_input_error") != "":
+                last_reason = "audit_input_error_present"
+                continue
         if (
             state.get("mode") != target_mode
             or not audit_known
@@ -1741,7 +2120,36 @@ def _assess_committed_audit(
                 last_reason = rebase_error
                 continue
         gate = record.get("gate")
-        if not isinstance(gate, dict) or (
+        if shutdown_forced_bypass:
+            gate_reason = gate.get("reason") if isinstance(gate, dict) else None
+            expected_gate_action = (
+                "freeze" if shutdown_migration_bypass else "bypass"
+            )
+            if (
+                not isinstance(gate, dict)
+                or gate.get("action") != expected_gate_action
+                or gate.get("force_bypass") is not True
+                or not isinstance(gate_reason, str)
+                or not gate_reason.strip()
+            ):
+                last_reason = "audit_shutdown_fail_safe_gate_invalid"
+                continue
+            if shutdown_migration_bypass:
+                parts = gate_reason.split(":")
+                required_pairs = {
+                    (item.server_id, item.port_id)
+                    for item in config.required_endpoints
+                }
+                source_names = {item.name for item in config.state_sources}
+                if (
+                    len(parts) != 4
+                    or parts[0] != "migration_transition"
+                    or (parts[1], parts[2]) not in required_pairs
+                    or parts[3] not in source_names
+                ):
+                    last_reason = "audit_shutdown_fail_safe_gate_invalid"
+                    continue
+        elif not isinstance(gate, dict) or (
             gate.get("action"), gate.get("reason")
         ) != ("publish", "all_required_endpoints_healthy"):
             last_reason = "audit_gate_not_healthy_publish"
@@ -1930,6 +2338,32 @@ def main() -> int:
     args = _parser().parse_args()
     try:
         config = load_config(args.config)
+        if args.command == "wait-transition":
+            if args.after_offset < 0:
+                raise CoordinatorError("after-offset must be non-negative")
+            if args.audit_device < 0 or args.audit_inode < 0:
+                raise CoordinatorError(
+                    "audit-device and audit-inode must be non-negative"
+                )
+            if args.after_epoch < 0:
+                raise CoordinatorError("after-epoch must be non-negative")
+            if args.timeout <= 0:
+                raise CoordinatorError("timeout must be positive")
+            if args.interval <= 0:
+                raise CoordinatorError("interval must be positive")
+            return _run_wait_transition(
+                config,
+                args.audit_log,
+                args.after_offset,
+                args.audit_device,
+                args.audit_inode,
+                args.server_id,
+                args.port_id,
+                _short_host(args.source_host),
+                args.after_epoch,
+                args.timeout,
+                args.interval,
+            )
         if args.command == "wait-committed":
             target_mode = _normalize_mode(args.target_mode)
             if args.after_epoch < 0:
@@ -1973,10 +2407,16 @@ def main() -> int:
             return result.exit_code
         if args.interval <= 0:
             raise CoordinatorError("interval must be positive")
+        if args.shutdown_timeout_seconds <= 0:
+            raise CoordinatorError("shutdown timeout seconds must be positive")
         stopping = threading.Event()
 
         def request_stop(_signum: int, _frame: Any) -> None:
-            stopping.set()
+            if not stopping.is_set():
+                coordinator.request_shutdown(
+                    time.monotonic() + args.shutdown_timeout_seconds
+                )
+                stopping.set()
 
         signal.signal(signal.SIGINT, request_stop)
         signal.signal(signal.SIGTERM, request_stop)
@@ -2124,6 +2564,7 @@ def _command_list(value: Any, name: str) -> tuple[str, ...]:
 def _validate_publisher_command(
     name: str,
     host: str,
+    ssh_destination: str,
     port_id: str,
     command: Sequence[str],
     policy_lock_root: PurePosixPath,
@@ -2171,6 +2612,10 @@ def _validate_publisher_command(
         if PurePosixPath(argument).name == "cache_policy_txn"
     )
     if first == "cache_policy_txn":
+        if ssh_destination:
+            raise CoordinatorError(
+                f"local publisher {name} must not set a remote ssh destination"
+            )
         if transaction_index != 0:
             raise CoordinatorError(
                 f"publisher {name} has an invalid local transaction command"
@@ -2220,9 +2665,15 @@ def _validate_publisher_command(
         raise CoordinatorError(
             f"remote publisher {name} must pin the ed25519 host-key algorithm"
         )
-    if _short_host(command[9]) != host:
+    destination_matches = (
+        command[9] == ssh_destination
+        if ssh_destination
+        else _short_host(command[9]) == host
+    )
+    if not destination_matches:
         raise CoordinatorError(
-            f"remote publisher {name} ssh destination must match its host"
+            f"remote publisher {name} ssh destination must match its "
+            "configured ssh_destination"
         )
     if (
         PurePosixPath(command[10]).name != "sudo"
