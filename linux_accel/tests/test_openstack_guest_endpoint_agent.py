@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import io
 import json
 import os
@@ -7,7 +8,7 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 try:
     import fcntl
@@ -275,6 +276,38 @@ class ConfigTest(unittest.TestCase):
                 load_endpoint_config(path)
 
 
+class DeploymentUnitTest(unittest.TestCase):
+    def test_guest_unit_keeps_cli_shutdown_budget_below_systemd_timeout(self):
+        unit = (
+            Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "systemd"
+            / "vnet-dataplane-guest-endpoint.service"
+        ).read_text(encoding="utf-8")
+        shutdown_budget = float(
+            next(
+                line.rsplit("=", 1)[1]
+                for line in unit.splitlines()
+                if line.startswith(
+                    "Environment=VNET_GUEST_SHUTDOWN_TIMEOUT="
+                )
+            )
+        )
+        systemd_timeout = float(
+            next(
+                line.split("=", 1)[1]
+                for line in unit.splitlines()
+                if line.startswith("TimeoutStopSec=")
+            )
+        )
+
+        self.assertIn(
+            "--shutdown-timeout-seconds ${VNET_GUEST_SHUTDOWN_TIMEOUT}",
+            unit,
+        )
+        self.assertLess(shutdown_budget, systemd_timeout)
+
+
 class CommandGenerationTest(unittest.TestCase):
     def test_client_only_builds_userspace_grpc_fast_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -357,6 +390,91 @@ class SystemDriverCommandTest(unittest.TestCase):
                 tool_paths(),
                 paths,
             )
+
+    def test_shutdown_deadline_clamps_external_command_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = endpoint_paths(Path(temp))
+
+            class Runner:
+                def __init__(self):
+                    self.calls = []
+
+                def run(self, args, timeout=10):
+                    self.calls.append((list(args), timeout))
+                    return CommandResult(0, "[{}]")
+
+            runner = Runner()
+            with patch.object(SystemEndpointDriver, "_validate_inputs"):
+                driver = SystemEndpointDriver(
+                    endpoint_config("client"),
+                    tool_paths(),
+                    paths,
+                    runner=runner,
+                )
+            driver.begin_shutdown(105.0)
+
+            with patch(
+                "agent.openstack_guest_endpoint_agent.time.monotonic",
+                return_value=100.0,
+            ):
+                self.assertEqual(driver.current_xdp_program_id("ens3"), 0)
+
+        self.assertEqual(runner.calls[0][1], 5.0)
+
+    def test_expired_shutdown_deadline_refuses_external_command(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = endpoint_paths(Path(temp))
+            runner = Mock()
+            with patch.object(SystemEndpointDriver, "_validate_inputs"):
+                driver = SystemEndpointDriver(
+                    endpoint_config("client"),
+                    tool_paths(),
+                    paths,
+                    runner=runner,
+                )
+            driver.begin_shutdown(99.0)
+
+            with (
+                patch(
+                    "agent.openstack_guest_endpoint_agent.time.monotonic",
+                    return_value=100.0,
+                ),
+                self.assertRaisesRegex(
+                    GuestEndpointError, "shutdown deadline expired"
+                ),
+            ):
+                driver.current_xdp_program_id("ens3")
+
+        runner.run.assert_not_called()
+
+    def test_expired_shutdown_deadline_stops_waiting_for_policy_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            paths = endpoint_paths(Path(temp))
+            driver = self._driver(paths)
+            driver.begin_shutdown(99.0)
+            blocked_fcntl = Mock()
+            blocked_fcntl.LOCK_EX = 1
+            blocked_fcntl.LOCK_NB = 2
+            blocked_fcntl.flock.side_effect = BlockingIOError(
+                errno.EAGAIN, "policy lock busy"
+            )
+
+            with (
+                patch(
+                    "agent.openstack_guest_endpoint_agent.fcntl",
+                    blocked_fcntl,
+                ),
+                patch(
+                    "agent.openstack_guest_endpoint_agent.time.monotonic",
+                    return_value=100.0,
+                ),
+                self.assertRaisesRegex(
+                    GuestEndpointError, "expired waiting for policy lock"
+                ),
+            ):
+                driver.enter_quiesce()
+
+            self.assertFalse(paths.quiesce_file.exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX mode bits are required")
     def test_enter_quiesce_rejects_world_writable_lock_root(self):
