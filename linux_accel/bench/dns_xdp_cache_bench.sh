@@ -28,6 +28,7 @@ cleanup() {
   run_sudo pkill -f "/tmp/dns_xdp_cache_stub.py" >/dev/null 2>&1 || true
   run_sudo ip netns del "${netns}" >/dev/null 2>&1 || true
   run_sudo ip link del "${srv_if}" >/dev/null 2>&1 || true
+  rm -f /tmp/dns_xdp_cache_protocol_guard.py
 }
 
 run_sudo() {
@@ -153,6 +154,68 @@ while True:
 PY
 }
 
+write_protocol_guard() {
+  local qbytes="$1"
+  cat > /tmp/dns_xdp_cache_protocol_guard.py <<PY
+import socket
+
+server = "${srv_ip}"
+client = "${cli_ip}"
+question = bytes([${qbytes}])
+answer_ip = bytes(int(part) for part in "${answer_ip}".split("."))
+
+
+def is_xdp_cache_response(payload, query, dns_id):
+    return (
+        len(payload) == len(query) + 16
+        and payload[:2] == dns_id.to_bytes(2, "big")
+        and payload[2:4] == bytes([0x81, 0x80])
+        and payload[4:8] == bytes([0x00, 0x01, 0x00, 0x01])
+        and payload[12:12 + len(question)] == question
+        and payload[-16:-10] == bytes([0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01])
+        and payload[-6:-4] == bytes([0x00, 0x04])
+        and payload[-4:] == answer_ip
+    )
+
+
+def expect_no_cache_response(name, source_port, destination_port, flags, dns_id):
+    query = (
+        dns_id.to_bytes(2, "big")
+        + flags.to_bytes(2, "big")
+        + bytes([0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        + question
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(0.25)
+    sock.bind((client, source_port))
+    try:
+        sock.sendto(query, (server, destination_port))
+        try:
+            payload, peer = sock.recvfrom(512)
+        except socket.timeout:
+            print(f"{name}=pass")
+            return
+        if is_xdp_cache_response(payload, query, dns_id):
+            raise SystemExit(
+                f"{name}=fail unexpected_xdp_cache_response_from={peer}"
+            )
+        # Fail-open traffic is allowed to reach an existing DNS backend.  A
+        # backend rejection/response is not an XDP cache hit and is therefore
+        # a valid result for this integration guard.
+        print(f"{name}=pass backend_response_bytes={len(payload)}")
+    finally:
+        sock.close()
+
+
+# A packet sourced from UDP/53 is not a DNS server query when its destination
+# is another port. It must never trigger the cache response path.
+expect_no_cache_response("wrong_destination_port", 53, 5300, 0x0100, 0x7101)
+
+# The cache currently supports only standard QUERY (opcode 0).
+expect_no_cache_response("non_query_opcode", 0, 53, 0x1100, 0x7102)
+PY
+}
+
 extract_dnsperf() {
   awk '
     /Queries sent:/ { sent=$3 }
@@ -174,6 +237,7 @@ need_cmd dnsperf
 need_cmd gcc
 need_cmd ip
 need_cmd awk
+need_cmd python3
 
 mkdir -p "${out_dir}"
 trap cleanup EXIT
@@ -182,6 +246,7 @@ cleanup
 qbytes="$(qname_bytes_csv "${domain}")"
 write_latency_bench "${qbytes}"
 write_stub
+write_protocol_guard "${qbytes}"
 printf '%s A\n' "${domain}" > "${out_dir}/queries.txt"
 printf '%s %s %s\n' "${domain}" "${answer_ip}" "${ttl}" > "${out_dir}/cache.txt"
 
@@ -213,6 +278,8 @@ fi
 monitor_pid=$!
 popd >/dev/null
 sleep 1
+run_sudo ip netns exec "${netns}" python3 /tmp/dns_xdp_cache_protocol_guard.py \
+  > "${out_dir}/protocol-guard.log"
 run_sudo ip netns exec "${netns}" dnsperf -s "${srv_ip}" -p 53 -d "${out_dir}/queries.txt" -l "${duration}" -q 100 -T 2 -c 10 -t 1 > "${out_dir}/xdp-dnsperf.log" 2>&1
 run_sudo ip netns exec "${netns}" /tmp/dns_xdp_cache_latency_bench "${srv_ip}" "${latency_count}" "${latency_warmup}" > "${out_dir}/xdp-latency.log"
 run_sudo pkill -TERM -f "dns_monitor --dev ${srv_if}" >/dev/null 2>&1 || true
@@ -227,6 +294,14 @@ xdp_qps="$(echo "${xdp_dnsperf}" | tr ' ' '\n' | awk -F= '$1=="qps"{print $2}')"
 userspace_p99="$(extract_field p99_us "${out_dir}/userspace-latency.log")"
 xdp_p99="$(extract_field p99_us "${out_dir}/xdp-latency.log")"
 cache_line="$(grep -E 'cache_hit|cache_tx' "${out_dir}/xdp-monitor.log" | tail -1 || true)"
+cache_hit="$(tr ' ' '\n' <<< "${cache_line}" | awk -F= '$1 == "cache_hit" { print $2; exit }')"
+cache_tx="$(tr ' ' '\n' <<< "${cache_line}" | awk -F= '$1 == "cache_tx" { print $2; exit }')"
+
+if [[ -z "${cache_hit}" || -z "${cache_tx}" ]] ||
+   (( cache_hit < 1 || cache_tx < 1 )); then
+  echo "XDP cache path was not observed: cache_hit=${cache_hit:-missing} cache_tx=${cache_tx:-missing}" >&2
+  exit 1
+fi
 
 qps_speedup="$(awk -v x="${xdp_qps}" -v u="${userspace_qps}" 'BEGIN { if (u > 0) printf "%.2f", x / u; else print "0.00" }')"
 p99_speedup="$(awk -v x="${xdp_p99}" -v u="${userspace_p99}" 'BEGIN { if (x > 0) printf "%.2f", u / x; else print "0.00" }')"
@@ -248,6 +323,8 @@ userspace dnsperf: ${userspace_dnsperf}
 xdp dnsperf: ${xdp_dnsperf}
 
 xdp cache metrics: ${cache_line}
+
+protocol guard: $(tr '\n' ' ' < "${out_dir}/protocol-guard.log")
 MD
 
 cat "${out_dir}/summary.md"

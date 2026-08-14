@@ -3,8 +3,8 @@
 
 The backend keeps the original single-name behavior and also understands the
 synthetic corpus prefixes emitted by generate_openstack_dns_corpus.py.  This
-lets one offline VM serve repeatable A, AAAA, CNAME, NXDOMAIN, short-TTL and
-truncated-response traffic without depending on the public Internet.
+lets one offline VM serve repeatable A, AAAA, HTTPS, CNAME, NXDOMAIN, short-TTL
+and truncated-response traffic without depending on the public Internet.
 """
 
 import argparse
@@ -128,6 +128,10 @@ def main():
     encode_question(domain)
     answer_ipv4 = socket.inet_aton(args.answer)
     answer_ipv6 = socket.inet_pton(socket.AF_INET6, "2001:db8::123")
+    # A deliberately small HTTPS RR (priority 1, root target, no SvcParams).
+    # It exercises the narrow single-answer HTTPS path without pretending that
+    # the benchmark is a full HTTPS/SVCB resolver implementation.
+    answer_https = b"\x00\x01\x00"
     counters = {
         "requests": 0,
         "responses": 0,
@@ -138,8 +142,15 @@ def main():
         "warm_a": 0,
         "cold_a": 0,
         "aaaa": 0,
+        "https": 0,
+        "ptr": 0,
+        "ns": 0,
+        "other": 0,
         "cname": 0,
         "nxdomain": 0,
+        "servfail": 0,
+        "notimp": 0,
+        "empty_noerror": 0,
         "edns": 0,
         "truncated": 0,
         "unsupported": 0,
@@ -196,7 +207,22 @@ def main():
             counters["edns"] += 1
 
         response = None
-        if qclass == 1 and qtype == 1 and qname == domain:
+        if is_under_domain and first_label.startswith("nxd-"):
+            counters["invalid"] += 1
+            counters["nxdomain"] += 1
+            response = make_response(data, question, normal_flags | 3)
+        elif is_under_domain and first_label.startswith("servfail-"):
+            counters["invalid"] += 1
+            counters["servfail"] += 1
+            response = make_response(data, question, normal_flags | 2)
+        elif is_under_domain and first_label.startswith("notimp-"):
+            counters["invalid"] += 1
+            counters["notimp"] += 1
+            response = make_response(data, question, normal_flags | 4)
+        elif is_under_domain and first_label.startswith("empty-"):
+            counters["empty_noerror"] += 1
+            response = make_response(data, question, normal_flags)
+        elif qclass == 1 and qtype == 1 and qname == domain:
             counters["root_a"] += 1
             answer = resource_record(owner_pointer, 1, args.ttl, answer_ipv4)
             response = make_response(data, question, normal_flags, (answer,))
@@ -217,6 +243,23 @@ def main():
             counters["aaaa"] += 1
             answer = resource_record(owner_pointer, 28, args.ttl, answer_ipv6)
             response = make_response(data, question, normal_flags, (answer,))
+        elif qclass == 1 and qtype == 65 and is_under_domain and first_label.startswith("https-"):
+            counters["https"] += 1
+            answer = resource_record(owner_pointer, 65, args.ttl, answer_https)
+            response = make_response(data, question, normal_flags, (answer,))
+        elif qclass == 1 and qtype == 12 and is_under_domain and first_label.startswith("ptr-"):
+            counters["ptr"] += 1
+            answer = resource_record(owner_pointer, 12, args.ttl, encode_name(domain))
+            response = make_response(data, question, normal_flags, (answer,))
+        elif qclass == 1 and qtype == 2 and is_under_domain and first_label.startswith("ns-"):
+            counters["ns"] += 1
+            answer = resource_record(owner_pointer, 2, args.ttl, encode_name(f"ns1.{domain}"))
+            response = make_response(data, question, normal_flags, (answer,))
+        elif qclass == 1 and qtype == 16 and is_under_domain and first_label.startswith("other-"):
+            counters["other"] += 1
+            text = b"radar-other"
+            answer = resource_record(owner_pointer, 16, args.ttl, bytes([len(text)]) + text)
+            response = make_response(data, question, normal_flags, (answer,))
         elif qclass == 1 and qtype == 1 and is_under_domain and first_label.startswith("cname-"):
             counters["cname"] += 1
             target = encode_name(domain)
@@ -225,10 +268,6 @@ def main():
             response = make_response(
                 data, question, normal_flags, (cname_answer, a_answer)
             )
-        elif is_under_domain and first_label.startswith("nxd-"):
-            counters["invalid"] += 1
-            counters["nxdomain"] += 1
-            response = make_response(data, question, normal_flags | 3)
         elif is_under_domain and first_label.startswith("large-"):
             counters["truncated"] += 1
             response = make_response(data, question, normal_flags | 0x0200)

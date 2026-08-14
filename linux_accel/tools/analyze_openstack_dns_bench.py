@@ -142,6 +142,12 @@ def parse_case(case_dir):
         "xdp_learn_rejected": numeric_delta(
             bpf_before, bpf_after, "learn_rejected"
         ),
+        "xdp_unsupported": numeric_delta(
+            bpf_before, bpf_after, "unsupported"
+        ),
+        "xdp_egress_no_pending": numeric_delta(
+            bpf_before, bpf_after, "egress_no_pending"
+        ),
         "node1_geneve_packets": interface_packet_delta(
             node1_before, node1_after, "genev_sys_6081"
         ),
@@ -192,6 +198,8 @@ def write_csv(path, rows):
         "xdp_cache_tx",
         "xdp_cache_learned",
         "xdp_learn_rejected",
+        "xdp_unsupported",
+        "xdp_egress_no_pending",
         "geneve_packets",
         "tap_drop_errors",
         "softnet_drops",

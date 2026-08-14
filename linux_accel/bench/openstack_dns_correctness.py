@@ -7,7 +7,7 @@ import socket
 import struct
 
 
-QTYPE = {"A": 1, "CNAME": 5, "TXT": 16, "AAAA": 28}
+QTYPE = {"A": 1, "CNAME": 5, "TXT": 16, "AAAA": 28, "HTTPS": 65}
 
 
 def encode_name(name):
@@ -62,6 +62,7 @@ def main():
         ("warm_a", f"warm-00001.{suffix}", "A", 0, 1, False),
         ("cold_a", f"cold-999999.{suffix}", "A", 0, 1, False),
         ("aaaa", f"v6-0001.{suffix}", "AAAA", 0, 1, False),
+        ("https", f"https-0001.{suffix}", "HTTPS", 0, 1, False),
         ("nxdomain", f"nxd-99999.{suffix}", "A", 3, 0, False),
         ("cname", f"cname-0001.{suffix}", "A", 0, 2, False),
         ("truncated", f"large-99999.{suffix}", "TXT", 0, 0, True),
@@ -86,6 +87,8 @@ def main():
             )
             if qtype == "A" and rcode == 0 and label != "cname":
                 passed = passed and expected_a in result["wire"]
+            if label == "https" and rcode == 0:
+                passed = passed and b"\x00\x01\x00" in result["wire"]
             results.append(
                 {
                     "case": label,

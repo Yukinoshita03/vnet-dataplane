@@ -7,6 +7,11 @@ sudo_pass="${SUDO_PASS:-}"
 duration="${DURATION:-5}"
 grpc_port="${GRPC_PORT:-50051}"
 iface_list="${IFACES:-br-int br-ex ens33}"
+monitor_bin_dir="${MONITOR_BIN_DIR:-${repo_dir}/build}"
+dns_monitor_bin="${DNS_MONITOR_BIN:-${monitor_bin_dir}/dns_monitor}"
+dns_monitor_bpf="${DNS_MONITOR_BPF:-${monitor_bin_dir}/dns_monitor.bpf.o}"
+grpc_monitor_bin="${GRPC_MONITOR_BIN:-${monitor_bin_dir}/grpc_monitor}"
+grpc_monitor_bpf="${GRPC_MONITOR_BPF:-${monitor_bin_dir}/grpc_monitor.bpf.o}"
 
 run_sudo() {
   if [[ -n "${sudo_pass}" ]]; then
@@ -62,10 +67,10 @@ extract_status() {
 
 mkdir -p "${out_dir}"
 
-need_file "${repo_dir}/build/dns_monitor"
-need_file "${repo_dir}/build/dns_monitor.bpf.o"
-need_file "${repo_dir}/build/grpc_monitor"
-need_file "${repo_dir}/build/grpc_monitor.bpf.o"
+need_file "${dns_monitor_bin}"
+need_file "${dns_monitor_bpf}"
+need_file "${grpc_monitor_bin}"
+need_file "${grpc_monitor_bpf}"
 command -v timeout >/dev/null
 
 iface="$(choose_iface || true)"
@@ -77,10 +82,10 @@ fi
 ip -br link show "${iface}" > "${out_dir}/iface.log" 2>&1 || true
 run_sudo tc qdisc show dev "${iface}" > "${out_dir}/tc-before.log" 2>&1 || true
 
-run_monitor dns_tc "${repo_dir}/build/dns_monitor" --dev "${iface}" --hook tc --timeout-ms 1000
+run_monitor dns_tc "${dns_monitor_bin}" --dev "${iface}" --hook tc --timeout-ms 1000
 run_sudo tc qdisc show dev "${iface}" > "${out_dir}/tc-after-dns.log" 2>&1 || true
 
-run_monitor grpc_tc "${repo_dir}/build/grpc_monitor" --dev "${iface}" --port "${grpc_port}" --timeout-ms 1000
+run_monitor grpc_tc "${grpc_monitor_bin}" --dev "${iface}" --port "${grpc_port}" --timeout-ms 1000
 run_sudo tc qdisc show dev "${iface}" > "${out_dir}/tc-after-grpc.log" 2>&1 || true
 
 dns_status="$(extract_status "${out_dir}/dns_tc.log")"

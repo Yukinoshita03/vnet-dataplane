@@ -26,6 +26,8 @@ CACHE_STATS = (
     "cache_learned",
     "learn_rejected",
     "pending_expired",
+    "unsupported",
+    "egress_no_pending",
 )
 
 

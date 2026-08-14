@@ -9,6 +9,7 @@ qga_exec_tool="${repo_root}/tools/openstack_qga_exec.sh"
 qga_copy_tool="${repo_root}/tools/openstack_qga_copy_to.sh"
 artifact_dir="${1:?usage: $0 ARTIFACT_DIR [quick|full]}"
 profile="${2:-quick}"
+corpus_profile="${CORPUS_PROFILE:-top3}"
 
 client_instance="instance-0000000f"
 backend_instance="instance-00000012"
@@ -231,13 +232,13 @@ host_before, host_after = load(host_before_path), load(host_after_path)
 if not result.get("passed"):
     raise SystemExit("DNS correctness failed")
 backend_delta = backend_after["requests"] - backend_before["requests"]
-if mode == "no_hook" and backend_delta != 18:
-    raise SystemExit(f"baseline correctness expected 18 backend requests, saw {backend_delta}")
+if mode == "no_hook" and backend_delta != 20:
+    raise SystemExit(f"baseline correctness expected 20 backend requests, saw {backend_delta}")
 if mode == "tap_xdp":
     before = host_before.get("bpf", {})
     after = host_after.get("bpf", {})
     tx_delta = after.get("cache_tx", 0) - before.get("cache_tx", 0)
-    if tx_delta < 4 or backend_delta >= 18:
+    if tx_delta < 5 or backend_delta >= 20:
         raise SystemExit(f"XDP correctness did not prove offload: tx={tx_delta} backend={backend_delta}")
 print(f"correctness mode={mode} backend_delta={backend_delta} passed=true")
 PY
@@ -344,7 +345,7 @@ manifest_local="${artifact_dir}/corpus-manifest.json"
 if [ ! -s "${query_local}" ]; then
   python3 "${repo_root}/tools/generate_openstack_dns_corpus.py" \
     --output "${query_local}" --manifest "${manifest_local}" \
-    --lines 50000 --seed 20260805
+    --lines 50000 --seed 20260805 --profile "${corpus_profile}"
 fi
 
 run_openstack_status "${artifact_dir}/health/openstack-before.txt" || true
@@ -382,6 +383,7 @@ backend_guest 'systemctl is-active linux-accel-openstack-dns-backend.service; py
 {
   echo "run_id=${run_id}"
   echo "profile=${profile}"
+  echo "corpus_profile=${corpus_profile}"
   echo "rates=${rates[*]}"
   echo "scan_duration=${scan_duration}"
   echo "steady_duration=${steady_duration}"

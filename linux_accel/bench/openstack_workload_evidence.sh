@@ -20,6 +20,9 @@ client_timeout="${CLIENT_TIMEOUT:-1.0}"
 traffic_cmd="${OPENSTACK_TRAFFIC_CMD:-}"
 target_ip="${OPENSTACK_TARGET_IP:-}"
 openrc="${OPENRC:-/opt/stack/devstack/openrc}"
+monitor_bin_dir="${MONITOR_BIN_DIR:-${repo_dir}/build}"
+dns_monitor_bin="${DNS_MONITOR_BIN:-${monitor_bin_dir}/dns_monitor}"
+grpc_monitor_bin="${GRPC_MONITOR_BIN:-${monitor_bin_dir}/grpc_monitor}"
 
 run_sudo() {
   if [[ -n "${sudo_pass}" ]]; then
@@ -217,7 +220,7 @@ run_fallback_workload() {
   fi
   sleep 1
   local dns_pid
-  dns_pid="$(start_monitor dns-monitor "${repo_dir}/build/dns_monitor" --dev "${workload_iface}" --hook tc --timeout-ms 1000)"
+  dns_pid="$(start_monitor dns-monitor "${dns_monitor_bin}" --dev "${workload_iface}" --hook tc --timeout-ms 1000)"
   sleep 1
   run_sudo ip netns exec "${netns}" python3 "${out_dir}/openstack_workload_client.py" dns "${srv_ip}" "${requests}" "${warmup}" "${dns_domain}" "${client_timeout}" > "${out_dir}/dns-client.log" || true
   run_sudo pkill -TERM -f "dns_monitor --dev ${workload_iface}" >/dev/null 2>&1 || true
@@ -231,7 +234,7 @@ run_fallback_workload() {
   fi
   sleep 1
   local grpc_pid
-  grpc_pid="$(start_monitor grpc-monitor "${repo_dir}/build/grpc_monitor" --dev "${workload_iface}" --port "${grpc_port}" --timeout-ms 1000)"
+  grpc_pid="$(start_monitor grpc-monitor "${grpc_monitor_bin}" --dev "${workload_iface}" --port "${grpc_port}" --timeout-ms 1000)"
   sleep 1
   run_sudo ip netns exec "${netns}" python3 "${out_dir}/openstack_workload_client.py" tcp "${srv_ip}" "${requests}" "${warmup}" "${grpc_port}" "${client_timeout}" > "${out_dir}/grpc-client.log" || true
   run_sudo pkill -TERM -f "grpc_monitor --dev ${workload_iface}" >/dev/null 2>&1 || true
@@ -243,8 +246,8 @@ run_external_workload() {
   workload_mode="external-openstack-workload"
   workload_iface="${openstack_iface}"
   local dns_pid grpc_pid
-  dns_pid="$(start_monitor dns-monitor "${repo_dir}/build/dns_monitor" --dev "${workload_iface}" --hook tc --timeout-ms 1000)"
-  grpc_pid="$(start_monitor grpc-monitor "${repo_dir}/build/grpc_monitor" --dev "${workload_iface}" --port "${grpc_port}" --timeout-ms 1000)"
+  dns_pid="$(start_monitor dns-monitor "${dns_monitor_bin}" --dev "${workload_iface}" --hook tc --timeout-ms 1000)"
+  grpc_pid="$(start_monitor grpc-monitor "${grpc_monitor_bin}" --dev "${workload_iface}" --port "${grpc_port}" --timeout-ms 1000)"
   sleep 1
   if [[ -n "${target_ip}" ]]; then
     python3 "${out_dir}/openstack_workload_client.py" dns "${target_ip}" "${requests}" "${warmup}" "${dns_domain}" "${client_timeout}" > "${out_dir}/dns-client.log" || true
@@ -263,8 +266,8 @@ run_external_workload() {
 need_cmd ip
 need_cmd python3
 need_cmd awk
-if [[ ! -x "${repo_dir}/build/dns_monitor" || ! -x "${repo_dir}/build/grpc_monitor" ]]; then
-  echo "missing monitor binaries; run ./scripts/build_linux.sh first" >&2
+if [[ ! -x "${dns_monitor_bin}" || ! -x "${grpc_monitor_bin}" ]]; then
+  echo "missing monitor binaries under ${monitor_bin_dir}; build or stage a Linux release first" >&2
   exit 1
 fi
 
