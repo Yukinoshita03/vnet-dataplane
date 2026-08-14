@@ -97,6 +97,15 @@ void handle_signal(int)
     exiting = 1;
 }
 
+bool install_signal_handler(int signal_number)
+{
+    struct sigaction action = {};
+    action.sa_handler = handle_signal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    return sigaction(signal_number, &action, nullptr) == 0;
+}
+
 uint64_t hash_grpc_method(const std::string &method)
 {
     uint64_t hash = 1469598103934665603ull;
@@ -397,7 +406,7 @@ bool send_all(int fd, const std::vector<uint8_t> &data)
     while (sent < data.size()) {
         ssize_t n = send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR && !exiting)
                 continue;
             return false;
         }
@@ -422,7 +431,7 @@ bool read_exact(int fd, uint8_t *buf, size_t len, std::vector<uint8_t> *copy)
     while (got < len) {
         ssize_t n = recv(fd, buf + got, len - got, 0);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR && !exiting)
                 continue;
             return false;
         }
@@ -519,7 +528,7 @@ bool fallback_to_backend(int client, const Options &options,
     while (true) {
         ssize_t n = recv(backend, buffer.data(), buffer.size(), 0);
         if (n < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR && !exiting)
                 continue;
             ok = false;
             break;
@@ -532,7 +541,7 @@ bool fallback_to_backend(int client, const Options &options,
             ssize_t m = send(client, buffer.data() + sent,
                              static_cast<size_t>(n) - sent, MSG_NOSIGNAL);
             if (m < 0) {
-                if (errno == EINTR)
+                if (errno == EINTR && !exiting)
                     continue;
                 ok = false;
                 break;
@@ -648,8 +657,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
+    if (!install_signal_handler(SIGINT) || !install_signal_handler(SIGTERM)) {
+        std::cerr << "Failed to install signal handlers: " << strerror(errno)
+                  << "\n";
+        close(listener);
+        close(map_fd);
+        return 1;
+    }
 
     ResponseCache response_cache;
     if (!options.cache_file.empty() &&
@@ -679,8 +693,10 @@ int main(int argc, char **argv)
         socklen_t peer_len = sizeof(peer);
         int client = accept(listener, reinterpret_cast<sockaddr *>(&peer), &peer_len);
         if (client < 0) {
-            if (errno == EINTR)
+            if (errno == EINTR && !exiting)
                 continue;
+            if (errno == EINTR)
+                break;
             std::cerr << "accept failed: " << strerror(errno) << "\n";
             break;
         }

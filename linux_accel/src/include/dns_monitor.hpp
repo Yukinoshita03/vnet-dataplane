@@ -10,6 +10,12 @@
 
 #include "dns_event.h"
 #include "dns_cache_config.hpp"
+#include "arp_proxy_control.hpp"
+#include "dhcp_relay_control.hpp"
+#include "interface_feed.hpp"
+#include "policy_feed.hpp"
+#include "policy_reconciler.hpp"
+#include "udp_fastpath_policy.hpp"
 
 constexpr int kRcodeCount = 16;
 constexpr int kHistoryWindows = 10;
@@ -53,17 +59,33 @@ struct Options {
     // Command-line config. hook=tc stays the default baseline.
     std::string ifname;
     std::string bpf_object;
+    std::string xdp_dispatcher_object;
+    std::string udp_bpf_object;
     std::string hook = "tc";
     std::string role = "server";
     std::string xdp_mode = "native";
+    std::string udp_policy_file;
+    bool merge_xdp = false;
     std::string cache_domain;
     std::string cache_ip;
     std::string cache_file;
+    std::string arp_policy_file;
+    std::string arp_policy_feed;
+    std::string interface_feed;
+    std::string dhcp_policy_file;
+    std::vector<TapArpPolicy> arp_policies;
+    std::vector<DhcpRelayPolicySpec> dhcp_policies;
+    std::vector<UdpFastpathPolicyEntry> udp_policies;
+    int arp_lease_seconds = 0;
+    int arp_policy_feed_uid = -1;
+    int interface_feed_uid = -1;
+    int arp_feed_startup_timeout_ms = 5000;
     std::vector<std::string> trusted_dns;
     int cache_ttl = 60;
     int max_learn_ttl = 300;
     int learn_window_ms = 2000;
     int timeout_ms = 2000;
+    bool detailed_events = false;
     bool verbose_events = false;
     double qps_spike_factor = 3.0;
     double latency_spike_factor = 3.0;
@@ -99,6 +121,8 @@ struct ReaderState {
     uint64_t last_cache_learned = 0;
     uint64_t last_cache_learn_rejected = 0;
     uint64_t last_cache_pending_expired = 0;
+    uint64_t last_cache_unsupported = 0;
+    uint64_t last_cache_egress_no_pending = 0;
     int dropped_events_fd = -1;
     int cache_stats_fd = -1;
 };

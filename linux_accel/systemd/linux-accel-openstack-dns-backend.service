@@ -1,0 +1,14 @@
+[Unit]
+Description=Linux Accel deterministic DNS backend for OpenStack benchmarks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/linux-accel/openstack-dns-backend.env
+ExecStart=/usr/bin/python3 /usr/local/libexec/linux-accel/openstack_dns_backend.py --bind ${DNS_BIND_IP} --domain ${DNS_DOMAIN} --answer ${DNS_ANSWER_IP} --ttl ${DNS_TTL} --count-file /run/linux-accel-openstack-dns-backend.json
+Restart=on-failure
+RestartSec=1s
+
+[Install]
+WantedBy=multi-user.target

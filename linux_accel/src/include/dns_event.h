@@ -5,6 +5,7 @@
 #define DNS_CACHE_QNAME_MAX 256
 #define DNS_XDP_QNAME_SCAN_MAX 64
 #define DNS_CLIENT_QNAME_MAX DNS_XDP_QNAME_SCAN_MAX
+#define DNS_CACHE_ANSWER_MAX 256
 
 enum dns_direction {
     DNS_DIR_INGRESS = 1,
@@ -22,7 +23,10 @@ enum dns_cache_stat_key {
     DNS_CACHE_STAT_LEARNED = 4,
     DNS_CACHE_STAT_LEARN_REJECTED = 5,
     DNS_CACHE_STAT_PENDING_EXPIRED = 6,
-    DNS_CACHE_STAT_COUNT = 7,
+    // Aggregate counters used when per-packet ringbuf events are disabled.
+    DNS_CACHE_STAT_UNSUPPORTED = 7,
+    DNS_CACHE_STAT_EGRESS_NO_PENDING = 8,
+    DNS_CACHE_STAT_COUNT = 9,
 };
 
 struct dns_flow_key {
@@ -58,9 +62,10 @@ struct dns_cache_key {
 };
 
 struct dns_cache_value {
-    __u32 answer_ipv4;
     __u32 ttl;
+    __u32 answer_len;
     __u64 expires_ns;
+    __u8 answer[DNS_CACHE_ANSWER_MAX];
 };
 
 struct dns_client_cache_key {
@@ -78,5 +83,9 @@ struct dns_client_pending_value {
 struct dns_client_config {
     __u64 learn_window_ns;
     __u32 max_ttl;
-    __u32 _pad;
+    __u32 detailed_events;
+};
+
+struct dns_server_config {
+    __u32 detailed_events;
 };

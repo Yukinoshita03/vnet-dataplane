@@ -148,7 +148,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             std::cout << "Installed DNS cache entry " << entry.domain
-                      << " A " << entry.ip
+                      << " qtype=" << entry.qtype << " " << entry.ip
                       << " ttl=" << entry.ttl << "\n";
         }
         close(cache_fd);
@@ -177,4 +177,3 @@ int main(int argc, char **argv)
     }
     return 0;
 }
-

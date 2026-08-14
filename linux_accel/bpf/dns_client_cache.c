@@ -8,6 +8,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "arp_proxy.h"
 #include "dns_event.h"
 #include "dns_xdp_cache_helpers.h"
 
@@ -42,6 +43,15 @@ struct {
     __type(key, struct dns_client_cache_key);
     __type(value, struct dns_cache_value);
 } dns_client_cache SEC(".maps");
+
+/* A per-CPU scratch value keeps the variable-size wire answer off the BPF
+ * stack while the tc egress learner copies it into the LRU cache. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct dns_cache_value);
+} dns_client_cache_scratch SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -117,6 +127,13 @@ static __always_inline struct dns_client_config *client_config(void)
     return bpf_map_lookup_elem(&dns_client_config, &key);
 }
 
+static __always_inline int detailed_events_enabled(void)
+{
+    struct dns_client_config *config = client_config();
+
+    return config && config->detailed_events;
+}
+
 static __always_inline void emit_dns_event(__u32 direction, __u32 ifindex,
                                             __u32 packet_len,
                                             const struct iphdr *ip,
@@ -166,7 +183,7 @@ static __always_inline int try_client_cache_response(
     __u16 new_udp_len;
     __u32 logical_packet_end_offset;
     __u32 answer_offset;
-    __u32 answer_ipv4;
+    __u32 answer_len;
     __u32 answer_ttl;
     __u64 remaining_ns;
     struct dns_flow_key flow_key = {};
@@ -183,13 +200,25 @@ static __always_inline int try_client_cache_response(
     if (ip_header_len != sizeof(*ip) || !is_trusted_dns_server(ip->daddr))
         return XDP_PASS;
 
+    old_ip_len = bpf_ntohs(ip->tot_len);
+    old_udp_len = bpf_ntohs(udp->len);
+    if (old_ip_len < ip_header_len + sizeof(*udp) + sizeof(*dns))
+        return XDP_PASS;
+    if (old_udp_len != old_ip_len - ip_header_len)
+        return XDP_PASS;
+
     cache_key.resolver_ipv4 = ip->daddr;
     if (dns_parse_question(data, data_end, dns, cache_key.qname,
                            &cache_key.qtype, &cache_key.qclass,
                            &question_end_offset) < 0)
         return XDP_PASS;
-    if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
+    if ((cache_key.qtype != DNS_QTYPE_A &&
+         cache_key.qtype != DNS_QTYPE_AAAA &&
+         cache_key.qtype != DNS_QTYPE_HTTPS) ||
+        cache_key.qclass != DNS_QCLASS_IN) {
+        increment_cache_stat(DNS_CACHE_STAT_UNSUPPORTED);
         return XDP_PASS;
+    }
 
     cache_value = bpf_map_lookup_elem(&dns_client_cache, &cache_key);
     if (cache_value && cache_value->expires_ns && now > cache_value->expires_ns) {
@@ -207,13 +236,14 @@ static __always_inline int try_client_cache_response(
         return XDP_PASS;
     }
 
-    old_ip_len = bpf_ntohs(ip->tot_len);
-    old_udp_len = bpf_ntohs(udp->len);
     logical_packet_end_offset = (__u32)((long)ip - (long)data) + old_ip_len;
     if (question_end_offset != logical_packet_end_offset)
         return XDP_PASS;
 
-    answer_ipv4 = cache_value->answer_ipv4;
+    answer_len = cache_value->answer_len;
+    if (answer_len < DNS_RR_HEADER_LEN || answer_len > DNS_CACHE_ANSWER_MAX)
+        return XDP_PASS;
+
     answer_ttl = cache_value->ttl;
     if (cache_value->expires_ns) {
         remaining_ns = cache_value->expires_ns - now;
@@ -221,11 +251,11 @@ static __always_inline int try_client_cache_response(
         if (!answer_ttl)
             answer_ttl = 1;
     }
-    new_ip_len = old_ip_len + DNS_A_ANSWER_LEN;
-    new_udp_len = old_udp_len + DNS_A_ANSWER_LEN;
+    new_ip_len = old_ip_len + answer_len;
+    new_udp_len = old_udp_len + answer_len;
     answer_offset = question_end_offset;
 
-    if (bpf_xdp_adjust_tail(ctx, DNS_A_ANSWER_LEN) < 0)
+    if (bpf_xdp_adjust_tail(ctx, answer_len) < 0)
         return XDP_ABORTED;
 
     data = (void *)(long)ctx->data;
@@ -243,8 +273,10 @@ static __always_inline int try_client_cache_response(
     if ((void *)(dns + 1) > data_end)
         return XDP_ABORTED;
 
-    if (dns_write_a_answer(data, data_end, answer_offset, answer_ttl,
-                           answer_ipv4) < 0)
+    cache_value = bpf_map_lookup_elem(&dns_client_cache, &cache_key);
+    if (!cache_value)
+        return XDP_ABORTED;
+    if (dns_write_cached_answer(ctx, answer_offset, cache_value, answer_ttl) < 0)
         return XDP_ABORTED;
 
     dns_swap_eth_addrs(eth);
@@ -293,6 +325,10 @@ int dns_client_cache_xdp(struct xdp_md *ctx)
 
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
+
+    if (bpf_ntohs(eth->h_proto) == ETH_P_ARP)
+        return arp_proxy_handle(ctx, data, data_end);
+
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         return XDP_PASS;
 
@@ -333,9 +369,10 @@ int dns_client_cache_xdp(struct xdp_md *ctx)
     if (cache_action != XDP_PASS)
         return cache_action;
 
-    emit_dns_event(DNS_DIR_CLIENT_XDP_INGRESS, ctx->ingress_ifindex,
-                   (__u32)((long)data_end - (long)data), ip, src_port,
-                   dst_port, dns_id, is_response, rcode, 0, now, 0);
+    if (detailed_events_enabled())
+        emit_dns_event(DNS_DIR_CLIENT_XDP_INGRESS, ctx->ingress_ifindex,
+                       (__u32)((long)data_end - (long)data), ip, src_port,
+                       dst_port, dns_id, is_response, rcode, 0, now, 0);
     return XDP_PASS;
 }
 
@@ -420,11 +457,16 @@ int dns_client_cache_egress(struct __sk_buff *skb)
     struct dns_client_pending_value *pending;
     struct dns_client_config *config;
     struct dns_client_cache_key response_key = {};
-    struct dns_a_answer answer = {};
-    struct dns_cache_value cache_value = {};
+    struct dns_rr_header answer = {};
+    struct dns_cache_value *cache_value;
+    __u32 scratch_key = 0;
     __u32 offset = 0;
     __u32 ip_header_len;
     __u32 answer_offset = 0;
+    __u32 answer_len;
+    __u32 copy_len;
+    __u16 answer_type;
+    __u16 answer_rdlength;
     __u16 src_port;
     __u16 dst_port;
     __u16 dns_id;
@@ -473,48 +515,96 @@ int dns_client_cache_egress(struct __sk_buff *skb)
     rcode = dns_flags & DNS_RCODE_MASK;
     build_dns_flow_key(&flow_key, &ip, src_port, dst_port, dns_id, 1);
     pending = bpf_map_lookup_elem(&dns_client_pending, &flow_key);
-    if (pending) {
-        matched = 1;
-        latency_ns = now - pending->started_ns;
-        config = client_config();
-        if (!config || now - pending->started_ns > config->learn_window_ns) {
-            bpf_map_delete_elem(&dns_client_pending, &flow_key);
-            increment_cache_stat(DNS_CACHE_STAT_PENDING_EXPIRED);
-        } else if (!is_trusted_dns_server(ip.saddr) ||
-                   (dns_flags & DNS_OPCODE_MASK) ||
-                   (dns_flags & DNS_FLAG_TRUNCATED) || rcode != 0 ||
-                   bpf_ntohs(dns.qdcount) != 1 ||
-                   bpf_ntohs(dns.ancount) != 1 ||
-                   parse_skb_question(skb, offset, &response_key,
-                                      &answer_offset) < 0) {
+    if (!pending) {
+        increment_cache_stat(DNS_CACHE_STAT_EGRESS_NO_PENDING);
+        if (detailed_events_enabled())
+            emit_dns_event(DNS_DIR_CLIENT_TC_EGRESS, skb->ifindex, skb->len,
+                           &ip, src_port, dst_port, dns_id, 1, rcode, 0,
+                           now, 0);
+        return TC_ACT_OK;
+    }
+
+    config = client_config();
+    matched = 1;
+    latency_ns = now - pending->started_ns;
+    if (!config || now - pending->started_ns > config->learn_window_ns) {
+        bpf_map_delete_elem(&dns_client_pending, &flow_key);
+        increment_cache_stat(DNS_CACHE_STAT_PENDING_EXPIRED);
+    } else if (!is_trusted_dns_server(ip.saddr) ||
+               (dns_flags & DNS_OPCODE_MASK) ||
+               (dns_flags & DNS_FLAG_TRUNCATED) || rcode != 0 ||
+               bpf_ntohs(dns.qdcount) != 1 ||
+               bpf_ntohs(dns.ancount) != 1 ||
+               parse_skb_question(skb, offset, &response_key,
+                                  &answer_offset) < 0) {
+        reject_pending(&flow_key);
+    } else {
+        response_key.resolver_ipv4 = ip.saddr;
+        if (!cache_keys_equal(&pending->cache_key, &response_key) ||
+            read_packet(&answer, skb, answer_offset, sizeof(answer)) < 0 ||
+            bpf_ntohs(answer.name) != 0xc00c ||
+            bpf_ntohs(answer.class) != DNS_QCLASS_IN ||
+            bpf_ntohs(dns.nscount) != 0 ||
+            bpf_ntohs(dns.arcount) != 0) {
             reject_pending(&flow_key);
         } else {
-            response_key.resolver_ipv4 = ip.saddr;
-            if (!cache_keys_equal(&pending->cache_key, &response_key) ||
-                read_packet(&answer, skb, answer_offset, sizeof(answer)) < 0 ||
-                bpf_ntohs(answer.name) != 0xc00c ||
-                bpf_ntohs(answer.type) != DNS_QTYPE_A ||
-                bpf_ntohs(answer.class) != DNS_QCLASS_IN ||
-                bpf_ntohs(answer.rdlength) != 4 ||
-                bpf_ntohs(dns.nscount) != 0 ||
-                bpf_ntohs(dns.arcount) != 0) {
+            answer_type = bpf_ntohs(answer.type);
+            answer_rdlength = bpf_ntohs(answer.rdlength);
+            answer_len = sizeof(answer) + answer_rdlength;
+            if (answer_type != pending->cache_key.qtype ||
+                (answer_type == DNS_QTYPE_A && answer_rdlength != 4) ||
+                (answer_type == DNS_QTYPE_AAAA && answer_rdlength != 16) ||
+                (answer_type != DNS_QTYPE_A &&
+                 answer_type != DNS_QTYPE_AAAA &&
+                 answer_type != DNS_QTYPE_HTTPS) ||
+                answer_len > DNS_CACHE_ANSWER_MAX ||
+                answer_len <= DNS_RR_HEADER_LEN ||
+                answer_offset > skb->len ||
+                answer_len > skb->len - answer_offset ||
+                answer_offset + answer_len != skb->len) {
+                reject_pending(&flow_key);
+                goto response_done;
+            }
+
+            /* Keep the helper's destination range trivially provable to the
+             * tc verifier: the cache value has 256 bytes of answer storage,
+             * and a one-byte-short cap keeps the copy length in [0, 255]
+             * after the mask below.  A 256-byte RR is deliberately
+             * fail-open rather than risking a verifier-dependent write. */
+            copy_len = answer_len;
+            if (copy_len > DNS_CACHE_ANSWER_MAX - 1) {
+                reject_pending(&flow_key);
+                goto response_done;
+            }
+            copy_len &= 0xff;
+            if (!copy_len) {
+                reject_pending(&flow_key);
+                goto response_done;
+            }
+
+            ttl = bpf_ntohl(answer.ttl);
+            if (!ttl) {
                 reject_pending(&flow_key);
             } else {
-                ttl = bpf_ntohl(answer.ttl);
-                if (!ttl) {
+                if (!config->max_ttl) {
                     reject_pending(&flow_key);
                 } else {
-                    if (!config->max_ttl) {
+                    if (ttl > config->max_ttl)
+                        ttl = config->max_ttl;
+                    cache_value = bpf_map_lookup_elem(
+                        &dns_client_cache_scratch, &scratch_key);
+                    if (!cache_value ||
+                        bpf_skb_load_bytes(skb, answer_offset,
+                                           cache_value->answer,
+                                           copy_len) < 0) {
                         reject_pending(&flow_key);
                     } else {
-                        if (ttl > config->max_ttl)
-                        ttl = config->max_ttl;
-                        cache_value.answer_ipv4 = answer.addr;
-                        cache_value.ttl = ttl;
-                        cache_value.expires_ns =
+                        cache_value->ttl = ttl;
+                        cache_value->answer_len = answer_len;
+                        cache_value->expires_ns =
                             now + (__u64)ttl * 1000000000ull;
                         bpf_map_update_elem(&dns_client_cache, &response_key,
-                                            &cache_value, BPF_ANY);
+                                            cache_value, BPF_ANY);
                         bpf_map_delete_elem(&dns_client_pending, &flow_key);
                         increment_cache_stat(DNS_CACHE_STAT_LEARNED);
                     }
@@ -523,9 +613,11 @@ int dns_client_cache_egress(struct __sk_buff *skb)
         }
     }
 
-    emit_dns_event(DNS_DIR_CLIENT_TC_EGRESS, skb->ifindex, skb->len, &ip,
-                   src_port, dst_port, dns_id, 1, rcode, matched, now,
-                   latency_ns);
+response_done:
+    if (config && config->detailed_events)
+        emit_dns_event(DNS_DIR_CLIENT_TC_EGRESS, skb->ifindex, skb->len, &ip,
+                       src_port, dst_port, dns_id, 1, rcode, matched, now,
+                       latency_ns);
     return TC_ACT_OK;
 }
 

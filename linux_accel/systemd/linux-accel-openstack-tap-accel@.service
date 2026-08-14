@@ -1,0 +1,20 @@
+[Unit]
+Description=Linux Accel OpenStack TAP DNS acceleration for Neutron port %i
+Wants=network-online.target
+After=network-online.target openvswitch-switch.service ovs-vswitchd.service ovn-controller.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/linux-accel/openstack-tap-accel/%i.env
+ExecStart=/opt/linux-accel-openstack-tap/current/openstack_tap_accel.sh
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+LimitMEMLOCK=infinity
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

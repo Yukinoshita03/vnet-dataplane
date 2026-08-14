@@ -1,0 +1,54 @@
+# Dr.COM / ePortal adapter template.
+# The screenshot's footer identifies the Guangzhou Hotspot / Dr.COM family,
+# but the portal host, operator, and required fields are still school-specific.
+# Copy this file to a private config and replace the ALL_CAPS values.
+
+# Use an endpoint that the portal redirects while unauthenticated and returns
+# 204 (or another configured status) after authentication.
+probe_url=http://connect.rom.miui.com/generate_204
+probe_success_status=204
+
+# Common Dr.COM deployments expose one of these forms:
+#   http://PORTAL_HOST:801/eportal/portal/login
+#   http://PORTAL_HOST:801/eportal/?c=Portal&a=login
+auth_url=http://PORTAL_HOST:801/eportal/portal/login
+auth_method=GET
+request_format=form
+
+interface=wlan0
+operator=telecom
+username=YOUR_CAMPUS_ACCOUNT
+password_file=/etc/campus-net-guard/password
+username_field=user_account
+password_field=user_password
+username_value=,0,{username}@{operator}
+password_value={password}
+
+# Common Dr.COM JSONP fields. Confirm them from the browser Network request.
+field.callback=dr1003
+field.login_method=1
+field.wlan_user_ip={local_ipv4}
+field.wlan_user_ipv6=
+field.wlan_user_mac=000000000000
+field.wlan_ac_ip=
+field.wlan_ac_name=
+field.jsVersion=4.1.3
+field.v=9960
+field.lang=zh
+
+# Dr.COM usually returns JSONP such as dr1003({"result":1,...}).
+auth_success_status=200
+auth_success_contains=result":1
+auth_failure_contains=ret_code
+
+cookie_file=/var/lib/campus-net-guard/cookies.txt
+probe_timeout_ms=5000
+auth_timeout_ms=10000
+interval_seconds=15
+offline_threshold=2
+verify_delay_ms=500
+min_retry_seconds=10
+max_retry_seconds=300
+max_response_bytes=1048576
+follow_auth_redirects=false
+tls_verify=true

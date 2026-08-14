@@ -292,6 +292,10 @@ void print_metrics(ReaderState *state)
         state->cache_stats_fd, DNS_CACHE_STAT_LEARN_REJECTED);
     uint64_t cache_pending_expired = read_percpu_counter_total(
         state->cache_stats_fd, DNS_CACHE_STAT_PENDING_EXPIRED);
+    uint64_t cache_unsupported = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_UNSUPPORTED);
+    uint64_t cache_egress_no_pending = read_percpu_counter_total(
+        state->cache_stats_fd, DNS_CACHE_STAT_EGRESS_NO_PENDING);
 
     uint64_t cache_hit_delta = counter_delta(cache_hits, &state->last_cache_hits);
     uint64_t cache_miss_delta = counter_delta(cache_misses, &state->last_cache_misses);
@@ -304,6 +308,10 @@ void print_metrics(ReaderState *state)
         cache_learn_rejected, &state->last_cache_learn_rejected);
     uint64_t cache_pending_expired_delta = counter_delta(
         cache_pending_expired, &state->last_cache_pending_expired);
+    uint64_t cache_unsupported_delta = counter_delta(
+        cache_unsupported, &state->last_cache_unsupported);
+    uint64_t cache_egress_no_pending_delta = counter_delta(
+        cache_egress_no_pending, &state->last_cache_egress_no_pending);
 
     double avg_ms = average_ms(state->current.latency_samples_ns);
     double p95_ms = percentile_ms(state->current.latency_samples_ns, 95.0);
@@ -339,10 +347,12 @@ void print_metrics(ReaderState *state)
                << " cache_miss=" << cache_miss_delta
                << " cache_expired=" << cache_expired_delta
                << " cache_tx=" << cache_tx_delta
-               << " cache_learned=" << cache_learned_delta
-               << " learn_rejected=" << cache_learn_rejected_delta
-               << " pending_expired=" << cache_pending_expired_delta
-               << " alerts=" << alerts << "\n";
+              << " cache_learned=" << cache_learned_delta
+              << " learn_rejected=" << cache_learn_rejected_delta
+              << " pending_expired=" << cache_pending_expired_delta
+              << " unsupported=" << cache_unsupported_delta
+              << " egress_no_pending=" << cache_egress_no_pending_delta
+              << " alerts=" << alerts << "\n";
 
     state->history.push_back(
         {state->current.query_count + state->current.response_count, p95_ms});

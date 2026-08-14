@@ -1,0 +1,36 @@
+[Unit]
+Description=Campus network reconnect and authentication guard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=campus-net-guard
+Group=campus-net-guard
+WorkingDirectory=/var/lib/campus-net-guard
+ExecStart=/usr/local/bin/campus_net_guard --config /etc/campus-net-guard/config.conf
+Restart=always
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+# The guard only makes outbound HTTP(S) requests and writes its cookie jar.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/campus-net-guard
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

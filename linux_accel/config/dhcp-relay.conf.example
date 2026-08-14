@@ -1,0 +1,6 @@
+# client_if relay_if relay_ipv4 server_ipv4 relay_mac server_mac lease_seconds
+#
+# The relay policy is intentionally explicit. The XDP path only rewrites and
+# redirects DHCP/BOOTP packets matching a configured client interface. It does
+# not allocate, cache, or replay leases.
+tap-client br-dhcp 192.0.2.1 192.0.2.2 fa:16:3e:aa:bb:cc fa:16:3e:dd:ee:ff 30

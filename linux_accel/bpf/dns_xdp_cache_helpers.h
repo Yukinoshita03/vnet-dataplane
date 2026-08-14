@@ -13,9 +13,13 @@
 #define DNS_OPCODE_MASK 0x7800
 #define DNS_RCODE_MASK 0x000f
 #define DNS_QTYPE_A 1
+#define DNS_QTYPE_AAAA 28
+#define DNS_QTYPE_HTTPS 65
 #define DNS_QCLASS_IN 1
 #define DNS_RESPONSE_NOERROR 0x8180
 #define DNS_A_ANSWER_LEN 16
+#define DNS_AAAA_ANSWER_LEN 28
+#define DNS_RR_HEADER_LEN 12
 #define DNS_FIXED_ANSWER_WRITER(offset)                                      \
     if (answer_offset == offset) {                                           \
         answer = data + offset;                                              \
@@ -40,6 +44,14 @@ struct dns_a_answer {
     __be32 ttl;
     __be16 rdlength;
     __be32 addr;
+} __attribute__((packed));
+
+struct dns_rr_header {
+    __be16 name;
+    __be16 type;
+    __be16 class;
+    __be32 ttl;
+    __be16 rdlength;
 } __attribute__((packed));
 
 static __always_inline __u16 dns_ipv4_header_checksum(struct iphdr *ip)
@@ -177,6 +189,29 @@ write_answer:
     answer[14] = (__u8)(answer_ipv4 >> 16);
     answer[15] = (__u8)(answer_ipv4 >> 24);
     return 0;
+}
+
+static __always_inline int dns_write_cached_answer(
+    struct xdp_md *ctx, __u32 answer_offset,
+    const struct dns_cache_value *cache_value, __u32 answer_ttl)
+{
+    __u32 answer_len = cache_value->answer_len;
+    __u8 ttl[4] = {
+        (__u8)(answer_ttl >> 24),
+        (__u8)(answer_ttl >> 16),
+        (__u8)(answer_ttl >> 8),
+        (__u8)answer_ttl,
+    };
+
+    if (answer_len < DNS_RR_HEADER_LEN || answer_len > DNS_CACHE_ANSWER_MAX)
+        return -1;
+    if (bpf_xdp_store_bytes(ctx, answer_offset, (void *)cache_value->answer,
+                            answer_len) < 0)
+        return -1;
+
+    /* The cached wire RR is replayed at the same offset, but its TTL is
+     * adjusted to the remaining lease before returning it to the client. */
+    return bpf_xdp_store_bytes(ctx, answer_offset + 6, ttl, sizeof(ttl));
 }
 
 static __always_inline int dns_parse_question(void *data, void *data_end,

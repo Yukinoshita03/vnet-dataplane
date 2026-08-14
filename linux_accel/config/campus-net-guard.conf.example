@@ -1,0 +1,63 @@
+# Copy this file to /etc/campus-net-guard/config.conf and chmod it to 600.
+# Replace every example URL and field with the values from your own school's
+# official portal. The program never guesses an authentication endpoint.
+
+# A probe must be reachable before authentication and must return one of the
+# configured success statuses. A captive portal redirect (for example 302) is
+# intentionally treated as offline because probe redirects are not followed.
+probe_url=https://connectivitycheck.gstatic.com/generate_204
+probe_success_status=204
+
+# The fixed form/JSON adapter supports ordinary portal login APIs. For a portal
+# that requires a challenge or a calculated password, use a dedicated adapter
+# rather than putting a stale hash in this file.
+auth_url=https://portal.example.edu/api/login
+auth_method=POST
+request_format=form
+username_field=username
+password_field=password
+
+# Keep the password outside the config and protect it with chmod 600.
+username=YOUR_CAMPUS_ACCOUNT
+password_file=/etc/campus-net-guard/password
+
+# Add the portal's other required fields. Values may use {username} or
+# {password}; the two credential fields above are always overwritten with the
+# current credentials.
+# field.service=campus
+# field.ac_id=1
+# field.n=200
+# For portals that wrap or suffix the account, customize the credential values:
+# username_value=,0,{username}@telecom
+# password_value={password}
+
+# Optional HTTP headers. Do not put credentials in a header unless the portal
+# explicitly requires it.
+# header.Referer=https://portal.example.edu/login
+# header.X-Requested-With=XMLHttpRequest
+
+# If the login page must be fetched first to receive a cookie, set this.
+# pre_auth_url=https://portal.example.edu/login
+cookie_file=/var/lib/campus-net-guard/cookies.txt
+
+# A successful HTTP status is not always enough. Set a marker when the portal
+# returns a stable success string or JSON fragment.
+auth_success_status=200,204,302
+# auth_success_contains=success
+# auth_failure_contains=invalid password
+
+probe_timeout_ms=5000
+auth_timeout_ms=10000
+interval_seconds=15
+offline_threshold=2
+verify_delay_ms=500
+min_retry_seconds=10
+max_retry_seconds=300
+max_response_bytes=1048576
+follow_auth_redirects=true
+tls_verify=true
+
+# If the variable names are changed, the values can be supplied through the
+# environment instead of putting them in this file.
+# username_env=CAMPUS_NET_USERNAME
+# password_env=CAMPUS_NET_PASSWORD

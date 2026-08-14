@@ -3,13 +3,15 @@
         {
             "name": "Mac",
             "includePath": [
-                "${workspaceFolder}/**",
-                "${workspaceFolder}/third_party/bpf-headers"
+                "${workspaceFolder}/src/include/**",
+                "${workspaceFolder}/include/**",
+                "${workspaceFolder}/third_party/bpf-headers/**",
+                "${workspaceFolder}/**"
             ],
             "defines": [],
-            "compilerPath": "/usr/bin/clang",
+            "compilerPath": "/usr/bin/clang++",
             "cStandard": "c17",
-            "cppStandard": "c++14",
+            "cppStandard": "c++17",
             "intelliSenseMode": "macos-clang-arm64"
         }
     ],

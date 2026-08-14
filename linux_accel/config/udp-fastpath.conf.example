@@ -1,0 +1,12 @@
+# Exact, opt-in IPv4 UDP request/response entries.
+#
+# Fields:
+#   ingress_ifname server_ipv4 server_port request_hex response_hex lease_seconds
+#
+# Payloads are hexadecimal and must be at most 64 bytes. Use only deterministic,
+# side-effect-free exchanges whose response is safe to synthesize. Unknown,
+# expired, fragmented, malformed, or oversized traffic is passed to the normal
+# network stack.
+
+# Health probe: "ping" -> "pong-ok" for a backend reached through this TAP.
+tap-example 192.0.2.53 9000 70696e67 706f6e672d6f6b 30

@@ -1,0 +1,6 @@
+# Legacy three-column A form remains supported.
+a.example.test 10.0.0.123 60
+
+# Typed entries are used by the generic wire-RR cache format.
+aaaa.example.test AAAA 2001:db8::123 60
+https.example.test HTTPS 000100 60

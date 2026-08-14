@@ -102,15 +102,44 @@ bool parse_cache_policy_file(const std::string &path,
 
         if (kind == "dns") {
             DnsCacheEntry entry;
+            std::string type_or_address;
+            std::string address_or_rdata;
             std::string ttl;
             std::string extra;
-            if (!(stream >> entry.domain >> entry.ip >> ttl) || (stream >> extra)) {
+            if (!(stream >> entry.domain >> type_or_address)) {
                 if (error) {
                     *error = "invalid policy line " + std::to_string(line_no) +
-                             ": expected 'dns domain ipv4 ttl'";
+                             ": expected 'dns domain [A|AAAA|HTTPS] address-or-rdata ttl'";
                 }
                 return false;
             }
+            if (type_or_address == "A" || type_or_address == "AAAA" ||
+                type_or_address == "HTTPS") {
+                entry.qtype = type_or_address == "A" ? 1 :
+                              (type_or_address == "AAAA" ? 28 : 65);
+                if (!(stream >> address_or_rdata >> ttl) || (stream >> extra)) {
+                    if (error) {
+                        *error = "invalid policy line " +
+                                 std::to_string(line_no) +
+                                 ": expected 'dns domain type address-or-rdata ttl'";
+                    }
+                    return false;
+                }
+            } else {
+                entry.qtype = 1;
+                address_or_rdata = type_or_address;
+                if (!(stream >> ttl) || (stream >> extra)) {
+                    if (error) {
+                        *error = "invalid policy line " +
+                                 std::to_string(line_no) +
+                                 ": expected 'dns domain ipv4 ttl'";
+                    }
+                    return false;
+                }
+            }
+            entry.ip = address_or_rdata;
+            if (entry.qtype == 65)
+                entry.rdata_hex = address_or_rdata;
             if (!parse_positive_int(ttl, &entry.ttl)) {
                 if (error)
                     *error = "invalid DNS TTL on policy line " +
@@ -230,4 +259,3 @@ bool parse_cache_policy_file(const std::string &path,
     }
     return true;
 }
-

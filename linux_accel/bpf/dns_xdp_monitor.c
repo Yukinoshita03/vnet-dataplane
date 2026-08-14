@@ -7,6 +7,8 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
+#include "arp_proxy.h"
+#include "dhcp_relay_program.h"
 #include "dns_event.h"
 #include "dns_xdp_cache_helpers.h"
 
@@ -48,6 +50,13 @@ struct {
     __type(value, __u64);
 } dns_cache_stats SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct dns_server_config);
+} dns_server_config SEC(".maps");
+
 static __always_inline void increment_dropped_events(void)
 {
     __u32 key = 0;
@@ -63,6 +72,15 @@ static __always_inline void increment_cache_stat(__u32 key)
 
     if (value)
         *value += 1;
+}
+
+static __always_inline int detailed_events_enabled(void)
+{
+    __u32 key = 0;
+    struct dns_server_config *config =
+        bpf_map_lookup_elem(&dns_server_config, &key);
+
+    return config && config->detailed_events;
 }
 
 static __always_inline void build_dns_flow_key(struct dns_flow_key *key,
@@ -95,7 +113,8 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
                                                   struct udphdr *udp,
                                                   struct dns_hdr *dns,
                                                   __u32 ip_header_len,
-                                                  __u8 is_response,
+                                                  __u16 dst_port,
+                                                  __u16 dns_flags,
                                                   __u64 now)
 {
     struct dns_cache_key cache_key = {};
@@ -107,11 +126,15 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     __u16 new_udp_len;
     __u32 logical_packet_end_offset;
     __u32 answer_offset;
-    __u32 answer_ipv4;
+    __u32 answer_len;
     __u32 answer_ttl;
     __u64 remaining_ns;
 
-    if (is_response)
+    if (dns_flags & DNS_FLAG_RESPONSE)
+        return XDP_PASS;
+    if (dns_flags & DNS_OPCODE_MASK)
+        return XDP_PASS;
+    if (dst_port != DNS_PORT)
         return XDP_PASS;
     if (bpf_ntohs(dns->qdcount) != 1)
         return XDP_PASS;
@@ -121,12 +144,22 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     if (ip_header_len != sizeof(*ip))
         return XDP_PASS;
 
+    old_ip_len = bpf_ntohs(ip->tot_len);
+    old_udp_len = bpf_ntohs(udp->len);
+    if (old_ip_len < ip_header_len + sizeof(*udp) + sizeof(*dns))
+        return XDP_PASS;
+    if (old_udp_len != old_ip_len - ip_header_len)
+        return XDP_PASS;
+
     __builtin_memset(&cache_key, 0, sizeof(cache_key));
     if (dns_parse_question(data, data_end, dns, cache_key.qname,
                            &cache_key.qtype, &cache_key.qclass,
                            &question_end_offset) < 0)
         return XDP_PASS;
-    if (cache_key.qtype != DNS_QTYPE_A || cache_key.qclass != DNS_QCLASS_IN)
+    if ((cache_key.qtype != DNS_QTYPE_A &&
+         cache_key.qtype != DNS_QTYPE_AAAA &&
+         cache_key.qtype != DNS_QTYPE_HTTPS) ||
+        cache_key.qclass != DNS_QCLASS_IN)
         return XDP_PASS;
 
     cache_value = bpf_map_lookup_elem(&dns_cache, &cache_key);
@@ -141,8 +174,10 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
         return XDP_PASS;
     }
 
-    increment_cache_stat(DNS_CACHE_STAT_HIT);
-    answer_ipv4 = cache_value->answer_ipv4;
+    answer_len = cache_value->answer_len;
+    if (answer_len < DNS_RR_HEADER_LEN || answer_len > DNS_CACHE_ANSWER_MAX)
+        return XDP_PASS;
+
     answer_ttl = cache_value->ttl;
     if (cache_value->expires_ns) {
         remaining_ns = cache_value->expires_ns - now;
@@ -151,18 +186,16 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
             answer_ttl = 1;
     }
 
-    old_ip_len = bpf_ntohs(ip->tot_len);
-    old_udp_len = bpf_ntohs(udp->len);
     logical_packet_end_offset =
         (__u32)((long)ip - (long)data) + old_ip_len;
     if (question_end_offset != logical_packet_end_offset)
         return XDP_PASS;
 
-    new_ip_len = old_ip_len + DNS_A_ANSWER_LEN;
-    new_udp_len = old_udp_len + DNS_A_ANSWER_LEN;
+    new_ip_len = old_ip_len + answer_len;
+    new_udp_len = old_udp_len + answer_len;
     answer_offset = question_end_offset;
 
-    if (bpf_xdp_adjust_tail(ctx, DNS_A_ANSWER_LEN) < 0)
+    if (bpf_xdp_adjust_tail(ctx, answer_len) < 0)
         return XDP_ABORTED;
 
     data = (void *)(long)ctx->data;
@@ -181,8 +214,11 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     if ((void *)(dns + 1) > data_end)
         return XDP_ABORTED;
 
-    if (dns_write_a_answer(data, data_end, answer_offset, answer_ttl,
-                           answer_ipv4) < 0)
+    cache_value = bpf_map_lookup_elem(&dns_cache, &cache_key);
+    if (!cache_value)
+        return XDP_ABORTED;
+
+    if (dns_write_cached_answer(ctx, answer_offset, cache_value, answer_ttl) < 0)
         return XDP_ABORTED;
 
     dns_swap_eth_addrs(eth);
@@ -205,6 +241,7 @@ static __always_inline int try_dns_cache_response(struct xdp_md *ctx,
     dns->nscount = 0;
     dns->arcount = 0;
 
+    increment_cache_stat(DNS_CACHE_STAT_HIT);
     increment_cache_stat(DNS_CACHE_STAT_TX);
     return XDP_TX;
 }
@@ -235,6 +272,9 @@ int dns_xdp_monitor(struct xdp_md *ctx)
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
+    if (bpf_ntohs(eth->h_proto) == ETH_P_ARP)
+        return arp_proxy_handle(ctx, data, data_end);
+
     if (bpf_ntohs(eth->h_proto) != ETH_P_IP)
         return XDP_PASS;
 
@@ -249,12 +289,19 @@ int dns_xdp_monitor(struct xdp_md *ctx)
         return XDP_PASS;
 
     ip_header_len = ip->ihl * 4;
-    if (ip_header_len < sizeof(*ip))
+    if (ip_header_len < sizeof(*ip) || ip_header_len > 60)
         return XDP_PASS;
 
     udp = (void *)ip + ip_header_len;
     if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
+
+    if (ip_header_len == sizeof(*ip)) {
+        int dhcp_action = dhcp_relay_handle(ctx, data, data_end, eth, ip, udp,
+                                             ip_header_len);
+        if (dhcp_action != XDP_PASS)
+            return dhcp_action;
+    }
 
     src_port = bpf_ntohs(udp->source);
     dst_port = bpf_ntohs(udp->dest);
@@ -273,10 +320,17 @@ int dns_xdp_monitor(struct xdp_md *ctx)
         rcode = dns_flags & DNS_RCODE_MASK;
 
     int cache_action = try_dns_cache_response(ctx, data, data_end, eth, ip, udp,
-                                              dns, ip_header_len, is_response,
-                                              now);
+                                              dns, ip_header_len, dst_port,
+                                              dns_flags, now);
     if (cache_action != XDP_PASS)
         return cache_action;
+
+    /* The server fast path is a cache/forwarding data plane.  Per-packet
+     * query tracking and ringbuf production are optional observability and
+     * must not tax the default benchmark/production path.  Cache hit/miss and
+     * TX remain available through per-CPU counters. */
+    if (!detailed_events_enabled())
+        return XDP_PASS;
 
     build_dns_flow_key(&flow_key, ip, src_port, dst_port, dns_id, is_response);
     if (is_response) {

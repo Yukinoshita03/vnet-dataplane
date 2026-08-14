@@ -10,6 +10,8 @@ struct DnsCacheEntry {
     std::string domain;
     std::string ip;
     int ttl = 60;
+    __u16 qtype = 1;
+    std::string rdata_hex;
 };
 
 uint64_t monotonic_now_ns();

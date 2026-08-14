@@ -12,6 +12,8 @@
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *)1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, unsigned long long flags) = (void *)2;
 static long (*bpf_map_delete_elem)(void *map, const void *key) = (void *)3;
+static long (*bpf_tail_call)(void *ctx, void *prog_array_map, unsigned int index) = (void *)12;
+static long (*bpf_redirect)(unsigned int ifindex, unsigned long long flags) = (void *)23;
 static long (*bpf_skb_load_bytes)(const void *skb, unsigned int offset, void *to, unsigned int len) = (void *)26;
 static unsigned long long (*bpf_ktime_get_ns)(void) = (void *)5;
 static void *(*bpf_ringbuf_reserve)(void *ringbuf, unsigned long long size, unsigned long long flags) = (void *)131;
