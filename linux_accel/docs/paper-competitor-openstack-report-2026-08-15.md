@@ -26,7 +26,9 @@
 - 参数：5 repetitions，4 client threads，每线程 25,000 timed requests，1,000 warmup requests；每轮 100,000 requests。
 - 隔离拓扑：两个 network namespace，两个 veth pair，veth host ends 接入临时 OVS bridge，bridge 使用 userspace `netdev` datapath；没有修改 `br-int`、物理 NIC、OpenStack VM TAP 或 K8s 网络。
 - AF_XDP 端确认：OVS Interface `type=afxdp`，`status` 中 `xdp-mode=generic`，host veth 显示 `xdpgeneric`。
-- 结果文件：`artifacts/paper-competitors/20260815-node1-v1/ovs-afxdp/`。
+- 结果文件：两模式矩阵在
+  `artifacts/paper-competitors/20260815-node1-v1/ovs-afxdp/`；三方正式矩阵在
+  `artifacts/paper-competitors/20260815-node1-v1/ovs-afxdp-linux-accel/`。
 
 ### 正式结果（5 轮中位数）
 
@@ -76,6 +78,17 @@ linux_accel 行在 client host veth 的 generic XDP 命中后直接 `XDP_TX` 回
 
 - batch：`artifacts/all-comparisons/20260814-node1-v1/`；
 - verifier：`python3 tools/verify_all_comparisons_artifacts.py` → `PASS: 569 reproducibility checks`。
+
+三方 OVS/AF_XDP/linux_accel 原始目录另有独立 verifier：
+
+```bash
+python3 tools/verify_ovs_afxdp_artifacts.py \
+  artifacts/paper-competitors/20260815-node1-v1/ovs-afxdp-linux-accel
+```
+
+本轮结果为 `PASS: 238 OVS/AF_XDP comparison checks`；它会检查五轮请求是否全完成、
+失败与 softnet drop、OVS interface 类型、AF_XDP/generic XDP attachment、linux_accel
+命中与 `XDP_TX` 计数、server bypass，以及实验前后 OVS/Kubernetes/BPF 现场是否恢复。
 
 ## 如何复现 OVS AF_XDP 矩阵
 
