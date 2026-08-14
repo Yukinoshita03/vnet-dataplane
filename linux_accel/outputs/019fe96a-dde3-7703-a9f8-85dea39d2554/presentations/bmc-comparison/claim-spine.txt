@@ -1,0 +1,18 @@
+thesis: linux_accel beats BMC mainly through higher effective offload under key collisions and mixed hot sets; the final cross-compute OpenStack TAP result is +32.07%, while pure-hit processing remains only slightly faster.
+audience: technical competition defense panel
+arc: correction -> direct result -> causal mechanism -> OpenStack proof -> protocol portfolio -> honest conclusion
+
+1. Claim: The old OpenStack +0.16% result was an asymmetric-capacity pilot; the final cross-compute result is +32.07%.
+   Proof: cover metrics and evidence identity.
+2. Claim: The old pilot gave BMC 4096 slots plus TC learning but linux_accel only 1024 preloaded entries.
+   Proof: invalidated-versus-corrected cache contract and offload deltas.
+3. Claim: Higher effective offload turns exact-key cache organization into +21–23% netns and +32.07% OpenStack throughput versus BMC.
+   Proof: direct BMC/Linux bars; pure hit shown as only +3.19%.
+4. Claim: BMC uses XDP ingress response plus TC egress learning; linux_accel uses owner-scoped exact policy preload.
+   Proof: side-by-side cache state machines and explicit engineering tradeoff.
+5. Claim: On the final cross-compute OpenStack TAP path, QPS and p50/p95/p99 all improve versus BMC.
+   Proof: nohook/BMC/Linux bars, latency deltas, zero-error ledger, Geneve path.
+6. Claim: The project generalizes beyond Memcached, but every protocol must retain its own semantic baseline.
+   Proof: DNS/ARP/UDP/LDAP/gRPC/DHCP matrix; LDAP called out as CPU offload, not latency win.
+7. Claim: The defensible advantage is cache effectiveness, audited OpenStack deployment, and broader protocol engineering—not an invented universal multiplier.
+   Proof: 207.3M-request ledger, cleanup state, and explicit physical-native gap.

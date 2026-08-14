@@ -1,0 +1,78 @@
+{
+  "statistics": "median of six repetitions",
+  "direct_bmc": {
+    "netns_paper_scaled": {
+      "bmc_qps": 970340,
+      "linux_qps": 1197340,
+      "gain_pct": 23.39,
+      "bmc_offload_pct": 73.480,
+      "linux_offload_pct": 85.851,
+      "bmc_p99_us": 46.999,
+      "linux_p99_us": 57.349,
+      "linux_p99_delta_vs_bmc_pct": -22.02
+    },
+    "netns_slot_pressure": {
+      "bmc_qps": 827996,
+      "linux_qps": 1004330,
+      "gain_pct": 21.30,
+      "bmc_offload_pct": 61.186,
+      "linux_offload_pct": 75.09,
+      "bmc_p99_us": 41.984,
+      "linux_p99_us": 46.287,
+      "linux_p99_delta_vs_bmc_pct": -10.25
+    },
+    "netns_all_hit": {
+      "bmc_qps": 1712655,
+      "linux_qps": 1767370,
+      "gain_pct": 3.19,
+      "bmc_p99_us": 3.639,
+      "linux_p99_us": 3.291
+    },
+    "openstack_mixed_cross_compute": {
+      "population": 65536,
+      "hot_keys": 4096,
+      "bmc_slots": 4096,
+      "linux_entries": 4096,
+      "bmc_qps": 51547,
+      "linux_qps": 68078,
+      "gain_pct": 32.07,
+      "bmc_offload_pct": 61.406,
+      "linux_offload_pct": 75.080,
+      "bmc_p50_us": 11.099,
+      "linux_p50_us": 10.825,
+      "bmc_p95_us": 90.236,
+      "linux_p95_us": 88.874,
+      "bmc_p99_us": 97.212,
+      "linux_p99_us": 95.769,
+      "p50_reduction_pct": 2.47,
+      "p95_reduction_pct": 1.51,
+      "p99_reduction_pct": 1.48
+    },
+    "openstack_mixed_invalidated_pilot": {
+      "valid_for_conclusion": false,
+      "bmc_slots": 4096,
+      "linux_entries": 1024,
+      "bmc_qps": 153183,
+      "linux_qps": 153422,
+      "apparent_gain_pct": 0.16,
+      "bmc_offload_pct": 85.652,
+      "linux_offload_pct": 83.754
+    }
+  },
+  "protocol_matrix": {
+    "dns_vs_xpress_capacity_ratio": 1.1795,
+    "arp_vs_kernel_qps_ratio": 1.840,
+    "udp_vs_userspace_qps_ratio": 11.276,
+    "ldap_vs_userspace_qps_ratio": 0.888,
+    "grpc_vs_delayed_demo_qps_ratio": 12.645,
+    "dhcp": "correctness only"
+  },
+  "quality": {
+    "netns_timed_requests": 204638877,
+    "openstack_timed_requests": 2700000,
+    "total_timed_requests": 207338877,
+    "failures": 0,
+    "checksum_errors": 0,
+    "softnet_drops": 0
+  }
+}

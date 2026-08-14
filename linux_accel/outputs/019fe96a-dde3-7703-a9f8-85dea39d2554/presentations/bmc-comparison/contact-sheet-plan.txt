@@ -1,0 +1,9 @@
+1. Image split cover: broad white space, user image on right, metric spine on left.
+2. Direct comparison proof: large paired bars with a narrow causal annotation rail.
+3. State-machine architecture: left-to-right XDP ingress, userspace fallback, TC egress learning loop.
+4. Mechanism comparison: BMC direct-map collision path versus linux_accel exact hash + tenant scope.
+5. OpenStack proof: compact topology ribbon over a three-scenario direct comparison.
+6. Evidence ledger: dark slide with correctness totals and explicit limitations.
+7. Closing matrix: where we win / tie / still lose with one defensible answer.
+
+Seven slides use seven macro-layout families; no card-grid cadence.

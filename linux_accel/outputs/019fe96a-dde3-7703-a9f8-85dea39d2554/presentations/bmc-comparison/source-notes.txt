@@ -1,0 +1,17 @@
+Primary content source:
+- /Users/tankaiwen/vnet-dataplane/linux_accel/docs/competitor-benchmark-report-2026-08.md
+- data date: 2026-08-13 through 2026-08-14
+- statistics: medians of six repetitions
+
+BMC identity:
+- Orange-OpenSource/bmc-cache
+- commit 2997145508e02c55aa92f63a0009ac2a26800810
+- official loader defaults to XDP_FLAGS_DRV_MODE
+- BMC data path uses XDP ingress for hit response and TC egress for response learning
+
+User-provided illustration:
+- source: /Users/tankaiwen/.codex/generated_images/019fe96a-dde3-7703-a9f8-85dea39d2554/exec-61681580-5313-4a0a-aa85-ef729f974125.png
+- provenance: generated image explicitly supplied by the user
+- use: title/architecture mood only; it is not benchmark evidence
+
+No logos or third-party identity marks are used.

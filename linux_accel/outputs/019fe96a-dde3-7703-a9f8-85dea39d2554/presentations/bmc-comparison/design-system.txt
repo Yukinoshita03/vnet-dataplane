@@ -1,0 +1,21 @@
+slide size: 1280x720
+background: warm white #F6F8FB; occasional deep ink #071625
+typography: Hiragino Sans for Chinese and Latin; monospaced labels use Menlo
+palette:
+- ink #071625
+- navy #103B66
+- cyan #19C8E6 (linux_accel)
+- slate #6D7F91 (BMC)
+- mint #4DE2BA (positive evidence)
+- coral #FF7A68 (risk/negative)
+- warm white #F6F8FB
+chart grammar: direct labels, BMC slate, linux_accel cyan, nohook only when context is needed
+diagram grammar: cyan ingress fast path, mint learned state, gray fallback, coral limitations
+connector grammar: arrows only for packet/state direction; all connectors attach to nodes
+containers: square or 8px radius only when grouping is semantic; no default card grid
+footer: 10px source/date left; page marker right
+kicker: small cyan rule plus uppercase label, optically centered
+title: claim sentence, 38-46px, two lines maximum
+data labels: 18px; headline metrics 40-58px
+layout families: image split, bar proof, state-machine flow, mechanism comparison, topology metric, evidence ledger, closing matrix
+banned motifs: generic feature cards, decorative badges, invented logos, 3D chart effects

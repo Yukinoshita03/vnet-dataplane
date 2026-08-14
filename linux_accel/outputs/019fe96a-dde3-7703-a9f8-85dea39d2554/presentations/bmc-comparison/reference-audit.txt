@@ -1,0 +1,13 @@
+No reference deck was supplied. The user-provided image establishes a white/cyan/navy
+visual direction but does not define a slide template. The deck is created from scratch.
+
+Preserve from image:
+- high-key white background
+- cyan packet-flow accent
+- deep navy endpoint contrast
+- generous whitespace
+
+Avoid:
+- translucent decoration behind small text
+- pseudo-dashboard card grids
+- treating the illustration as a quantitative proof object

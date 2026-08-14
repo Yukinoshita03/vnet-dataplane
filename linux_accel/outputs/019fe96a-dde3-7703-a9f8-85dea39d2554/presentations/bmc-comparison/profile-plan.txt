@@ -1,0 +1,22 @@
+task mode: create
+primary deck-profile: engineering-platform
+secondary gates: appendix-heavy source density; direct BMC comparison fairness
+required proof objects:
+- direct linux_accel/BMC throughput comparison
+- XDP ingress + TC egress architecture map
+- OpenStack TAP result and limitation
+- exact-hash versus direct-map mechanism comparison
+- correctness/recovery evidence
+source requirements:
+- docs/competitor-benchmark-report-2026-08.md
+- final v15 netns/OpenStack analysis summaries
+- official BMC pinned source and paper profile
+- user-provided 3D network illustration as a non-evidentiary visual
+brand policy: no invented logos; use text labels only
+QA gates:
+- positive and negative results both visible
+- all numbers reconcile with six-run medians
+- architecture labels distinguish XDP response from TC learning
+- OpenStack slide says cross-compute VM/TAP → OVS/OVN/Geneve → backend VM; native physical NIC remains explicitly out of scope because node1 is stock r8169
+- no clipping, collisions, or ambiguous chart axes
+known missing input: no source deck/template; no current physical native-XDP run because the reviewed r8169_xdp driver is not bound
