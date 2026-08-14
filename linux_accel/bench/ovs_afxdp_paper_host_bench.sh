@@ -27,6 +27,9 @@ for unit in kubelet containerd kubernetes-haproxy k3s rke2-server rke2-agent; do
 done
 
 bench_bin="${BENCH_BIN:-/tmp/ovs-afxdp-paper/udp_fastpath_bench}"
+run_linux_accel="${RUN_LINUX_ACCEL:-0}"
+linux_accel_bin="${LINUX_ACCEL_BIN:-/opt/competitor-bench/releases/competitor-preflight-20260813-173626/linux-accel-bmc-target-v6/udp_fastpath}"
+linux_accel_bpf="${LINUX_ACCEL_BPF:-/opt/competitor-bench/releases/competitor-preflight-20260813-173626/linux-accel-bmc-target-v6/udp_fastpath.bpf.o}"
 out_dir="${OUT_DIR:-/tmp/ovs-afxdp-paper/results-$(date +%Y%m%d-%H%M%S)}"
 repetitions="${REPETITIONS:-3}"
 threads="${THREADS:-4}"
@@ -40,7 +43,24 @@ test -x "${bench_bin}" || {
   echo "benchmark binary is missing or not executable: ${bench_bin}" >&2
   exit 1
 }
+if [[ "${run_linux_accel}" != 0 && "${run_linux_accel}" != 1 ]]; then
+  echo "RUN_LINUX_ACCEL must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "${run_linux_accel}" == 1 ]]; then
+  test -x "${linux_accel_bin}" || {
+    echo "linux_accel loader is missing or not executable: ${linux_accel_bin}" >&2
+    exit 1
+  }
+  test -s "${linux_accel_bpf}" || {
+    echo "linux_accel BPF object is missing: ${linux_accel_bpf}" >&2
+    exit 1
+  }
+fi
 mkdir -p "${out_dir}"/{health,nohook,afxdp}
+if [[ "${run_linux_accel}" == 1 ]]; then
+  mkdir -p "${out_dir}/linux-accel"
+fi
 
 tag="$(( $$ % 80000 + 10000 ))"
 client_ns="oa-c-${tag}"
@@ -51,6 +71,16 @@ server_host="oas-h-${tag}"
 server_peer="oas-p-${tag}"
 bridge="oab-${tag}"
 server_pid=""
+loader_pid=""
+
+cleanup_loader()
+{
+  if [[ -n "${loader_pid}" ]]; then
+    kill -TERM "${loader_pid}" >/dev/null 2>&1 || true
+    wait "${loader_pid}" >/dev/null 2>&1 || true
+    loader_pid=""
+  fi
+}
 
 cleanup_server()
 {
@@ -64,6 +94,7 @@ cleanup_server()
 cleanup_topology()
 {
   set +e
+  cleanup_loader
   cleanup_server
   ovs-vsctl --if-exists del-br "${bridge}" >/dev/null 2>&1
   ip netns del "${client_ns}" >/dev/null 2>&1
@@ -89,6 +120,7 @@ trap cleanup EXIT INT TERM
   echo "warmup=${warmup}"
   echo "topology=isolated-netns-veth-to-ovs-userspace-netdev"
   echo "kubernetes=required-inactive"
+  echo "linux_accel_mode=${run_linux_accel}"
 } >"${out_dir}/metadata.txt"
 ovs-vsctl list-br >"${out_dir}/health/bridges-before.txt"
 ovs-vsctl show >"${out_dir}/health/ovs-before.txt"
@@ -197,6 +229,30 @@ run_mode()
   local mode="$1"
   local repetition
   setup_topology "${mode}"
+  if [[ "${mode}" == linux-accel ]]; then
+    printf '%s %s %s %s %s %s\n' \
+      "${client_host}" "${server_ip}" "${server_port}" \
+      70696e67 706f6e672d6f6b 30 \
+      >"${out_dir}/linux-accel/policy.conf"
+    "${linux_accel_bin}" \
+      --policy-file "${out_dir}/linux-accel/policy.conf" \
+      --bpf-object "${linux_accel_bpf}" --xdp-mode generic \
+      >"${out_dir}/linux-accel/loader.log" 2>&1 &
+    loader_pid=$!
+    for unused in $(seq 1 50); do
+      if bpftool net show dev "${client_host}" 2>/dev/null | grep -q 'generic id'; then
+        break
+      fi
+      kill -0 "${loader_pid}" 2>/dev/null || {
+        cat "${out_dir}/linux-accel/loader.log" >&2
+        exit 1
+      }
+      sleep 0.1
+    done
+    bpftool net show dev "${client_host}" \
+      >"${out_dir}/linux-accel/attachment.txt" 2>&1
+    grep -q 'generic id' "${out_dir}/linux-accel/attachment.txt"
+  fi
   ip netns exec "${server_ns}" "${bench_bin}" \
     --server "${server_ip}:${server_port}" \
     >"${out_dir}/${mode}/server.log" 2>&1 &
@@ -228,13 +284,25 @@ run_mode()
       fi
     fi
   done
+  if [[ "${mode}" == linux-accel ]]; then
+    cleanup_loader
+    grep -Eq 'hit=[1-9][0-9]*' "${out_dir}/linux-accel/loader.log"
+    grep -Eq 'tx=[1-9][0-9]*' "${out_dir}/linux-accel/loader.log"
+  fi
   cleanup_topology
 }
 
 run_mode nohook
 run_mode afxdp
+if [[ "${run_linux_accel}" == 1 ]]; then
+  run_mode linux-accel
+fi
 
-for mode in nohook afxdp; do
+comparison_modes=(nohook afxdp)
+if [[ "${run_linux_accel}" == 1 ]]; then
+  comparison_modes+=(linux-accel)
+fi
+for mode in "${comparison_modes[@]}"; do
   printf '%s qps=%s p50_us=%s p95_us=%s p99_us=%s\n' \
     "${mode}" \
     "$(median_metric "${mode}" qps)" \
@@ -272,6 +340,14 @@ p99_ratio="$(awk -v a="${baseline_p99}" -v b="${afxdp_p99}" 'BEGIN { if (b > 0) 
   echo
   printf 'afxdp_vs_nohook_qps=%sx\n' "${qps_ratio}"
   printf 'nohook_vs_afxdp_p99=%sx\n' "${p99_ratio}"
+  if [[ "${run_linux_accel}" == 1 ]]; then
+    linux_qps="$(awk '$1 == "linux-accel" { for (i = 1; i <= NF; ++i) if ($i ~ /^qps=/) { split($i, a, "="); print a[2] } }' "${out_dir}/medians.txt")"
+    linux_p99="$(awk '$1 == "linux-accel" { for (i = 1; i <= NF; ++i) if ($i ~ /^p99_us=/) { split($i, a, "="); print a[2] } }' "${out_dir}/medians.txt")"
+    linux_vs_afxdp_qps="$(awk -v a="${linux_qps}" -v b="${afxdp_qps}" 'BEGIN { if (b > 0) printf "%.4f", a / b; else print "0" }')"
+    afxdp_vs_linux_p99="$(awk -v a="${linux_p99}" -v b="${afxdp_p99}" 'BEGIN { if (b > 0) printf "%.4f", a / b; else print "0" }')"
+    printf 'linux_accel_vs_afxdp_qps=%sx\n' "${linux_vs_afxdp_qps}"
+    printf 'afxdp_vs_linux_accel_p99=%sx\n' "${afxdp_vs_linux_p99}"
+  fi
   printf 'correctness=all client requests completed with failed=0\n'
 } | tee "${out_dir}/summary.md"
 

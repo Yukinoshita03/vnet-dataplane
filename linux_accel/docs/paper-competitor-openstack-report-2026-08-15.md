@@ -32,13 +32,22 @@
 
 | OVS 模式 | QPS | p50 (µs) | p95 (µs) | p99 (µs) | failed | 相对 system QPS | system p99 / 本模式 p99 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `system` baseline | 76,029.5 | 40.725 | 77.284 | 88.565 | 0 | 1.0000× | 1.0000× |
-| `afxdp` generic | 329,764 | 11.732 | 13.896 | 15.035 | 0 | **4.3373×** | **5.8906×** |
+| `system` baseline | 76,250.3 | 40.441 | 77.567 | 90.112 | 0 | 1.0000× | 1.0000× |
+| `afxdp` generic | 315,018 | 12.239 | 14.238 | 16.212 | 0 | **4.1314×** | **5.5584×** |
+| `linux_accel` generic exact-hit | **2,571,010** | **1.495** | **1.512** | **1.528** | 0 | **33.7180×** | **58.9738×** |
 
 逐轮原始 QPS：
 
-- `system`: 77,013.1、76,029.5、76,793.8、75,468.8、75,398.9。
-- `afxdp`: 317,045、329,340、334,839、329,764、333,777。
+- `system`: 76,739.6、74,980.1、75,744.3、76,678.2、76,250.3。
+- `afxdp`: 296,123、303,381、315,018、328,411、327,555。
+- `linux_accel`: 2,605,110、2,563,740、2,560,400、2,571,010、2,579,830。
+
+在同一 UDP 请求和同一隔离拓扑下，linux_accel 相对 OVS AF_XDP 为 **8.1615× QPS**；
+p50/p95/p99 分别约为 **8.1866×/9.4167×/10.6099×**。但这不是“两个纯
+I/O 框架”的同语义对比：AF_XDP 行由 OVS userspace 转发到 server 再回包，
+linux_accel 行在 client host veth 的 generic XDP 命中后直接 `XDP_TX` 回包。它
+证明的是当前短消息 exact-hit 场景中协议感知的 XDP 直回路径比通用 AF_XDP/OVS
+转发路径更快，不能推广为所有 miss、TCP 或其他应用协议的结论。
 
 每一轮都完成 100,000/100,000 请求；实验采集的 veth link 计数与 `softnet_stat` 没有出现新增丢包，且 teardown 后 bridge 列表恢复为实验前状态。
 
@@ -80,10 +89,13 @@ g++ -std=c++17 -O2 -g -Wall -Wextra -Wpedantic -Werror -pthread \
 把 `bench/ovs_afxdp_paper_host_bench.sh` 复制到 node1，以 root 执行：
 
 ```bash
-REPETITIONS=5 THREADS=4 REQUESTS=25000 WARMUP=1000 \
+RUN_LINUX_ACCEL=1 REPETITIONS=5 THREADS=4 REQUESTS=25000 WARMUP=1000 \
 OUT_DIR=/tmp/ovs-afxdp-paper/formal-YYYYMMDD-v1 \
 bash bench/ovs_afxdp_paper_host_bench.sh
 ```
+
+`RUN_LINUX_ACCEL=1` 使用 node1 上的固定 linux_accel release 和对应 BPF object；
+关闭该变量时 runner 仍只执行 `system`/`afxdp` 两种数据面模式。
 
 辅助 correctness/debug 脚本：
 
@@ -93,15 +105,35 @@ bash bench/ovs_afxdp_paper_host_bench.sh
 源文件 SHA-256：
 
 ```text
-bench/ovs_afxdp_paper_host_bench.sh  ad2401200b8e4dd4d5680785fc6596dda6573dc42a4c391ac5fe5f50c9c10c0b
+bench/ovs_afxdp_paper_host_bench.sh  3f5f0a3f7be4aeef24fd8e9e1774f7573b8bfa9a5c65ae2fa1706b879d974bef
 bench/ovs_udp_datagram_smoke.sh      1ed1b9064e7ddbd4d7a1f30ef183a220b7a70a1c9c38456977c2eadd5418ba0d
 bench/udp_direct_veth_smoke.sh       72703cf2be1709e4d56672c45f346c5a49c7f4ed3838ce2bb055ce9fec0ff440
 bench/udp_fastpath_bench.cpp         74df8fdbaf88efaaccc74f724b51dc0c39340c925cca58b6607d3e86e455b303
 ```
 
+## C. 其他已实现协议的结果与竞品边界
+
+协议不能都拿 AF_XDP 做直接横比。AF_XDP/OVS 是通用数据面 I/O 方案，不自带 DNS、
+Memcached、ARP、HTTP/2、LDAP 或 DHCP 语义。其他协议使用各自的同语义竞品或
+baseline，完整数值见 [`all-comparisons-experiment-report-2026-08-14.md`](all-comparisons-experiment-report-2026-08-14.md)：
+
+| 协议/路径 | 对比 | linux_accel 结果 | 当前结论 |
+| --- | --- | ---: | --- |
+| DNS | linux_accel vs Xpress | `268,344 / 227,500 = 1.1795×` resperf 1% loss capacity；OpenStack 20k p99 `183/195 µs` | 容量提升约 17.95%，低压 p99 不是所有点都胜 |
+| Memcached UDP | linux_accel vs BMC NSDI'21 | netns mixed `1,197,340/970,340 = 1.2339×`；OpenStack `68,078/51,547 = 1.3207×` | 当前最公平的论文级应用协议竞品 |
+| ARP | linux_accel generic XDP vs kernel neighbor | `718,033/390,189 = 1.840×` | 没找到同层公开顶会 ARP responder，使用 kernel baseline |
+| 通用 UDP | userspace vs linux_accel generic XDP | `3,295,770/292,278 = 11.276×` | 与本轮 OVS AF_XDP 三方结果互补，不混成一个数字 |
+| gRPC h2c | direct backend vs linux_accel cache | `22,471/1,777 = 12.645×` | 协议 cache 原型，miss path 不宣称加速 |
+| LDAP/LDAPS | userspace/splice/sockmap | sockmap `16,513/18,722 = 0.882×` QPS | CPU offload 约 99.86%，不是 QPS/时延加速 |
+| DHCP | relay/control correctness | correctness gate 通过 | 没有伪造 cache 加速比 |
+
+因此，“linux_accel 相比 AF_XDP”的严格答案只适用于上面的同 UDP 隔离矩阵：
+QPS `8.1615×`、p99 `10.6099×`；DNS/Memcached/ARP/gRPC/LDAP 必须使用各自的
+语义对比行。
+
 ## 解释边界
 
-OVS AF_XDP 的 4.3373× 是“OVS userspace system port → OVS AF_XDP port”的数据面提升；BMC 的 1.3207× 是“同一 OpenStack VM/TAP Memcached UDP workload 中 linux_accel → BMC”的应用协议缓存提升。两者不能合并成一个总加速比，也不能据此说 linux_accel 在所有场景都比 OVS AF_XDP 高；它们优化的层次不同：前者是 packet I/O/datapath，后者是协议解析、缓存命中与响应生成。
+三方正式矩阵中 OVS AF_XDP 相对 system 为 4.1314× QPS，linux_accel exact-hit 相对 AF_XDP 为 8.1615×；BMC 的 1.3207× 是“同一 OpenStack VM/TAP Memcached UDP workload 中 linux_accel → BMC”的应用协议缓存提升。两者不能合并成一个总加速比，也不能据此说 linux_accel 在所有场景都比 OVS AF_XDP 高；它们优化的层次不同：前者是 packet I/O/datapath，后者是协议解析、缓存命中与响应生成。
 
 ## 当前现场恢复
 
